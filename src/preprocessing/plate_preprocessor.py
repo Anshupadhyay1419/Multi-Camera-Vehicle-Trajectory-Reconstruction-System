@@ -74,10 +74,7 @@ class PlatePreprocessor:
             return plate_crop
 
         try:
-            # Step 0: Crop top 15% to remove bolt/screw interference
-            h, w = plate_crop.shape[:2]
-            top_crop = int(h * 0.15)
-            plate_crop = plate_crop[top_crop:, :]
+
 
             # Step 1: Grayscale
             if len(plate_crop.shape) == 3:

@@ -1,29 +1,29 @@
 video:
   source: "ALPR.mp4"              # local video file
-  frame_skip: 2                            # process every Nth frame
+  frame_skip: 2                            # Process every 2nd frame for SPEED (complete coverage with performance)
   max_retries: 5                           # reconnect attempts on failure
 
 detection:
   vehicle_model_path: "models/vehicle_detector/yolov8n.pt"
-  vehicle_confidence: 0.5
+  vehicle_confidence: 0.5                  # Back to conservative (0.4 catches too many false positives)
   plate_model_path: "models/plate_detector/best.pt"
-  plate_confidence: 0.4
+  plate_confidence: 0.4                    # Back to conservative
 
 tracking:
   lost_track_timeout: 30                   # frames before track is retired
 
 preprocessing:
-  clahe_clip_limit: 2.0
+  clahe_clip_limit: 2.0                    # Balanced for speed
   clahe_tile_size: 8
   denoise_h: 10
   sharpen_strength: 1.5
 
 enhancement:
-  sr_threshold_px: 180          # only apply Real-ESRGAN to small plates in live mode
+  sr_threshold_px: 180          # Apply super-resolution only for very small plates < 180px
   realesrgan_model_path: "models/realesrgan/RealESRGAN_x4plus.pth"
 
 ocr:
-  backend: "paddleocr"                     # "paddleocr" | "trocr" | "ensemble"
+  backend: "paddleocr"                     # Fast single OCR engine (NOT ensemble)
   paddleocr:
     use_angle_cls: true
     lang: "en"
@@ -33,6 +33,7 @@ ocr:
     backends: ["paddleocr", "trocr"]
     min_vote_count: 1
     use_variants: true
+  confidence_threshold: 0.70                # HIGH threshold: reject low-confidence wrong reads
 
 fusion:
   window_size: 5                           # majority vote over 5 reads for accuracy
