@@ -1,335 +1,254 @@
-"""
-Simple ALPR runner — processes a video and saves detected plates to CSV.
-
-No tracking required — detects plates directly from each frame,
-deduplicates by plate number, and saves to CSV.
-
-Key fix: OCR often misreads the same plate slightly differently across frames
-(e.g. DL7CD5017 vs DL7CDS017). We use edit-distance fuzzy merging at the end
-to group near-identical plate strings and keep only one entry per real vehicle.
-
-Usage:
-  python scripts/run_alpr.py --source ALPR.mp4
-  python scripts/run_alpr.py --source mycarplate.mp4 --output output/results.csv
-"""
-
-import argparse
-import csv
-import sys
-from pathlib import Path
-from datetime import datetime, timezone
+"""ALPR - processes video and saves one entry per vehicle to CSV."""
+from __future__ import annotations
+import argparse, csv, re, sys
 from collections import defaultdict
-
+from datetime import datetime, timezone
+from pathlib import Path
 import cv2
-import numpy as np
-
-# Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-
-def _levenshtein(s1: str, s2: str) -> int:
-    """Compute the Levenshtein edit distance between two strings."""
-    if len(s1) < len(s2):
-        s1, s2 = s2, s1
-    if len(s2) == 0:
-        return len(s1)
-    prev = list(range(len(s2) + 1))
-    for i, c1 in enumerate(s1):
-        curr = [i + 1]
+def _lev(s1, s2):
+    if s1 == s2: return 0
+    if len(s1) < len(s2): s1, s2 = s2, s1
+    if not s2: return len(s1)
+    prev = list(range(len(s2)+1))
+    for c1 in s1:
+        curr = [prev[0]+1]
         for j, c2 in enumerate(s2):
-            curr.append(min(
-                prev[j + 1] + 1,   # deletion
-                curr[j] + 1,       # insertion
-                prev[j] + (0 if c1 == c2 else 1),  # substitution
-            ))
+            curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(c1!=c2)))
         prev = curr
     return prev[-1]
 
-
-def _merge_similar_plates(
-    plate_reads: dict[str, list],
-    max_edit_distance: int = 2,
-) -> dict[str, list]:
-
+def _fix_ocr(raw, validator):
+    """Validate raw OCR string and return canonical plate (or None).
+    
+    No O->Q correction here — that is handled by _resolve_canonical()
+    using multi-frame evidence across the full vehicle pass.
     """
-    Merge plate strings that differ by at most max_edit_distance characters.
+    plate, _ = validator.validate(raw)
+    return plate
 
-    Root cause: OCR reads the same physical plate as slightly different strings
-    across frames (e.g. DL7CD5017 vs DL7CDS017 vs DL7CD5O17). Without merging,
-    each variant creates a separate CSV row, giving more entries than real vehicles.
-
-    Strategy:
-      1. Sort plates by number of reads (most-read first = most reliable).
-      2. For each plate not yet assigned, group all others within edit distance.
-      3. Merge all reads into the most-read plate's bucket.
+def _character_vote(plates_with_conf, validator):
     """
-    plates = sorted(plate_reads.keys(), key=lambda p: len(plate_reads[p]), reverse=True)
-    merged: dict[str, list] = {}
-    assigned: set[str] = set()
+    Given a list of (plate_string, confidence) from multiple frames,
+    determine the best plate using per-character majority voting.
+    
+    This handles O/Q confusion correctly:
+    - If 40 frames read 'O' and 20 frames read 'Q' at position 5,
+      majority = 'O', so keep 'O' (it's a real O plate)
+    - If 10 frames read 'O' and 25 frames read 'Q' at position 5,
+      majority = 'Q', so use 'Q' (OCR was reading Q wrong as O)
+    
+    This is safe: a plate with real 'O' will consistently read 'O' across
+    most frames. A plate with 'Q' will sometimes read 'O' and sometimes 'Q'.
+    """
+    if not plates_with_conf:
+        return None
+    
+    # Only apply per-character voting for 10-char plates (standard format)
+    # For non-standard lengths, just take the most-read plate
+    lengths = set(len(p) for p, _ in plates_with_conf)
+    if len(lengths) != 1 or list(lengths)[0] != 10:
+        # Mixed lengths or non-standard: return most frequent
+        from collections import Counter
+        counts = Counter(p for p, _ in plates_with_conf)
+        return counts.most_common(1)[0][0]
+    
+    # Per-position character voting weighted by confidence
+    # For each position, count how many times each character appears
+    from collections import defaultdict
+    pos_char_conf = [defaultdict(float) for _ in range(10)]
+    pos_char_count = [defaultdict(int) for _ in range(10)]
+    
+    for plate, conf in plates_with_conf:
+        for i, ch in enumerate(plate):
+            pos_char_conf[i][ch] += conf
+            pos_char_count[i][ch] += 1
+    
+    # For each position, pick the character with highest total confidence
+    best_chars = []
+    for i in range(10):
+        if not pos_char_conf[i]:
+            return None
+        best_ch = max(pos_char_conf[i], key=lambda c: pos_char_conf[i][c])
+        best_chars.append(best_ch)
+    
+    voted = "".join(best_chars)
+    plate, _ = validator.validate(voted)
+    if plate:
+        return plate
+    
+    # Fallback: return the most frequent plate
+    from collections import Counter
+    counts = Counter(p for p, _ in plates_with_conf)
+    return counts.most_common(1)[0][0]
 
+
+def _resolve(reads, min_reads, max_dist):
+    if not reads: return None
+    plates = sorted(reads, key=lambda p: len(reads[p]), reverse=True)
+    assigned, merged = set(), {}
     for plate in plates:
-
-        if plate in assigned:
-            continue
-        # Start a new group with this plate as the canonical form
-        group_reads = list(plate_reads[plate])
-        assigned.add(plate)
-
+        if plate in assigned: continue
+        group = list(reads[plate]); assigned.add(plate)
         for other in plates:
-            if other in assigned:
-                continue
-            # Only compare plates of similar length (within 2 chars)
-            if abs(len(plate) - len(other)) > max_edit_distance:
-                continue
-            dist = _levenshtein(plate, other)
-            if dist <= max_edit_distance:
-                group_reads.extend(plate_reads[other])
-                assigned.add(other)
-
-        merged[plate] = group_reads
-
-    return merged
-
-
-def _classify_by_plate_number(plate_number: str) -> tuple[str, str]:
-    """Classify vehicle type from plate number. Returns (vehicle_type, plate_color)."""
-    if plate_number.startswith("BH"):
-        return ("Private", "White")
-    return ("Private", "White")
-
+            if other in assigned: continue
+            if abs(len(plate)-len(other)) > max_dist: continue
+            if _lev(plate, other) <= max_dist:
+                group.extend(reads[other]); assigned.add(other)
+        merged[plate] = group
+    best, best_score = None, -1.0
+    for plate, entries in merged.items():
+        if len(entries) < min_reads: continue
+        confs = [e[0] for e in entries]
+        score = len(entries) * (sum(confs)/len(confs))
+        if score > best_score: best_score, best = score, plate
+    if best is None: return None
+    entries = merged[best]
+    best_conf = max(e[0] for e in entries)
+    best_total = len(entries)
+    best_frame = min(e[1] for e in entries)
+    return (best, best_conf, best_total, best_frame)
 
 def main():
-    parser = argparse.ArgumentParser(description="ALPR — detect plates and save to CSV")
-    parser.add_argument("--source", required=True, help="Video file path")
-    parser.add_argument("--output", default="output/results.csv", help="Output CSV path")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--output", default="output/results.csv")
     parser.add_argument("--config", default="config/config.yaml")
-    parser.add_argument("--min-reads", type=int, default=2,
-                        help="Minimum consistent reads before storing a plate (default: 2)")
-    parser.add_argument("--max-edit-distance", type=int, default=2,
-                        help="Max edit distance to merge similar OCR reads (default: 2)")
+    parser.add_argument("--min-reads", type=int, default=2)
+    parser.add_argument("--max-edit-distance", type=int, default=2)
+    parser.add_argument("--max-gap-frames", type=int, default=13)
     args = parser.parse_args()
 
     from src.utils.config import load_config
     from src.utils.logger import get_logger
-    from src.detection.vehicle_detector import VehicleDetector
-    from src.detection.plate_detector import PlateDetector
-    from src.ocr import create_ocr_engine
     from src.validation.plate_validator import PlateValidator
-    from src.ocr.ocr_postprocessor import remove_noise_characters, correct_ocr_text
+    from ultralytics import YOLO
+    from paddleocr import PaddleOCR
 
     config = load_config(args.config)
     log = get_logger("run_alpr", config=config)
-    det_cfg = config["detection"]
+    validator = PlateValidator()
+    plate_model = YOLO(config["detection"]["plate_model_path"])
+    ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+    log.info("Models loaded. Video: %s", args.source)
 
-    log.info("Loading models...")
-    vehicle_detector = VehicleDetector(det_cfg["vehicle_model_path"], 0.2)
-    plate_detector   = PlateDetector(det_cfg["plate_model_path"], 0.15)
-    ocr_backend      = str(config.get("ocr", {}).get("backend", "paddleocr"))
-    ocr_engine       = create_ocr_engine(ocr_backend, config)
-    plate_validator  = PlateValidator()
-
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(args.source)
     if not cap.isOpened():
-        log.error("Cannot open video: %s", args.source)
-        sys.exit(1)
+        log.error("Cannot open: %s", args.source); sys.exit(1)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    log.info("Total frames: %d", total)
 
-    log.info("Processing video: %s | min_reads=%d | max_edit_dist=%d",
-             args.source, args.min_reads, args.max_edit_distance)
-
-    # Read all plate OCR hits into per-frame buckets first.
-    # This prevents the "same physical pass" from being split into multiple
-    # plate-number variants that later become multiple CSV rows.
-    #
-    # frame_idx -> list of (plate_number, confidence)
-    frame_hits: dict[int, list[tuple[str, float]]] = defaultdict(list)
+    frame_hits = defaultdict(list)
     frame_idx = 0
-
 
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
         frame_idx += 1
-
-        # Detect vehicles
-        detections = vehicle_detector.detect(frame)
-        if not detections:
-            continue
-
-        for det in detections:
-            x1, y1, x2, y2 = det.bbox
-            h, w = frame.shape[:2]
-            vehicle_crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-            if vehicle_crop.size == 0:
-                continue
-
-            # ── Plate detection ──────────────────────────────────────
-            plate_crops = plate_detector.detect(vehicle_crop)
-
-            # Fallback: only use bottom 35% of vehicle — ONE fallback, not three.
-            # Using multiple fallback crops was causing the same plate to be OCR'd
-            # multiple times per frame with different results → fake extra entries.
-            if not plate_crops:
-                h_v = vehicle_crop.shape[0]
-                bottom_crop = vehicle_crop[int(h_v * 0.65):, :]
-                if bottom_crop.size > 0:
-                    plate_crops = [bottom_crop]
-                else:
-                    continue
-
-            # Only process the BEST (first/highest-conf) plate per vehicle per frame
-            # to avoid reading the same plate multiple times per frame
-            plate_crop = plate_crops[0]
-            ph, pw = plate_crop.shape[:2]
-
-            # Upscale small plates
-            if pw < 150:
-                scale = max(150 / pw, 3.0)
-                ocr_input = cv2.resize(plate_crop, None, fx=scale, fy=scale,
-                                       interpolation=cv2.INTER_CUBIC)
-            elif pw < 200:
-                scale = max(200 / pw, 2.0)
-                ocr_input = cv2.resize(plate_crop, None, fx=scale, fy=scale,
-                                       interpolation=cv2.INTER_CUBIC)
-            else:
-                ocr_input = plate_crop
-
-            # OCR
-            raw_text, confidence = ocr_engine.recognize(ocr_input)
-            if not raw_text or confidence < 0.40:
-                continue
-
-            # Clean up OCR text
-            raw_text = remove_noise_characters(raw_text)
-            raw_text = raw_text.replace("IND", "").replace("INDIA", "").strip()
-            raw_text = correct_ocr_text(raw_text)
-
-            plate_number, series_type = plate_validator.validate(raw_text)
-            if plate_number is None:
-                continue
-
-            # bucket by frame; later we cluster consecutive frames into a pass
-            frame_hits[frame_idx].append((plate_number, confidence))
-            log.info("Frame %d: OCR='%s' conf=%.2f", frame_idx, plate_number, confidence)
-
+        h_f, w_f = frame.shape[:2]
+        results = plate_model(frame, verbose=False, conf=0.20)
+        for r in results:
+            if r.boxes is None or len(r.boxes) == 0: continue
+            for box in r.boxes:
+                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w_f, x2), min(h_f, y2)
+                if x2 <= x1 or y2 <= y1: continue
+                pcrop = frame[y1:y2, x1:x2].copy()
+                if pcrop.size == 0: continue
+                ph, pw = pcrop.shape[:2]
+                scale = max(200.0/pw if pw < 200 else 1.0, 64.0/ph if ph < 64 else 1.0)
+                if scale > 1.0:
+                    pcrop = cv2.resize(pcrop, (int(pw*scale), int(ph*scale)), interpolation=cv2.INTER_CUBIC)
+                result = ocr.ocr(pcrop, cls=True)
+                if not result or not result[0]: continue
+                texts, confs = [], []
+                for line in result[0]:
+                    if line:
+                        t, c = line[1]
+                        texts.append(t)
+                        confs.append(float(c))
+                if not texts: continue
+                raw = re.sub(r"[^A-Z0-9]", "", "".join(texts).upper().replace(" ", ""))
+                raw = raw.replace("IND", "").replace("INDIA", "")
+                if not raw: continue
+                avg_conf = sum(confs) / len(confs)
+                if avg_conf < 0.25: continue
+                plate = _fix_ocr(raw, validator)
+                if plate is None: continue
+                frame_hits[frame_idx].append((plate, avg_conf))
+                log.debug("Frame %04d  %s  %.2f", frame_idx, plate, avg_conf)
 
     cap.release()
+    log.info("Scan done. Frames with hits: %d / %d", len(frame_hits), frame_idx)
 
-    # ── Pass clustering over frames (prevents extra CSV rows) ────────────
-    # A “pass” is a cluster of consecutive frames where we saw plate OCR hits.
-    # Within each pass we pick the best plate after fuzzy-merging variants.
-    # This matches the expectation: one car pass → one CSV row.
-    frame_indices = sorted(frame_hits.keys())
-    if not frame_indices:
-        results = []
-    else:
-        # Larger gap groups more frame OCR hits into a single pass.
-        # Too small a gap can split one vehicle into multiple passes,
-        # reintroducing extra CSV rows.
-        max_gap_frames = 60  # configurable clustering gap for a single pass
+    hit_frames = sorted(frame_hits)
+    if not hit_frames:
+        print("No plates detected.")
+        return
 
-        
-        passes: list[list[int]] = []
-        current = [frame_indices[0]]
-        for idx in frame_indices[1:]:
-            if idx - current[-1] <= max_gap_frames:
-                current.append(idx)
-            else:
-                passes.append(current)
-                current = [idx]
-        passes.append(current)
+    passes, current = [], [hit_frames[0]]
+    for f in hit_frames[1:]:
+        if f - current[-1] <= args.max_gap_frames:
+            current.append(f)
+        else:
+            passes.append(current)
+            current = [f]
+    passes.append(current)
+    log.info("Vehicle passes: %d", len(passes))
 
-        results = []
+    results = []
+    for pf in passes:
+        pr = defaultdict(list)
+        for f in pf:
+            for plate, conf in frame_hits[f]:
+                pr[plate].append((conf, f))
+        out = _resolve(pr, args.min_reads, args.max_edit_distance)
+        if out is None:
+            log.info("Pass %d-%d skipped", pf[0], pf[-1])
+            continue
+        best_group_plate, conf, reads, first = out
 
-        for pass_frames in passes:
-            # Collect all OCR hits inside this pass
-            pass_plate_reads: dict[str, list[tuple[float, int]]] = defaultdict(list)
-            for fidx in pass_frames:
-                for plate_number, conf in frame_hits.get(fidx, []):
-                    pass_plate_reads[plate_number].append((conf, fidx))
+        # Character-level voting within the merged group to handle O/Q ambiguity
+        # This uses multi-frame evidence: if majority of frames read Q, use Q
+        # If majority read O, keep O (it might genuinely be O)
+        group_entries = []
+        for orig_plate in pr:
+            if _lev(orig_plate, best_group_plate) <= args.max_edit_distance:
+                for c, f in pr[orig_plate]:
+                    group_entries.append((orig_plate, c))
+        voted_plate = _character_vote(group_entries, validator)
+        plate = voted_plate if voted_plate else best_group_plate
+        _, series = validator.validate(plate)
+        log.info("VEHICLE: %s | reads=%d | conf=%.2f | frames %d-%d",
+                 plate, reads, conf, pf[0], pf[-1])
+        results.append({
+            "plate_number": plate,
+            "vehicle_type": "Private",
+            "plate_color": "White",
+            "series_type": series or "normal",
+            "confidence": f"{conf:.2f}",
+            "total_reads": reads,
+            "best_frame": first,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
 
-            # Fuzzy-merge variants within the pass.
-            # Use a slightly larger edit distance to aggressively collapse common OCR
-            # confusions between letters/digits that still pass validation.
-            merged_plate_reads = pass_plate_reads
-            if args.max_edit_distance > 0:
-                merged_plate_reads = _merge_similar_plates(
-                    pass_plate_reads,
-                    max_edit_distance=max(args.max_edit_distance, 3),
-                )
-
-
-            # Choose canonical plate for this pass: max reads, tie-break by max confidence
-            #
-            # Also collapse obviously-confused last-digit variants (e.g. HR26CQ6869 vs HR26CO6869 vs HR26CO6869)
-            # by selecting the lexicographically most-common 'shape'.
-            best_plate = None
-
-            best_reads = None
-            best_total_reads = -1
-            best_conf = -1.0
-            best_frame = None
-
-            for plate_number, reads in merged_plate_reads.items():
-
-                if len(reads) < args.min_reads:
-                    continue
-                total_reads = len(reads)
-                conf = max(r[0] for r in reads)
-                first_frame = min(r[1] for r in reads)
-
-                if total_reads > best_total_reads or (total_reads == best_total_reads and conf > best_conf):
-                    best_total_reads = total_reads
-                    best_conf = conf
-                    best_frame = first_frame
-                    best_plate = plate_number
-                    best_reads = reads
-
-            if not best_plate:
-                continue
-
-            _, series_type = plate_validator.validate(best_plate)
-            vehicle_type, color = _classify_by_plate_number(best_plate)
-
-            log.info("✅ FINAL PASS: %s | reads=%d | best_conf=%.2f", best_plate, best_total_reads, best_conf)
-            results.append({
-                "plate_number": best_plate,
-                "vehicle_type": vehicle_type,
-                "plate_color":  color,
-                "series_type":  series_type or "normal",
-                "confidence":   f"{best_conf:.2f}",
-                "total_reads":  best_total_reads,
-                "best_frame":   best_frame,
-                "timestamp":    datetime.now(timezone.utc).isoformat(),
-            })
-
-    # Sort by first frame seen (order of appearance in video)
-    results.sort(key=lambda x: x["best_frame"])
-
-
-
-    # ── Write CSV ───────────────────────────────────────────────────────
+    results.sort(key=lambda r: r["best_frame"])
     if results:
-        fieldnames = ["plate_number", "vehicle_type", "plate_color", "series_type",
-                      "confidence", "total_reads", "best_frame", "timestamp"]
-        with open(output_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(results)
-        log.info("✅ Results saved to: %s (%d plates)", output_path, len(results))
-    else:
-        log.warning("No plates detected with enough reads.")
+        fields = ["plate_number", "vehicle_type", "plate_color", "series_type",
+                  "confidence", "total_reads", "best_frame", "timestamp"]
+        with open(args.output, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(results)
+        log.info("Saved %d row(s) to %s", len(results), args.output)
 
-    print(f"\n{'='*50}")
-    print(f"RESULTS: {len(results)} unique plates detected")
-    print(f"{'='*50}")
+    print(f"\n{'='*50}\n  RESULTS: {len(results)} vehicle(s)\n{'='*50}")
     for r in results:
-        print(f"  {r['plate_number']} | reads={r['total_reads']} | conf={r['confidence']}")
-    print(f"\nSaved to: {output_path}")
-
+        print(f"  {r['plate_number']:15s}  reads={r['total_reads']:>3}  conf={r['confidence']}")
+    print(f"\n  Saved to: {args.output}\n")
 
 if __name__ == "__main__":
     main()
