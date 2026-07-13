@@ -1,0 +1,26 @@
+# Core Deep Learning
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
+
+# YOLO
+ultralytics==8.4.93
+ultralytics-thop==2.0.20
+
+# Image Processing & Data
+opencv-python==4.10.1.26
+pillow==12.2.0
+numpy==2.4.4
+
+# Data Science & Analysis
+pandas==2.2.3
+scipy==1.18.0
+
+# Configuration & Utilities
+pyyaml==6.0.3
+tqdm==4.68.4
+requests==2.34.2
+psutil==7.2.2
+
+# Visualization
+matplotlib==3.11.0

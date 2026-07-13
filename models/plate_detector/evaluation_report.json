@@ -1,0 +1,6 @@
+{
+  "model": "models/plate_detector/train-3/weights/best.pt",
+  "metrics": {
+    "fitness": 0.6918364999999173
+  }
+}

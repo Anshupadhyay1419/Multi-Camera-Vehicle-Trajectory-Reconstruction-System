@@ -223,7 +223,7 @@ def main():
                     with col_img:
                         img_path = event.get("image_path", "")
                         if img_path and Path(img_path).exists():
-                            st.image(img_path, width=120, use_column_width=False)
+                            st.image(img_path, width=120, use_container_width=False)
                         else:
                             st.markdown("📷 *No image*")
 

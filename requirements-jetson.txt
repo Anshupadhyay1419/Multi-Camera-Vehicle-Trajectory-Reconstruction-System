@@ -1,0 +1,60 @@
+# ============================================================================
+# ALPR University Gate — Jetson Orin Nano requirements (JetPack 7.2)
+# L4T 39.2 | Ubuntu 24.04 | CUDA 13.2 | cuDNN 9.20 | TensorRT 10.16 | Python 3.12
+#
+# DO NOT use requirements.txt on Jetson — that file has x86-only packages
+# (torch from PyPI, paddlepaddle, easyocr) that either fail to install or
+# run CPU-only on aarch64.
+#
+# Install order matters. Follow install_jetson.sh for the correct sequence.
+# ============================================================================
+
+# ── Computer vision (pure-C++ wheels, aarch64 available on PyPI) ─────────────
+opencv-python==4.10.0.84
+numpy==2.1.0
+
+# ── YOLO — ultralytics uses its own bundled torch for export; on Jetson it
+#    detects the system CUDA and uses TensorRT export path automatically ────────
+ultralytics==8.3.0
+
+# ── Tracking — pure-Python, no GPU dependency ────────────────────────────────
+supervision==0.25.0
+
+# ── OCR (Phase 1: CPU — RapidOCR on onnxruntime CPU while JP7.2 ort-gpu
+#    wheels are unavailable. Phase 2: swap to TensorRT engine after PARSeq
+#    fine-tuning. See src/ocr/tensorrt_engine.py) ─────────────────────────────
+rapidocr-onnxruntime==1.4.0
+# CPU-only onnxruntime — works on Python 3.12 aarch64 via PyPI.
+# When onnxruntime-gpu wheels become available for JP7.2 (check
+# https://pypi.jetson-ai-lab.dev/jp7/), replace this line with:
+#   onnxruntime-gpu==<version> --index-url https://pypi.jetson-ai-lab.dev/jp7/cu132
+onnxruntime==1.20.1
+
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlalchemy==2.0.30
+
+# ── API ───────────────────────────────────────────────────────────────────────
+fastapi==0.115.0
+uvicorn==0.32.0
+pydantic==2.9.2
+httpx==0.27.2
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+streamlit==1.39.0
+pandas==2.2.3
+plotly==5.24.1
+
+# ── Config / utils ────────────────────────────────────────────────────────────
+PyYAML==6.0.2
+
+# ── NOT included (reason) ─────────────────────────────────────────────────────
+# torch / torchvision  — no CUDA 13.2 wheels for JP7.2 yet; needed only for
+#                        Real-ESRGAN SR (disabled on Jetson) and EasyOCR.
+#                        Install manually from NVIDIA when available:
+#                        https://docs.nvidia.com/deeplearning/frameworks/install-pytorch-jetson-platform/
+# basicsr / realesrgan — depend on torch; SR is bypassed on Jetson (OpenCV
+#                        cubic upscale is used instead, see super_resolution.py)
+# easyocr              — depends on torch; not used on Jetson
+# paddlepaddle/paddleocr — no GPU on aarch64; not used on Jetson
+# transformers         — TrOCR backend not used; omitted to save 2 GB
+# albumentations       — training-only; not needed for inference on Jetson

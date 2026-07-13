@@ -1,0 +1,36 @@
+2026-07-14 03:10:32 - __main__ - INFO - ================================================================================
+2026-07-14 03:10:32 - __main__ - INFO - YOLOV8 LICENSE PLATE DETECTOR EVALUATION
+2026-07-14 03:10:32 - __main__ - INFO - ================================================================================
+2026-07-14 03:10:32 - __main__ - ERROR - ❌ Evaluation failed: Model not found: models/plate_detector/best.pt
+Traceback (most recent call last):
+  File "/home/projectwork/ansh_2026/alpr-university-gate/training/evaluate.py", line 305, in main
+    evaluator = ModelEvaluator(args.model, args.data, device=args.device)
+  File "/home/projectwork/ansh_2026/alpr-university-gate/training/evaluate.py", line 49, in __init__
+    raise FileNotFoundError(f"Model not found: {model_path}")
+FileNotFoundError: Model not found: models/plate_detector/best.pt
+2026-07-14 03:11:09 - __main__ - INFO - ================================================================================
+2026-07-14 03:11:09 - __main__ - INFO - YOLOV8 LICENSE PLATE DETECTOR EVALUATION
+2026-07-14 03:11:09 - __main__ - INFO - ================================================================================
+2026-07-14 03:11:09 - __main__ - INFO - Loading model: models/plate_detector/train-3/weights/best.pt
+2026-07-14 03:11:09 - __main__ - INFO - ✓ Model loaded
+2026-07-14 03:11:09 - __main__ - INFO - 
+================================================================================
+2026-07-14 03:11:09 - __main__ - INFO - EVALUATING ON TEST DATASET
+2026-07-14 03:11:09 - __main__ - INFO - ================================================================================
+2026-07-14 03:11:18 - __main__ - INFO - 
+Evaluation completed in 00:00:09
+2026-07-14 03:11:18 - __main__ - INFO - 
+================================================================================
+2026-07-14 03:11:18 - __main__ - INFO - TEST SET METRICS
+2026-07-14 03:11:18 - __main__ - INFO - ================================================================================
+2026-07-14 03:11:18 - __main__ - INFO - 
+Detection Metrics:
+2026-07-14 03:11:18 - __main__ - INFO -   fitness: 0.6918
+2026-07-14 03:11:18 - __main__ - INFO - ================================================================================
+2026-07-14 03:11:18 - __main__ - INFO - ✓ Evaluation report saved to /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/evaluation_report.json
+2026-07-14 03:11:18 - __main__ - INFO - 
+Running inference on images in dataset/test/images...
+2026-07-14 03:11:18 - __main__ - INFO - Found 978 images
+2026-07-14 03:11:26 - __main__ - INFO - ✓ Saved 978/978 predictions to models/plate_detector/predictions
+2026-07-14 03:11:26 - __main__ - INFO - 
+✓ Evaluation completed successfully

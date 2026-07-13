@@ -12,7 +12,6 @@ Environment variable: DB_URL
 from __future__ import annotations
 
 import os
-import shutil
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +19,7 @@ from typing import Generator, Optional
 from urllib.parse import urlparse
 
 import numpy as np
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.database.models import Base, VehicleEvent
@@ -72,14 +71,19 @@ def init_db(db_url: str = None) -> None:
         raise ValueError(f"Unsupported database scheme: {scheme}")
 
     # Create engine with connection pooling
-    engine_kwargs = {
-        "echo": False,
-        "pool_size": 20 if _db_type == "postgres" else 5,
-        "max_overflow": 40 if _db_type == "postgres" else 10,
-    }
-
     if _db_type == "postgres":
-        engine_kwargs["pool_pre_ping"] = True  # Verify connections before use
+        engine_kwargs = {
+            "echo": False,
+            "pool_size": 20,
+            "max_overflow": 40,
+            "pool_pre_ping": True,  # Verify connections before use
+        }
+    else:
+        # SQLite does not support pool_size / max_overflow
+        engine_kwargs = {
+            "echo": False,
+            "connect_args": {"check_same_thread": False},
+        }
 
     _engine = create_engine(db_url, **engine_kwargs)
 
@@ -199,9 +203,9 @@ def get_events_by_direction(session: Session, direction: str, limit: int = 100) 
 
 def get_daily_stats(session: Session) -> dict:
     """Return today's traffic statistics."""
-    from sqlalchemy import and_, func
-    from datetime import datetime, date
-    
+    from sqlalchemy import and_
+    from datetime import date
+
     today = date.today()
     today_start = datetime(today.year, today.month, today.day)
     today_end = datetime(today.year, today.month, today.day, 23, 59, 59)
@@ -224,83 +228,6 @@ def get_daily_stats(session: Session) -> dict:
         "unique_vehicles": unique_vehicles,
         "total_events": len(events),
     }
-
-
-@contextmanager
-def get_session() -> Generator[Session, None, None]:
-    """Context manager that yields a database session."""
-    if _SessionFactory is None:
-        raise RuntimeError("Database not initialized. Call init_db() first.")
-    session = _SessionFactory()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
-
-
-def insert_event(session: Session, event_data: dict) -> Optional[VehicleEvent]:
-    """Insert a vehicle event record with one retry on failure.
-
-    Args:
-        session:    Active SQLAlchemy session.
-        event_data: Dict with keys matching VehicleEvent columns.
-
-    Returns:
-        The inserted VehicleEvent, or None if both attempts failed.
-    """
-    for attempt in range(2):
-        try:
-            event = VehicleEvent(
-                plate_number=event_data["plate_number"],
-                vehicle_type=event_data["vehicle_type"],
-                plate_color=event_data["plate_color"],
-                series_type=event_data["series_type"],
-                timestamp=event_data.get(
-                    "timestamp",
-                    datetime.now(timezone.utc).isoformat()
-                ),
-                direction=event_data["direction"],
-                image_path=event_data.get("image_path", ""),
-            )
-            session.add(event)
-            session.flush()
-            return event
-        except Exception as exc:
-            if attempt == 0:
-                _logger.error(
-                    "DB insert failed (attempt 1), retrying: %s", exc
-                )
-                session.rollback()
-            else:
-                _logger.error(
-                    "DB insert failed (attempt 2), discarding event: %s", exc
-                )
-    return None
-
-
-def get_all_events(session: Session) -> list[dict]:
-    """Return all vehicle events ordered by timestamp descending."""
-    events = (
-        session.query(VehicleEvent)
-        .order_by(VehicleEvent.timestamp.desc())
-        .all()
-    )
-    return [e.to_dict() for e in events]
-
-
-def search_events(session: Session, plate_number: str) -> list[dict]:
-    """Return all events matching the given plate number."""
-    events = (
-        session.query(VehicleEvent)
-        .filter(VehicleEvent.plate_number == plate_number)
-        .order_by(VehicleEvent.timestamp.desc())
-        .all()
-    )
-    return [e.to_dict() for e in events]
 
 
 def save_plate_image(

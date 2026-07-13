@@ -1,0 +1,77 @@
+{
+  "model": "yolov8s",
+  "training_config": {
+    "epochs": 100,
+    "batch_size": 32,
+    "imgsz": 640,
+    "device": 0,
+    "optimizer": "SGD",
+    "lr0": 0.01,
+    "lrf": 0.01,
+    "momentum": 0.937,
+    "weight_decay": 0.0005,
+    "warmup_epochs": 3.0,
+    "warmup_momentum": 0.8,
+    "warmup_bias_lr": 0.1,
+    "scheduler": "cosine",
+    "cos_lr": true,
+    "patience": 20,
+    "min_delta": 0.0,
+    "amp": true,
+    "seed": 42,
+    "deterministic": false,
+    "workers": 8,
+    "cache": "ram",
+    "rect": false,
+    "mosaic": 1.0,
+    "mixup": 0.1,
+    "val": true,
+    "save": true,
+    "save_period": 10,
+    "plots": true,
+    "profile": false,
+    "verbose": true,
+    "project": "/home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector",
+    "name": "train"
+  },
+  "augmentation_config": {
+    "degrees": 10.0,
+    "translate": 0.1,
+    "scale": [
+      0.85,
+      1.15
+    ],
+    "flipud": 0.0,
+    "fliplr": 0.5,
+    "perspective": 0.0,
+    "shear": 0.0,
+    "hsv_h": 0.015,
+    "hsv_s": 0.3,
+    "hsv_v": 0.3,
+    "blur": 0.0,
+    "motion_blur": 0.0,
+    "mixup": 0.1,
+    "copy_paste": 0.0,
+    "erasing": 0.0,
+    "cutout": 0.0,
+    "crop_fraction": 1.0
+  },
+  "dataset_stats": {
+    "train_images": 20580,
+    "val_images": 4116,
+    "test_images": 978,
+    "total_images": 25674,
+    "classes": 1,
+    "class_names": {
+      "0": "license_plate"
+    },
+    "avg_annotations_per_image": 1.04
+  },
+  "hardware": {
+    "gpu_model": "RTX 2000 Ada",
+    "vram_gb": 11,
+    "target_deployment": "Jetson Orin Nano",
+    "deployment_vram_gb": 8,
+    "deployment_compute_capability": 8.7
+  }
+}

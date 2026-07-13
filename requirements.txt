@@ -2,7 +2,37 @@
 ultralytics==8.2.0
 supervision==0.20.0
 
-# PaddleOCR
+# ── OCR ───────────────────────────────────────────────────────────────────────
+# PRIMARY: RapidOCR — PP-OCR ONNX models without PaddlePaddle dependency.
+# The onnxruntime backend automatically uses GPU when available.
+rapidocr-onnxruntime==1.4.0
+
+# ── ONNX Runtime — install the correct variant for your platform ──────────────
+#
+# x86 dev machine:
+#   pip install onnxruntime-gpu==1.18.0
+#
+# Jetson Orin — JetPack 6.x (L4T 36, CUDA 12.6, Python 3.10, Ubuntu 22.04):
+#   PyPI onnxruntime-gpu has no ARM64 wheel. Use NVIDIA's index instead:
+#   pip install onnxruntime-gpu==1.20.2 \
+#     --index-url https://pypi.jetson-ai-lab.dev/jp6/cu126
+#   This is the ONLY way to get CUDAExecutionProvider on JetPack 6.
+#
+# Jetson Orin — JetPack 7.2 (L4T 39.2, CUDA 13.2, Python 3.12, Ubuntu 24.04):
+#   No pre-built GPU wheels exist yet (as of July 2026). Options:
+#     1. CPU-only (default): pip install onnxruntime==1.20.2
+#        RapidOCR will run on CPU — still fast enough (~80-120ms/crop).
+#     2. Build from source: https://onnxruntime.ai/docs/build/inferencing.html
+#        Pass --use_cuda --cuda_version=13.2 — takes ~2-3hrs on-device.
+#   Track wheel availability: https://pypi.jetson-ai-lab.dev/jp7/
+#
+# Default (CPU — works everywhere, change for GPU):
+onnxruntime==1.20.2
+
+# FALLBACK / dev alternatives (not used on Jetson):
+# EasyOCR — general-purpose, lower accuracy on Indian plates
+easyocr==1.7.2
+# PaddleOCR — x86 only, no GPU on Jetson aarch64
 paddlepaddle==3.0.0
 paddleocr==2.9.1
 

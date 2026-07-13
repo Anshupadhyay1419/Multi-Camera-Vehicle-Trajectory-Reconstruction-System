@@ -1,0 +1,132 @@
+2026-07-13 20:52:47 - __main__ - INFO - 
+================================================================================
+2026-07-13 20:52:47 - __main__ - INFO - Checking environment...
+2026-07-13 20:52:47 - __main__ - INFO - ✓ GPU: NVIDIA RTX 2000 Ada Generation
+2026-07-13 20:52:47 - __main__ - INFO -   VRAM: 15.7 GB
+2026-07-13 20:52:47 - __main__ - INFO - ✓ Dataset: /home/projectwork/ansh_2026/alpr-university-gate/dataset/data.yaml
+2026-07-13 20:52:47 - __main__ - INFO - ✓ Model: YOLOv8s (will download pretrained weights if needed)
+2026-07-13 20:52:47 - __main__ - INFO - ================================================================================
+2026-07-13 20:52:47 - __main__ - INFO - ✓ Configuration saved to /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/config.json
+2026-07-13 20:52:47 - __main__ - INFO - ================================================================================
+2026-07-13 20:52:47 - __main__ - INFO - STARTING TRAINING
+2026-07-13 20:52:47 - __main__ - INFO - ================================================================================
+2026-07-13 20:52:47 - __main__ - INFO - Model: yolov8s
+2026-07-13 20:52:47 - __main__ - INFO - Dataset size: 20,580 images
+2026-07-13 20:52:47 - __main__ - INFO - Batch size: 32
+2026-07-13 20:52:47 - __main__ - INFO - Steps per epoch: 643
+2026-07-13 20:52:47 - __main__ - INFO - Total epochs: 100
+2026-07-13 20:52:47 - __main__ - INFO - GPU: NVIDIA RTX 2000 Ada Generation
+2026-07-13 20:52:47 - __main__ - INFO - ================================================================================
+2026-07-13 20:52:47 - __main__ - INFO - 
+Loading model: YOLOv8s...
+2026-07-13 20:52:47 - __main__ - INFO - ✓ Model loaded successfully
+2026-07-13 20:52:47 - __main__ - INFO -   Parameters: 11,166,560
+2026-07-13 20:52:47 - __main__ - ERROR - ❌ Training failed: 'mosaic'
+Traceback (most recent call last):
+  File "/home/projectwork/ansh_2026/alpr-university-gate/training/train.py", line 211, in train
+    args = create_yolo_training_args()
+  File "/home/projectwork/ansh_2026/alpr-university-gate/training/train.py", line 150, in create_yolo_training_args
+    "mosaic": AUGMENTATION_CONFIG["mosaic"],
+              ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+KeyError: 'mosaic'
+2026-07-13 20:53:23 - __main__ - INFO - 
+================================================================================
+2026-07-13 20:53:23 - __main__ - INFO - Checking environment...
+2026-07-13 20:53:23 - __main__ - INFO - ✓ GPU: NVIDIA RTX 2000 Ada Generation
+2026-07-13 20:53:23 - __main__ - INFO -   VRAM: 15.7 GB
+2026-07-13 20:53:23 - __main__ - INFO - ✓ Dataset: /home/projectwork/ansh_2026/alpr-university-gate/dataset/data.yaml
+2026-07-13 20:53:23 - __main__ - INFO - ✓ Model: YOLOv8s (will download pretrained weights if needed)
+2026-07-13 20:53:23 - __main__ - INFO - ================================================================================
+2026-07-13 20:53:23 - __main__ - INFO - ✓ Configuration saved to /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/config.json
+2026-07-13 20:53:23 - __main__ - INFO - ================================================================================
+2026-07-13 20:53:23 - __main__ - INFO - STARTING TRAINING
+2026-07-13 20:53:23 - __main__ - INFO - ================================================================================
+2026-07-13 20:53:23 - __main__ - INFO - Model: yolov8s
+2026-07-13 20:53:23 - __main__ - INFO - Dataset size: 20,580 images
+2026-07-13 20:53:23 - __main__ - INFO - Batch size: 32
+2026-07-13 20:53:23 - __main__ - INFO - Steps per epoch: 643
+2026-07-13 20:53:23 - __main__ - INFO - Total epochs: 100
+2026-07-13 20:53:23 - __main__ - INFO - GPU: NVIDIA RTX 2000 Ada Generation
+2026-07-13 20:53:23 - __main__ - INFO - ================================================================================
+2026-07-13 20:53:23 - __main__ - INFO - 
+Loading model: YOLOv8s...
+2026-07-13 20:53:23 - __main__ - INFO - ✓ Model loaded successfully
+2026-07-13 20:53:23 - __main__ - INFO -   Parameters: 11,166,560
+2026-07-13 20:53:23 - __main__ - INFO - 
+Starting training...
+2026-07-13 20:53:23 - __main__ - INFO - --------------------------------------------------------------------------------
+2026-07-13 20:58:11 - __main__ - INFO - 
+================================================================================
+2026-07-13 20:58:11 - __main__ - INFO - Checking environment...
+2026-07-13 20:58:11 - __main__ - INFO - ✓ GPU: NVIDIA RTX 2000 Ada Generation
+2026-07-13 20:58:11 - __main__ - INFO -   VRAM: 15.7 GB
+2026-07-13 20:58:11 - __main__ - INFO - ✓ Dataset: /home/projectwork/ansh_2026/alpr-university-gate/dataset/data.yaml
+2026-07-13 20:58:11 - __main__ - INFO - ✓ Model: YOLOv8s (will download pretrained weights if needed)
+2026-07-13 20:58:11 - __main__ - INFO - ================================================================================
+2026-07-13 20:58:11 - __main__ - INFO - ✓ Configuration saved to /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/config.json
+2026-07-13 20:58:11 - __main__ - INFO - ================================================================================
+2026-07-13 20:58:11 - __main__ - INFO - STARTING TRAINING
+2026-07-13 20:58:11 - __main__ - INFO - ================================================================================
+2026-07-13 20:58:11 - __main__ - INFO - Model: yolov8s
+2026-07-13 20:58:11 - __main__ - INFO - Dataset size: 20,580 images
+2026-07-13 20:58:11 - __main__ - INFO - Batch size: 32
+2026-07-13 20:58:11 - __main__ - INFO - Steps per epoch: 643
+2026-07-13 20:58:11 - __main__ - INFO - Total epochs: 100
+2026-07-13 20:58:11 - __main__ - INFO - GPU: NVIDIA RTX 2000 Ada Generation
+2026-07-13 20:58:11 - __main__ - INFO - ================================================================================
+2026-07-13 20:58:11 - __main__ - INFO - 
+Loading model: YOLOv8s...
+2026-07-13 20:58:11 - __main__ - INFO - ✓ Model loaded successfully
+2026-07-13 20:58:11 - __main__ - INFO -   Parameters: 11,166,560
+2026-07-13 20:58:11 - __main__ - INFO - 
+Starting training...
+2026-07-13 20:58:11 - __main__ - INFO - --------------------------------------------------------------------------------
+2026-07-13 20:58:11 - __main__ - INFO - Training will display metrics for each epoch...
+2026-07-13 20:58:11 - __main__ - INFO - Watch GPU usage and loss metrics below:
+2026-07-13 20:58:11 - __main__ - INFO - --------------------------------------------------------------------------------
+2026-07-13 20:58:11 - __main__ - ERROR - ❌ Training failed: ultralytics.engine.model.Model.train() got multiple values for keyword argument 'verbose'
+Traceback (most recent call last):
+  File "/home/projectwork/ansh_2026/alpr-university-gate/training/train.py", line 263, in train
+    results = model.train(
+        **args,
+        verbose=True  # Show all training progress
+    )
+TypeError: ultralytics.engine.model.Model.train() got multiple values for keyword argument 'verbose'
+2026-07-13 20:58:44 - __main__ - INFO - 
+================================================================================
+2026-07-13 20:58:44 - __main__ - INFO - Checking environment...
+2026-07-13 20:58:44 - __main__ - INFO - ✓ GPU: NVIDIA RTX 2000 Ada Generation
+2026-07-13 20:58:44 - __main__ - INFO -   VRAM: 15.7 GB
+2026-07-13 20:58:44 - __main__ - INFO - ✓ Dataset: /home/projectwork/ansh_2026/alpr-university-gate/dataset/data.yaml
+2026-07-13 20:58:44 - __main__ - INFO - ✓ Model: YOLOv8s (will download pretrained weights if needed)
+2026-07-13 20:58:44 - __main__ - INFO - ================================================================================
+2026-07-13 20:58:44 - __main__ - INFO - ✓ Configuration saved to /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/config.json
+2026-07-13 20:58:44 - __main__ - INFO - ================================================================================
+2026-07-13 20:58:44 - __main__ - INFO - STARTING TRAINING
+2026-07-13 20:58:44 - __main__ - INFO - ================================================================================
+2026-07-13 20:58:44 - __main__ - INFO - Model: yolov8s
+2026-07-13 20:58:44 - __main__ - INFO - Dataset size: 20,580 images
+2026-07-13 20:58:44 - __main__ - INFO - Batch size: 32
+2026-07-13 20:58:44 - __main__ - INFO - Steps per epoch: 643
+2026-07-13 20:58:44 - __main__ - INFO - Total epochs: 100
+2026-07-13 20:58:44 - __main__ - INFO - GPU: NVIDIA RTX 2000 Ada Generation
+2026-07-13 20:58:44 - __main__ - INFO - ================================================================================
+2026-07-13 20:58:44 - __main__ - INFO - 
+Loading model: YOLOv8s...
+2026-07-13 20:58:44 - __main__ - INFO - ✓ Model loaded successfully
+2026-07-13 20:58:44 - __main__ - INFO -   Parameters: 11,166,560
+2026-07-13 20:58:44 - __main__ - INFO - 
+Starting training...
+2026-07-13 20:58:44 - __main__ - INFO - --------------------------------------------------------------------------------
+2026-07-13 20:58:44 - __main__ - INFO - Training will display metrics for each epoch...
+2026-07-13 20:58:44 - __main__ - INFO - Watch GPU usage and loss metrics below:
+2026-07-13 20:58:44 - __main__ - INFO - --------------------------------------------------------------------------------
+2026-07-14 03:06:49 - __main__ - INFO - --------------------------------------------------------------------------------
+2026-07-14 03:06:49 - __main__ - INFO - 
+================================================================================
+2026-07-14 03:06:49 - __main__ - INFO - FINAL TRAINING METRICS
+2026-07-14 03:06:49 - __main__ - INFO - ================================================================================
+2026-07-14 03:06:49 - __main__ - INFO - 
+✓ Training completed successfully!
+2026-07-14 03:06:49 - __main__ - INFO -   Total time: 06:08:05
+2026-07-14 03:06:49 - __main__ - INFO -   Output: /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector

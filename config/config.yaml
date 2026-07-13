@@ -19,21 +19,54 @@ preprocessing:
   sharpen_strength: 1.5
 
 enhancement:
-  sr_threshold_px: 180          # Apply super-resolution only for very small plates < 180px
+  # sr_threshold_px: plates narrower than this (px) get upscaled before OCR.
+  # On Jetson 7.2: Real-ESRGAN is unavailable (no PyTorch wheel yet) so
+  # OpenCV INTER_CUBIC upscale is used automatically — still helpful.
+  # Set to 0 to disable upscaling entirely.
+  sr_threshold_px: 180
   realesrgan_model_path: "models/realesrgan/RealESRGAN_x4plus.pth"
 
 ocr:
-  backend: "paddleocr"                     # Fast single OCR engine (NOT ensemble)
+  # ── Backend selection ─────────────────────────────────────────────────────
+  # JetPack 7.2  Phase 1 (current):  "rapidocr"  — PP-OCR via onnxruntime CPU
+  # JetPack 7.2  Phase 2 (PARSeq fine-tuned): switch to "tensorrt"
+  # x86 dev:                          "rapidocr" or "paddleocr"
+  backend: "rapidocr"
+
+  # ── RapidOCR (Phase 1 — active) ───────────────────────────────────────────
+  # Runs PP-OCRv3/v4 ONNX models via onnxruntime (CPU on JetPack 7.2).
+  # No PaddlePaddle dependency. ~80–120ms/crop on Jetson Orin Nano CPU.
+  # OCRFusion window of 5 frames compensates for the slower per-frame latency.
+  rapidocr:
+    text_score: 0.5       # minimum confidence per text region (0.4–0.6)
+    use_det: true         # text region detection inside crop (recommended)
+    use_cls: true         # angle classifier — handles rotated/upside-down plates
+    use_rec: true         # recognition (always true)
+
+  # ── TensorRT PARSeq (Phase 2 — activate after fine-tuning) ───────────────
+  # GPU inference via TensorRT 10.16 (pre-installed with JetPack 7.2).
+  # ~5ms/crop. Switch backend to "tensorrt" after building the .engine file.
+  # Full build instructions: src/ocr/tensorrt_engine.py
+  tensorrt:
+    engine_path: "models/ocr/parseq_plate.engine"
+    input_size: [32, 128]     # H x W — must match trtexec --optShapes
+    charset: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+  # ── Other backends (x86 dev / fallback) ──────────────────────────────────
   paddleocr:
     use_angle_cls: true
     lang: "en"
+  easyocr:
+    lang: ["en"]
+    gpu: true
+    allowlist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
   trocr:
     model_name: "microsoft/trocr-base-printed"
   ensemble:
-    backends: ["paddleocr", "trocr"]
+    backends: ["rapidocr"]
     min_vote_count: 1
     use_variants: true
-  confidence_threshold: 0.70                # HIGH threshold: reject low-confidence wrong reads
+  confidence_threshold: 0.70                # reject reads below this confidence
 
 fusion:
   window_size: 5                           # majority vote over 5 reads for accuracy
@@ -58,8 +91,10 @@ direction:
   dual_camera: false
 
 motion_filter:
-  min_displacement_px: 2.0     # very low — Real-ESRGAN slows frame rate so less movement per frame
-  history_frames: 3            # fewer frames needed
+  # On Jetson with OpenCV upscale (no Real-ESRGAN), the pipeline is faster
+  # per frame, so displacement per frame is slightly higher than with SR.
+  min_displacement_px: 3.0
+  history_frames: 3
 
 database:
   path: "data/alpr.db"

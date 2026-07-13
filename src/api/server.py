@@ -12,6 +12,7 @@ Run with:
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
@@ -23,21 +24,25 @@ from src.utils.logger import get_logger
 
 _logger = get_logger("api.server")
 
-app = FastAPI(
-    title="ALPR University Gate API",
-    description="License plate recognition entry/exit log API",
-    version="1.0.0",
-)
 
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database on startup."""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize resources on startup, clean up on shutdown."""
     try:
         database.init_db()
         _logger.info("Database initialized at startup")
     except Exception as exc:
         _logger.error("Failed to initialize database: %s", exc)
+    yield
+    # shutdown — nothing to release for SQLite; connection pool closes itself
+
+
+app = FastAPI(
+    title="ALPR University Gate API",
+    description="License plate recognition entry/exit log API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 def _get_db_session():

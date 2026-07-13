@@ -216,7 +216,9 @@ def run_pipeline(config: dict) -> None:
 
                 plate_crop = plate_crops[0]
 
-                # Save best crop for this track (used at fusion time)
+                # Save best crop for this track (used at fusion time).
+                # Store the raw plate_crop so the preprocessor can run fresh
+                # at fusion time (potentially with SR enhancement).
                 if tid not in track_plate_crops:
                     track_plate_crops[tid] = plate_crop
                     track_plate_crops[f"{tid}_vehicle"] = vehicle_crop
@@ -224,18 +226,20 @@ def run_pipeline(config: dict) -> None:
                 # Preprocessing (fast — no SR in live loop)
                 preprocessed = plate_preprocessor.process(plate_crop)
 
-                # Upscale small plates with fast OpenCV resize before OCR
-                h_p, w_p = plate_crop.shape[:2]
+                # Upscale small plates with fast OpenCV resize before OCR.
+                # Use the preprocessed crop (CLAHE + denoise + sharpen applied)
+                # rather than the raw plate_crop so OCR gets a cleaner input.
+                h_p, w_p = preprocessed.shape[:2]
                 if w_p < 200:
                     scale = max(200 / w_p, 2.0)
                     ocr_input = cv2.resize(
-                        plate_crop, None, fx=scale, fy=scale,
+                        preprocessed, None, fx=scale, fy=scale,
                         interpolation=cv2.INTER_CUBIC
                     )
                 else:
-                    ocr_input = plate_crop
+                    ocr_input = preprocessed
 
-                # OCR on upscaled BGR crop
+                # OCR on upscaled preprocessed crop
                 raw_text, confidence = ocr_engine.recognize(ocr_input)
                 if not raw_text:
                     continue

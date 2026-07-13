@@ -123,15 +123,16 @@ def main():
     from src.utils.config import load_config
     from src.utils.logger import get_logger
     from src.validation.plate_validator import PlateValidator
+    from src.ocr import create_ocr_engine
     from ultralytics import YOLO
-    from paddleocr import PaddleOCR
 
     config = load_config(args.config)
     log = get_logger("run_alpr", config=config)
     validator = PlateValidator()
     plate_model = YOLO(config["detection"]["plate_model_path"])
-    ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
-    log.info("Models loaded. Video: %s", args.source)
+    ocr_backend = str(config.get("ocr", {}).get("backend", "easyocr"))
+    ocr = create_ocr_engine(ocr_backend, config)
+    log.info("Models loaded. OCR backend: %s. Video: %s", ocr_backend, args.source)
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(args.source)
@@ -162,20 +163,10 @@ def main():
                 scale = max(200.0/pw if pw < 200 else 1.0, 64.0/ph if ph < 64 else 1.0)
                 if scale > 1.0:
                     pcrop = cv2.resize(pcrop, (int(pw*scale), int(ph*scale)), interpolation=cv2.INTER_CUBIC)
-                result = ocr.ocr(pcrop, cls=True)
-                if not result or not result[0]: continue
-                texts, confs = [], []
-                for line in result[0]:
-                    if line:
-                        t, c = line[1]
-                        texts.append(t)
-                        confs.append(float(c))
-                if not texts: continue
-                raw = re.sub(r"[^A-Z0-9]", "", "".join(texts).upper().replace(" ", ""))
+                text, avg_conf = ocr.recognize(pcrop)
+                if not text or avg_conf < 0.25: continue
+                raw = re.sub(r"[^A-Z0-9]", "", text.upper().replace(" ", ""))
                 raw = raw.replace("IND", "").replace("INDIA", "")
-                if not raw: continue
-                avg_conf = sum(confs) / len(confs)
-                if avg_conf < 0.25: continue
                 plate = _fix_ocr(raw, validator)
                 if plate is None: continue
                 frame_hits[frame_idx].append((plate, avg_conf))
