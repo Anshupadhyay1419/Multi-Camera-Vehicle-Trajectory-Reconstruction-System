@@ -8,6 +8,7 @@
 #   ./install_jetson.sh
 #
 # What this script does (in order):
+#   0. Installs git-lfs (arm64) and pulls real model weights from GitHub LFS
 #   1. Verifies JetPack version and Python 3.12
 #   2. Installs system packages needed by OpenCV and SQLite
 #   3. Installs TensorRT Python bindings (pre-built with JetPack)
@@ -41,6 +42,61 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 info "Project root: $SCRIPT_DIR"
+
+# ── Step 0a: install git-lfs and pull real model weights ─────────────────────
+info "Step 0/7 — Installing git-lfs and pulling model weights from GitHub LFS"
+
+install_git_lfs() {
+    # Try apt first (works if git-lfs is in Ubuntu 24.04 repos)
+    if sudo apt-get install -y --no-install-recommends git-lfs 2>/dev/null; then
+        return 0
+    fi
+    # Fallback: download ARM64 binary directly (JetPack = aarch64)
+    info "apt install failed — downloading git-lfs ARM64 binary..."
+    local LFS_VER="3.5.1"
+    local LFS_URL="https://github.com/git-lfs/git-lfs/releases/download/v${LFS_VER}/git-lfs-linux-arm64-v${LFS_VER}.tar.gz"
+    local TMP_DIR
+    TMP_DIR=$(mktemp -d)
+    curl -sL "$LFS_URL" -o "$TMP_DIR/git-lfs.tar.gz"
+    tar -xzf "$TMP_DIR/git-lfs.tar.gz" -C "$TMP_DIR"
+    mkdir -p "$HOME/.local/bin"
+    cp "$TMP_DIR/git-lfs-${LFS_VER}/git-lfs" "$HOME/.local/bin/"
+    export PATH="$HOME/.local/bin:$PATH"
+    rm -rf "$TMP_DIR"
+}
+
+if ! command -v git-lfs &>/dev/null; then
+    install_git_lfs
+fi
+
+export PATH="$HOME/.local/bin:$PATH"
+
+if command -v git-lfs &>/dev/null; then
+    git lfs install --skip-repo 2>/dev/null || true
+    success "git-lfs $(git lfs version | awk '{print $1}')"
+else
+    warn "git-lfs could not be installed. Model weights may be LFS pointer stubs."
+fi
+
+# Pull actual weight files (replaces LFS pointer stubs with real binaries)
+info "Pulling model weights via git lfs pull..."
+git lfs pull && success "Model weights downloaded" || \
+    warn "git lfs pull failed — weights may be pointer stubs. " \
+         "Run 'git lfs pull' manually after fixing git-lfs installation."
+
+# Verify best.pt is a real PyTorch file, not a pointer stub
+BEST_PT="models/plate_detector/best.pt"
+if [[ -f "$BEST_PT" ]]; then
+    FILE_SIZE=$(stat -c%s "$BEST_PT" 2>/dev/null || echo 0)
+    if [[ "$FILE_SIZE" -lt 1000 ]]; then
+        warn "$BEST_PT is only ${FILE_SIZE} bytes — likely still an LFS pointer stub!"
+        warn "Run: git lfs pull   to download the real weights."
+    else
+        success "$BEST_PT — $(du -sh "$BEST_PT" | cut -f1) — real weight file confirmed"
+    fi
+else
+    warn "$BEST_PT not found. Run 'git lfs pull' after verifying git-lfs is installed."
+fi
 
 # ── Step 1: verify environment ────────────────────────────────────────────────
 info "Step 1/7 — Verifying environment"
@@ -218,20 +274,24 @@ fi
 
 echo ""
 echo -e "${CYAN}Next steps:${NC}"
-echo "  1. Copy your model weights to the Jetson:"
-echo "     scp models/plate_detector/best.pt  jetson:$(pwd)/models/plate_detector/"
-echo "     scp models/vehicle_detector/yolov8n.pt  jetson:$(pwd)/models/vehicle_detector/"
+echo "  1. Model weights are already in models/ (downloaded via git lfs pull above)."
+echo "     The vehicle detector (yolov8n.pt) will auto-download on first run."
 echo ""
-echo "  2. Run the pipeline (Phase 1 — RapidOCR CPU):"
-echo "     python3 scripts/run_pipeline.py --source ALPR.mp4"
+echo "  2. Set your RTSP camera URL in config/config.yaml:"
+echo "     video:"
+echo "       source: \"rtsp://admin:password@192.168.1.100:554/stream1\""
+echo "     Or pass it at runtime: --source rtsp://..."
 echo ""
-echo "  3. Run the API server:"
+echo "  3. Run the pipeline (Phase 1 — RapidOCR CPU):"
+echo "     python3 scripts/run_pipeline.py --source rtsp://..."
+echo ""
+echo "  4. Run the API server:"
 echo "     uvicorn src.api.server:app --host 0.0.0.0 --port 8000"
 echo ""
-echo "  4. Run the dashboard:"
+echo "  5. Run the dashboard:"
 echo "     streamlit run src/dashboard/app.py --server.port 8501"
 echo ""
-echo "  5. Phase 2 (after PARSeq fine-tuning on dev machine):"
+echo "  6. Phase 2 — GPU OCR (after PARSeq fine-tuning on dev machine):"
 echo "     trtexec --onnx=models/ocr/parseq_plate.onnx \\"
 echo "             --saveEngine=models/ocr/parseq_plate.engine \\"
 echo "             --fp16 \\"
