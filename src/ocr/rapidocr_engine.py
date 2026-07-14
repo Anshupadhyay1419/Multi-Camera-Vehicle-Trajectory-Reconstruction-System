@@ -146,6 +146,12 @@ class RapidOCREngine(OCREngine):
             text is uppercase alphanumeric only (noise stripped).
             confidence is in [0.0, 1.0].
             Returns ("", 0.0) on any failure.
+
+        Note on API versions:
+            rapidocr-onnxruntime < 1.4 returns a tuple: (boxes, txts, scores)
+            rapidocr-onnxruntime >= 1.4 returns a RapidOCROutput object with
+            .boxes / .txts / .scores attributes.
+            This method handles both formats transparently.
         """
         if self._init_failed or self._engine is None:
             return ("", 0.0)
@@ -158,7 +164,6 @@ class RapidOCREngine(OCREngine):
 
             # RapidOCR expects a BGR uint8 image (same as OpenCV default)
             if len(image.shape) == 2:
-                # Grayscale → BGR so the PP-OCR pipeline works correctly
                 img_bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
             else:
                 img_bgr = image.copy()
@@ -166,10 +171,6 @@ class RapidOCREngine(OCREngine):
             if img_bgr.dtype != np.uint8:
                 img_bgr = np.clip(img_bgr, 0, 255).astype(np.uint8)
 
-            # Call RapidOCR. Returns a RapidOCROutput object.
-            #   result.boxes  → list of bounding boxes
-            #   result.txts   → list of recognized text strings
-            #   result.scores → list of confidence floats
             result = self._engine(
                 img_bgr,
                 use_det=self.use_det,
@@ -178,27 +179,49 @@ class RapidOCREngine(OCREngine):
                 text_score=self.text_score,
             )
 
-            # RapidOCR returns None when nothing is detected
-            if result is None or result.txts is None or len(result.txts) == 0:
+            if result is None:
+                return ("", 0.0)
+
+            # ── Normalise result across API versions ────────────────────────
+            # Old API (< 1.4): returns tuple (boxes, txts, scores)
+            #   boxes: list of box arrays or None
+            #   txts:  list of strings or None
+            #   scores: list of floats or None
+            #
+            # New API (>= 1.4): returns RapidOCROutput with .txts / .scores
+            if isinstance(result, tuple):
+                # Old-style tuple: (boxes, txts, scores)
+                if len(result) >= 2:
+                    raw_txts = result[1]
+                    raw_scores = result[2] if len(result) >= 3 else None
+                else:
+                    return ("", 0.0)
+            else:
+                # New-style object with attributes
+                raw_txts = getattr(result, "txts", None)
+                raw_scores = getattr(result, "scores", None)
+
+            if not raw_txts:
                 return ("", 0.0)
 
             texts: list[str] = []
             scores: list[float] = []
 
-            for txt, score in zip(result.txts, result.scores):
+            for i, txt in enumerate(raw_txts):
                 if txt is None:
                     continue
                 cleaned = re.sub(r"[^A-Z0-9]", "", str(txt).upper())
-                if cleaned:
-                    texts.append(cleaned)
-                    scores.append(float(score) if score is not None else 0.0)
+                if not cleaned:
+                    continue
+                texts.append(cleaned)
+                if raw_scores and i < len(raw_scores) and raw_scores[i] is not None:
+                    scores.append(float(raw_scores[i]))
+                else:
+                    scores.append(0.5)  # default when scores unavailable
 
             if not texts:
                 return ("", 0.0)
 
-            # Join all detected text regions.
-            # For a tightly-cropped plate there's usually one region; two for
-            # plates where the state emblem/IND text appears on a separate row.
             combined = "".join(texts)
             avg_score = float(np.mean(scores))
             avg_score = float(np.clip(avg_score, 0.0, 1.0))
