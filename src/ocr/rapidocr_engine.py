@@ -146,6 +146,12 @@ class RapidOCREngine(OCREngine):
             text is uppercase alphanumeric only (noise stripped).
             confidence is in [0.0, 1.0].
             Returns ("", 0.0) on any failure.
+
+        Note on API versions:
+            rapidocr-onnxruntime < 1.4 returns a tuple: (boxes, txts, scores)
+            rapidocr-onnxruntime >= 1.4 returns a RapidOCROutput object with
+            .boxes / .txts / .scores attributes.
+            This method handles both formats transparently.
         """
         if self._init_failed or self._engine is None:
             return ("", 0.0)
@@ -158,7 +164,6 @@ class RapidOCREngine(OCREngine):
 
             # RapidOCR expects a BGR uint8 image (same as OpenCV default)
             if len(image.shape) == 2:
-                # Grayscale → BGR so the PP-OCR pipeline works correctly
                 img_bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
             else:
                 img_bgr = image.copy()
@@ -166,10 +171,6 @@ class RapidOCREngine(OCREngine):
             if img_bgr.dtype != np.uint8:
                 img_bgr = np.clip(img_bgr, 0, 255).astype(np.uint8)
 
-            # Call RapidOCR. Returns a RapidOCROutput object.
-            #   result.boxes  → list of bounding boxes
-            #   result.txts   → list of recognized text strings
-            #   result.scores → list of confidence floats
             result = self._engine(
                 img_bgr,
                 use_det=self.use_det,
@@ -313,22 +314,6 @@ class RapidOCREngine(OCREngine):
                 _logger.debug("RapidOCR recognized='%s' conf=%.4f", combined, avg_score)
             except Exception:
                 pass
-
-            return (combined, avg_score)
-
-        except Exception as exc:
-            _logger.warning("RapidOCR inference failed: %s", exc)
-            return ("", 0.0)
-
-            if not texts:
-                return ("", 0.0)
-
-            # Join all detected text regions.
-            # For a tightly-cropped plate there's usually one region; two for
-            # plates where the state emblem/IND text appears on a separate row.
-            combined = "".join(texts)
-            avg_score = float(np.mean(scores))
-            avg_score = float(np.clip(avg_score, 0.0, 1.0))
 
             return (combined, avg_score)
 
