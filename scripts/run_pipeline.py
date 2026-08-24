@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
+import statistics
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +32,7 @@ import numpy as np
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.utils.benchmark import BenchmarkRecorder
 from src.utils.config import load_config
 from src.utils.logger import get_logger
 from src.ocr.ocr_postprocessor import correct_ocr_text, remove_noise_characters
@@ -40,6 +44,16 @@ def _init_logger(config: dict):
     global _logger
     _logger = get_logger("main_pipeline", config=config)
     return _logger
+
+
+def _ensure_system_site_packages() -> None:
+    """Enable system-installed Jetson Python packages inside a virtualenv."""
+    if sys.prefix == sys.base_prefix:
+        return
+
+    for path in ("/usr/lib/python3.12/dist-packages", "/usr/lib/python3/dist-packages"):
+        if Path(path).is_dir() and str(path) not in sys.path:
+            sys.path.append(str(path))
 
 
 def _store_event(
@@ -103,9 +117,11 @@ def _validate_ocr_text(plate_validator, text: str) -> tuple[str | None, str | No
     return plate_validator.validate(corrected)
 
 
-def run_pipeline(config: dict) -> None:
+def run_pipeline(config: dict, benchmark: bool = False) -> None:
     log = _init_logger(config)
     log.info("ALPR University Gate pipeline starting...")
+
+    _ensure_system_site_packages()
 
     # ── imports ──────────────────────────────────────────────────────────
     from src.capture.frame_capture import FrameCapture
@@ -139,7 +155,10 @@ def run_pipeline(config: dict) -> None:
     sr_enhancer        = SuperResolutionEnhancer(enh_cfg["realesrgan_model_path"], int(enh_cfg["sr_threshold_px"]))
     ocr_engine         = create_ocr_engine(str(ocr_cfg.get("backend", "paddleocr")), config)
     plate_validator    = PlateValidator()
-    ocr_fusion         = OCRFusion(window_size=int(fus_cfg.get("window_size", 5)))
+    ocr_fusion         = OCRFusion(
+        window_size=int(fus_cfg.get("window_size", 5)),
+        min_exact_votes=int(fus_cfg.get("min_exact_votes", 1)),
+    )
     color_classifier   = ColorClassifier.from_config(config)
     vehicle_classifier = VehicleClassifier()
     dup_filter         = DuplicateFilter.from_config(config)
@@ -153,6 +172,18 @@ def run_pipeline(config: dict) -> None:
 
     log.info("OCR backend: %s | fusion window: %d | min_conf: %.2f",
              ocr_cfg.get("backend"), fusion_window, min_conf)
+
+    benchmark_recorder = BenchmarkRecorder() if benchmark else None
+
+    plate_detection_times: list[float] = []
+    plate_detection_calls = 0
+    plate_detection_calls_per_track: dict[int, int] = defaultdict(int)
+
+    ocr_preprocess_times: list[float] = []
+    ocr_inference_times: list[float] = []
+    ocr_postprocess_times: list[float] = []
+    ocr_calls = 0
+    ocr_calls_per_track: dict[int, int] = defaultdict(int)
 
     # per-track state
     track_plate_crops: dict[int, np.ndarray] = {}   # best raw plate crop
@@ -176,9 +207,18 @@ def run_pipeline(config: dict) -> None:
                 log.info("Video ended — stopping pipeline.")
                 break
 
+            frame_start = time.perf_counter()
+
             # Vehicle detection
+            vehicle_detection_start = time.perf_counter()
             detections = vehicle_detector.detect(frame)
+            if benchmark_recorder is not None:
+                benchmark_recorder.record_vehicle_detection(
+                    time.perf_counter() - vehicle_detection_start
+                )
             if not detections:
+                if benchmark_recorder is not None:
+                    benchmark_recorder.record_frame(time.perf_counter() - frame_start)
                 continue
 
             # Vehicle tracking
@@ -209,8 +249,14 @@ def run_pipeline(config: dict) -> None:
                 if vehicle_crop.size == 0:
                     continue
 
-                # Plate detection
+                plate_detection_start = time.perf_counter()
+                plate_detection_calls += 1
+                plate_detection_calls_per_track[tid] += 1
                 plate_crops = plate_detector.detect(vehicle_crop)
+                plate_detection_elapsed = time.perf_counter() - plate_detection_start
+                plate_detection_times.append(plate_detection_elapsed * 1000.0)
+                if benchmark_recorder is not None:
+                    benchmark_recorder.record_plate_detection(plate_detection_elapsed)
                 if not plate_crops:
                     continue
 
@@ -224,6 +270,7 @@ def run_pipeline(config: dict) -> None:
                     track_plate_crops[f"{tid}_vehicle"] = vehicle_crop
 
                 # Preprocessing (fast — no SR in live loop)
+                preprocess_start = time.perf_counter()
                 preprocessed = plate_preprocessor.process(plate_crop)
 
                 # Upscale small plates with fast OpenCV resize before OCR.
@@ -238,23 +285,39 @@ def run_pipeline(config: dict) -> None:
                     )
                 else:
                     ocr_input = preprocessed
+                preprocess_elapsed = time.perf_counter() - preprocess_start
+                ocr_preprocess_times.append(preprocess_elapsed * 1000.0)
 
                 # OCR on upscaled preprocessed crop
+                ocr_calls += 1
+                ocr_calls_per_track[tid] += 1
+                ocr_start = time.perf_counter()
                 raw_text, confidence = ocr_engine.recognize(ocr_input)
+                inference_elapsed = time.perf_counter() - ocr_start
+                ocr_inference_times.append(inference_elapsed * 1000.0)
+                if benchmark_recorder is not None:
+                    benchmark_recorder.record_ocr(inference_elapsed)
                 if not raw_text:
                     continue
 
                 # Post-process OCR text
+                postprocess_start = time.perf_counter()
                 raw_text = remove_noise_characters(raw_text)
 
                 # Validate
                 plate_number, series_type = _validate_ocr_text(plate_validator, raw_text)
                 if plate_number is None:
+                    postprocess_elapsed = time.perf_counter() - postprocess_start
+                    ocr_postprocess_times.append(postprocess_elapsed * 1000.0)
                     continue
 
                 # Confidence filter
                 if confidence < min_conf:
+                    postprocess_elapsed = time.perf_counter() - postprocess_start
+                    ocr_postprocess_times.append(postprocess_elapsed * 1000.0)
                     continue
+                postprocess_elapsed = time.perf_counter() - postprocess_start
+                ocr_postprocess_times.append(postprocess_elapsed * 1000.0)
 
                 log.info("Track %d: OCR='%s' conf=%.2f", tid, plate_number, confidence)
 
@@ -287,10 +350,12 @@ def run_pipeline(config: dict) -> None:
                                         log.info("Track %d: SR improved OCR → '%s' conf=%.2f",
                                                  tid, plate_val, sr_conf)
 
+                            # Save the plate crop (prefer the SR-enhanced crop
+                            # for archival clarity) instead of the full vehicle image.
                             stored = _store_event(
                                 plate_number=plate_val,
                                 series_type=s_type,
-                                plate_crop=color_crop,
+                                plate_crop=enhanced_crop,
                                 color_classifier=color_classifier,
                                 vehicle_classifier=vehicle_classifier,
                                 dup_filter=dup_filter,
@@ -324,12 +389,13 @@ def run_pipeline(config: dict) -> None:
             if not plate_val:
                 continue
             best_crop = track_plate_crops.get(tid, np.zeros((20, 80, 3), dtype=np.uint8))
-            color_crop = track_plate_crops.get(f"{tid}_vehicle", best_crop)
+            # Use the saved plate crop for storage (not the full vehicle image).
+            plate_image_to_save = best_crop
             centroid  = track_centroids.get(tid, (0.0, 0.0))
             _store_event(
                 plate_number=plate_val,
                 series_type=s_type,
-                plate_crop=color_crop,
+                plate_crop=plate_image_to_save,
                 color_classifier=color_classifier,
                 vehicle_classifier=vehicle_classifier,
                 dup_filter=dup_filter,
@@ -342,6 +408,63 @@ def run_pipeline(config: dict) -> None:
             )
 
         frame_capture.release()
+        if benchmark_recorder is not None:
+            summary = benchmark_recorder.summary()
+            log.info(
+                "BENCHMARK summary: processed_frames=%d fps=%.2f vehicle_detection_latency_ms(avg=%.2f min=%.2f max=%.2f p95=%.2f) "
+                "ocr_latency_ms(avg=%.2f min=%.2f max=%.2f p95=%.2f) plate_detection_latency_ms(avg=%.2f min=%.2f max=%.2f p95=%.2f)",
+                summary["processed_frames"],
+                summary["fps"],
+                summary["vehicle_detection_latency_ms"]["avg_ms"],
+                summary["vehicle_detection_latency_ms"]["min_ms"],
+                summary["vehicle_detection_latency_ms"]["max_ms"],
+                summary["vehicle_detection_latency_ms"]["p95_ms"],
+                summary["ocr_latency_ms"]["avg_ms"],
+                summary["ocr_latency_ms"]["min_ms"],
+                summary["ocr_latency_ms"]["max_ms"],
+                summary["ocr_latency_ms"]["p95_ms"],
+                summary["plate_detection_latency_ms"]["avg_ms"],
+                summary["plate_detection_latency_ms"]["min_ms"],
+                summary["plate_detection_latency_ms"]["max_ms"],
+                summary["plate_detection_latency_ms"]["p95_ms"],
+            )
+
+        def _stats_ms(values: list[float]) -> tuple[float, float, float, float]:
+            if not values:
+                return 0.0, 0.0, 0.0, 0.0
+            v = sorted(values)
+            avg = statistics.mean(v)
+            p95 = statistics.quantiles(v, n=20)[-1] if len(v) >= 20 else v[-1]
+            return avg, v[0], v[-1], p95
+
+        plate_avg, plate_min, plate_max, plate_p95 = _stats_ms(plate_detection_times)
+        pre_avg, pre_min, pre_max, pre_p95 = _stats_ms(ocr_preprocess_times)
+        inf_avg, inf_min, inf_max, inf_p95 = _stats_ms(ocr_inference_times)
+        post_avg, post_min, post_max, post_p95 = _stats_ms(ocr_postprocess_times)
+
+        log.info(
+            "PROFILE summary: plate_detection_calls=%d tracks=%d avg_per_track=%.2f max_per_track=%d "
+            "plate_detection_ms(avg=%.2f min=%.2f max=%.2f p95=%.2f) "
+            "ocr_calls=%d tracks=%d avg_per_track=%.2f "
+            "ocr_preprocess_ms(avg=%.2f p95=%.2f) ocr_inference_ms(avg=%.2f p95=%.2f) ocr_postprocess_ms(avg=%.2f p95=%.2f)",
+            plate_detection_calls,
+            len(plate_detection_calls_per_track),
+            plate_detection_calls / len(plate_detection_calls_per_track) if plate_detection_calls_per_track else 0.0,
+            max(plate_detection_calls_per_track.values(), default=0),
+            plate_avg,
+            plate_min,
+            plate_max,
+            plate_p95,
+            ocr_calls,
+            len(ocr_calls_per_track),
+            ocr_calls / len(ocr_calls_per_track) if ocr_calls_per_track else 0.0,
+            pre_avg,
+            pre_p95,
+            inf_avg,
+            inf_p95,
+            post_avg,
+            post_p95,
+        )
         log.info("Pipeline shut down cleanly.")
 
 
@@ -349,13 +472,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ALPR University Gate — Main Pipeline")
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--source", default=None, help="Video source (RTSP URL or file path)")
+    parser.add_argument("--benchmark", action="store_true", help="Print FPS and latency summary at shutdown")
     args = parser.parse_args()
 
     config = load_config(args.config)
     if args.source:
         config["video"]["source"] = args.source
 
-    run_pipeline(config)
+    run_pipeline(config, benchmark=args.benchmark)
 
 
 if __name__ == "__main__":

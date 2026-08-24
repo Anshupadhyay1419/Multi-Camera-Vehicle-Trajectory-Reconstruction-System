@@ -11,11 +11,11 @@
 
 # ── Computer vision (pure-C++ wheels, aarch64 available on PyPI) ─────────────
 opencv-python==4.10.0.84
-numpy==2.1.0
+numpy==1.26.4
 
 # ── YOLO — ultralytics uses its own bundled torch for export; on Jetson it
 #    detects the system CUDA and uses TensorRT export path automatically ────────
-ultralytics==8.3.0
+ultralytics==8.4.93
 
 # ── Tracking — pure-Python, no GPU dependency ────────────────────────────────
 supervision==0.25.0
@@ -48,9 +48,14 @@ plotly==5.24.1
 PyYAML==6.0.2
 
 # ── NOT included (reason) ─────────────────────────────────────────────────────
-# torch / torchvision  — no CUDA 13.2 wheels for JP7.2 yet; needed only for
-#                        Real-ESRGAN SR (disabled on Jetson) and EasyOCR.
-#                        Install manually from NVIDIA when available:
+# torch / torchvision  — not included by default because NVIDIA Jetson CUDA
+#                        wheels are installed separately from NVIDIA's JetPack
+#                        repository. On JetPack 7.2 Python 3.12 aarch64, set
+#                        TORCH_INSTALL_URL to the matching NVIDIA wheel and
+#                        rerun install_jetson.sh. Example:
+#                          export TORCH_INSTALL_URL="https://developer.download.nvidia.cn/compute/redist/jp/v72/pytorch/<wheel-file>.whl"
+#                          ./install_jetson.sh
+#                        See:
 #                        https://docs.nvidia.com/deeplearning/frameworks/install-pytorch-jetson-platform/
 # basicsr / realesrgan — depend on torch; SR is bypassed on Jetson (OpenCV
 #                        cubic upscale is used instead, see super_resolution.py)

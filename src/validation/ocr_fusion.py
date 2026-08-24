@@ -63,6 +63,7 @@ class OCRFusion:
         *,
         max_edit_distance: int = 2,
         min_confidence: float = 0.0,
+        min_exact_votes: int = 1,
     ) -> None:
         """Args:
         window_size: Number of frames to keep per track.
@@ -72,6 +73,7 @@ class OCRFusion:
         self.window_size = window_size
         self.max_edit_distance = max_edit_distance
         self.min_confidence = min_confidence
+        self.min_exact_votes = min_exact_votes
 
         # track_id -> deque[(plate_string, confidence)]
         self._buffers: Dict[int, Deque[Tuple[str, float]]] = {}
@@ -227,8 +229,13 @@ class OCRFusion:
 
         assert best_cluster is not None
 
+        # Similar strings are useful for clustering, but they must not turn a
+        # sequence of unrelated OCR guesses into a stored plate.  Requiring
+        # exact repeated text is the safe gate for live ALPR deployments.
+        if len(plate_to_confs[best_cluster.best_plate]) < self.min_exact_votes:
+            return ("", 0.0)
+
         # Return best cluster's canonical plate and max confidence from all entries
         best_single = max(entries, key=lambda e: e[1])
         return (best_cluster.best_plate, best_single[1])
-
 

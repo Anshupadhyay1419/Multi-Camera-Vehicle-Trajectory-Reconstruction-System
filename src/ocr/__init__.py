@@ -18,31 +18,8 @@ _logger = get_logger("ocr")
 def create_ocr_engine(backend: str, config: dict) -> OCREngine:
     """Instantiate the OCR engine specified by *backend*.
 
-    Args:
-        backend: One of "rapidocr", "tensorrt", "paddleocr", "easyocr",
-                 "trocr", "ensemble".
-
-                 JetPack 7.2 — Phase 1 (now):
-                   "rapidocr" — PP-OCR models via onnxruntime CPU.
-                   No GPU onnxruntime wheel exists for JP7.2 yet; CPU
-                   runs at ~80-120ms/crop, sufficient with fusion window.
-
-                 JetPack 7.2 — Phase 2 (after PARSeq fine-tuning):
-                   "tensorrt" — compiled PARSeq .engine via TensorRT 10.16
-                   (pre-installed with JetPack). ~5ms/crop GPU inference.
-                   See src/ocr/tensorrt_engine.py for build instructions.
-
-                 x86 dev machine:
-                   "paddleocr" or "rapidocr" both work fine.
-
-        config:  Full config dict (backend-specific settings read from
-                 config['ocr'][backend]).
-
-    Returns:
-        An OCREngine instance.
-
-    Raises:
-        ValueError: If *backend* is not a supported value.
+    Supported values: rapidocr, parseq_tensorrt, tensorrt, paddleocr,
+    easyocr, trocr, ensemble.
     """
     ocr_cfg = config.get("ocr", {})
 
@@ -56,14 +33,32 @@ def create_ocr_engine(backend: str, config: dict) -> OCREngine:
             use_rec=bool(rapid_cfg.get("use_rec", True)),
         )
 
-    elif backend == "tensorrt":
-        from src.ocr.tensorrt_engine import TensorRTOCREngine
-        trt_cfg = ocr_cfg.get("tensorrt", {})
-        input_size_raw = trt_cfg.get("input_size", [32, 128])
-        return TensorRTOCREngine(
-            engine_path=str(trt_cfg.get("engine_path", "models/ocr/parseq_plate.engine")),
+    elif backend in {"tensorrt", "parseq_tensorrt"}:
+        import importlib.util
+
+        if importlib.util.find_spec("tensorrt") is None:
+            _logger.warning(
+                "TensorRT Python bindings are unavailable; falling back to RapidOCR for OCR. "
+                "Install TensorRT or switch config['ocr']['backend'] to 'rapidocr'."
+            )
+            from src.ocr.rapidocr_engine import RapidOCREngine
+            rapid_cfg = ocr_cfg.get("rapidocr", {})
+            return RapidOCREngine(
+                text_score=float(rapid_cfg.get("text_score", 0.5)),
+                use_det=bool(rapid_cfg.get("use_det", True)),
+                use_cls=bool(rapid_cfg.get("use_cls", True)),
+                use_rec=bool(rapid_cfg.get("use_rec", True)),
+            )
+
+        from src.ocr.parseq_tensorrt_engine import PARSeqTensorRTOCREngine
+        parseq_cfg = ocr_cfg.get("parseq", {})
+        input_size_raw = parseq_cfg.get("input_size", [32, 128])
+        return PARSeqTensorRTOCREngine(
+            engine_path=str(parseq_cfg.get("engine_path", "models/ocr/parseq.engine")),
             input_size=(int(input_size_raw[0]), int(input_size_raw[1])),
-            charset=str(trt_cfg.get("charset", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")),
+            charset=str(parseq_cfg.get("charset", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")),
+            onnx_path=str(parseq_cfg.get("onnx_path", "models/ocr/parseq.onnx")),
+            decoder_mode=str(parseq_cfg.get("decoder_mode", "legacy")),
         )
 
     elif backend == "paddleocr":
@@ -105,7 +100,7 @@ def create_ocr_engine(backend: str, config: dict) -> OCREngine:
     else:
         msg = (
             f"Unsupported OCR backend: '{backend}'. "
-            f"Valid options are: 'rapidocr', 'tensorrt', 'paddleocr', 'easyocr', 'trocr', 'ensemble'."
+            f"Valid options are: 'rapidocr', 'parseq_tensorrt', 'tensorrt', 'paddleocr', 'easyocr', 'trocr', 'ensemble'."
         )
         _logger.error(msg)
         raise ValueError(msg)

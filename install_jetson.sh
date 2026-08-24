@@ -18,10 +18,12 @@
 #   7. Runs a quick smoke-test to confirm key imports work
 #
 # What this script does NOT do:
-#   - Install PyTorch (no CUDA 13.2 wheel for aarch64 yet)
+#   - Install PyTorch (no general CUDA 13.2 wheel for aarch64 yet; use an NVIDIA JetPack wheel)
 #   - Install Real-ESRGAN / basicsr (depend on torch)
 #   - Install PaddleOCR / EasyOCR (not used on Jetson)
-#   These will be added in a future update once NVIDIA publishes JP7.2 wheels.
+# On Jetson Orin 8.7, generic PyTorch wheels may import with a warning about unsupported compute capability.
+# This script expects an NVIDIA JetPack wheel built for JetPack 7.2 and your device.
+# If no compatible wheel exists yet, use ONNX/TensorRT for deployment rather than a generic torch build.
 # =============================================================================
 
 set -euo pipefail
@@ -177,6 +179,8 @@ else
              "Phase 1 (RapidOCR) will still work. " \
              "For Phase 2 (TensorRT PARSeq), manually run: " \
              "  sudo apt-get install python3-libnvinfer python3-libnvinfer-dev"
+        warn "If you are using a Python virtualenv, also install pycuda inside it: " \
+             "  source ~/alpr/alpr_env/bin/activate && python -m pip install pycuda"
     fi
 fi
 
@@ -200,8 +204,32 @@ info "Step 5/7 — Installing Python packages from requirements-jetson.txt"
 # Upgrade pip first — older pip on Ubuntu 24.04 may not resolve aarch64 wheels
 pip3 install --upgrade pip setuptools wheel
 
+# Optional: install NVIDIA Jetson PyTorch wheel if a matching JetPack wheel URL
+# is available. JetPack 7.2 / Python 3.12 aarch64 may require an NVIDIA wheel
+# from the JetPack repository instead of the standard PyPI torch packages.
+# Note: if you see a warning about unsupported GPU compute capability (Orin 8.7),
+# the wheel is not built for your device. In that case, choose a JetPack wheel
+# that explicitly supports Orin 8.7 or use ONNX/TensorRT for deployment.
+if [[ -n "${TORCH_INSTALL_URL:-}" ]]; then
+    info "Installing NVIDIA Jetson PyTorch wheel from TORCH_INSTALL_URL"
+    if pip3 install --no-cache-dir "$TORCH_INSTALL_URL"; then
+        success "PyTorch installed from NVIDIA Jetson wheel"
+    else
+        warn "Failed to install NVIDIA Jetson PyTorch from TORCH_INSTALL_URL"
+        warn "Verify the wheel URL matches your JetPack and Python version."
+    fi
+fi
+
 # Install from the Jetson-specific requirements file
 pip3 install --no-cache-dir -r requirements-jetson.txt
+
+# Validate PyTorch CUDA support if a torch package is present
+if python3 -c "import torch; import sys; sys.exit(0 if torch.cuda.is_available() else 1)" &>/dev/null 2>&1; then
+    success "PyTorch CUDA support verified"
+elif python3 -c "import torch" &>/dev/null 2>&1; then
+    warn "PyTorch is installed but CUDA support is unavailable."
+    warn "Install NVIDIA Jetson PyTorch wheel for your JetPack version."
+fi
 
 success "Python packages installed"
 

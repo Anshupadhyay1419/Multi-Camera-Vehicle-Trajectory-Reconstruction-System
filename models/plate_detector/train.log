@@ -1,3 +1,198 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:616677e686260d4395560195969135169af9e8200c2a3c9f6a4e1b0b65b2e1ee
-size 42760
+INFO - 
+================================================================================
+INFO - Checking environment...
+INFO - ✓ GPU: NVIDIA RTX 2000 Ada Generation
+INFO -   VRAM: 15.7 GB
+INFO - ✓ Dataset: /home/projectwork/ansh_2026/alpr-university-gate/dataset/data.yaml
+INFO - ✓ Model: YOLOv8s (will download pretrained weights if needed)
+INFO - ================================================================================
+INFO - ✓ Configuration saved to /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/config.json
+INFO - ================================================================================
+INFO - STARTING TRAINING
+INFO - ================================================================================
+INFO - Model: yolov8s
+INFO - Dataset size: 20,580 images
+INFO - Batch size: 32
+INFO - Steps per epoch: 643
+INFO - Total epochs: 100
+INFO - GPU: NVIDIA RTX 2000 Ada Generation
+INFO - ================================================================================
+INFO - 
+Loading model: YOLOv8s...
+INFO - ✓ Model loaded successfully
+INFO -   Parameters: 11,166,560
+ERROR - ❌ Training failed: 'mosaic'
+Traceback (most recent call last):
+  File "/home/projectwork/ansh_2026/alpr-university-gate/training/train.py", line 211, in train
+    args = create_yolo_training_args()
+  File "/home/projectwork/ansh_2026/alpr-university-gate/training/train.py", line 150, in create_yolo_training_args
+    "mosaic": AUGMENTATION_CONFIG["mosaic"],
+              ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+KeyError: 'mosaic'
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║                    YOLOV8 LICENSE PLATE DETECTOR CONFIGURATION             ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+📊 DATASET:
+   • Total images: 25,674
+   • Train: 20,580 | Val: 4,116 | Test: 978
+   • Class: license_plate (1 class)
+   • Avg annotations/image: 1.04
+
+🤖 MODEL:
+   • Architecture: YOLOV8S (Small)
+   • Input size: 640x640
+   • Pretrained: COCO weights with transfer learning
+   • Reason: Balances accuracy (5-10% better than nano) with edge deployment
+
+⚙️ TRAINING:
+   • Epochs: 100
+   • Batch size: 32
+   • Optimizer: SGD
+   • Learning rate: 0.01 → 0.01
+   • Scheduler: Cosine annealing
+   • Early stopping: 20 epochs patience
+   • Mixed precision (AMP): True
+
+📈 AUGMENTATION:
+   • Mosaic: Always on (4-image combinations)
+   • MixUp: 10% (blended images)
+   • Rotation: ±10.0°
+   • Scale: 85% to 115%
+   • HSV: H±1.5%, S±30%, V±30%
+
+💾 OUTPUT:
+   • Best weights: /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/best.pt
+   • Training report: /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/training_report.md
+   • Plots: confusion matrix, P-R curves, training history
+
+🎯 TARGET DEPLOYMENT:
+   • Device: Jetson Orin Nano (8GB RAM)
+   • Export formats: PT, ONNX, ONNX-FP32
+   • No TensorRT engine (for flexibility)
+
+INFO - 
+================================================================================
+INFO - Checking environment...
+INFO - ✓ GPU: NVIDIA RTX 2000 Ada Generation
+INFO -   VRAM: 15.7 GB
+INFO - ✓ Dataset: /home/projectwork/ansh_2026/alpr-university-gate/dataset/data.yaml
+INFO - ✓ Model: YOLOv8s (will download pretrained weights if needed)
+INFO - ================================================================================
+INFO - ✓ Configuration saved to /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/config.json
+INFO - ================================================================================
+INFO - STARTING TRAINING
+INFO - ================================================================================
+INFO - Model: yolov8s
+INFO - Dataset size: 20,580 images
+INFO - Batch size: 32
+INFO - Steps per epoch: 643
+INFO - Total epochs: 100
+INFO - GPU: NVIDIA RTX 2000 Ada Generation
+INFO - ================================================================================
+INFO - 
+Loading model: YOLOv8s...
+INFO - ✓ Model loaded successfully
+INFO -   Parameters: 11,166,560
+INFO - 
+Starting training...
+INFO - --------------------------------------------------------------------------------
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║                    YOLOV8 LICENSE PLATE DETECTOR CONFIGURATION             ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+📊 DATASET:
+   • Total images: 25,674
+   • Train: 20,580 | Val: 4,116 | Test: 978
+   • Class: license_plate (1 class)
+   • Avg annotations/image: 1.04
+
+🤖 MODEL:
+   • Architecture: YOLOV8S (Small)
+   • Input size: 640x640
+   • Pretrained: COCO weights with transfer learning
+   • Reason: Balances accuracy (5-10% better than nano) with edge deployment
+
+⚙️ TRAINING:
+   • Epochs: 100
+   • Batch size: 32
+   • Optimizer: SGD
+   • Learning rate: 0.01 → 0.01
+   • Scheduler: Cosine annealing
+   • Early stopping: 20 epochs patience
+   • Mixed precision (AMP): True
+
+📈 AUGMENTATION:
+   • Mosaic: Always on (4-image combinations)
+   • MixUp: 10% (blended images)
+   • Rotation: ±10.0°
+   • Scale: 85% to 115%
+   • HSV: H±1.5%, S±30%, V±30%
+
+💾 OUTPUT:
+   • Best weights: /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/best.pt
+   • Training report: /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/training_report.md
+   • Plots: confusion matrix, P-R curves, training history
+
+🎯 TARGET DEPLOYMENT:
+   • Device: Jetson Orin Nano (8GB RAM)
+   • Export formats: PT, ONNX, ONNX-FP32
+   • No TensorRT engine (for flexibility)
+
+Ultralytics 8.4.93 🚀 Python-3.13.12 torch-2.6.0+cu124 CUDA:0 (NVIDIA RTX 2000 Ada Generation, 16068MiB)
+[34m[1mengine/trainer: [0magnostic_nms=False, amp=True, angle=1.0, augment=False, auto_augment=randaugment, batch=32, bgr=0.0, box=7.5, cache=ram, cfg=None, classes=None, close_mosaic=10, cls=0.5, cls_pw=0.0, cls_remap=True, compile=False, conf=None, copy_paste=0.0, copy_paste_mode=flip, cos_lr=True, cutmix=0.0, data=/home/projectwork/ansh_2026/alpr-university-gate/dataset/data.yaml, degrees=10.0, deterministic=True, device=0, dfl=1.5, dis=6.0, distill_model=None, dnn=False, dropout=0.0, dynamic=False, embed=None, end2end=None, epochs=100, erasing=0.4, exist_ok=False, fliplr=0.5, flipud=0.0, format=torchscript, fraction=1.0, freeze=None, hsv_h=0.015, hsv_s=0.3, hsv_v=0.3, imgsz=640, iou=0.7, keras=False, kobj=1.0, line_width=None, lr0=0.01, lrf=0.01, mask_ratio=4, max_det=300, mixup=0.1, mode=train, model=yolov8s.pt, momentum=0.937, mosaic=1.0, multi_scale=0.0, name=train-2, nbs=64, nms=False, opset=None, optimize=False, optimizer=SGD, overlap_mask=True, patience=20, perspective=0.0, plots=True, pose=12.0, pretrained=True, profile=False, project=/home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector, quantize=None, rect=False, resume=False, retina_masks=False, rle=1.0, save=True, save_conf=False, save_crop=False, save_dir=/home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/train-2, save_frames=False, save_json=False, save_period=10, save_txt=False, scale=(0.85, 1.15), seed=42, shear=0.0, show=False, show_boxes=True, show_conf=True, show_labels=True, simplify=True, single_cls=False, source=None, split=val, stream_buffer=False, task=detect, time=None, tracker=tracktrack.yaml, translate=0.1, val=True, verbose=True, vid_stride=1, visualize=False, warmup_bias_lr=0.1, warmup_epochs=3.0, warmup_momentum=0.8, weight_decay=0.0005, workers=8, workspace=None
+[KDownloading https://ultralytics.com/assets/Arial.ttf to '/home/projectwork/.config/Ultralytics/Arial.ttf': 100% ━━━━━━━━━━━━ 755.1KB 63.6MB/s 0.0s
+Overriding model.yaml nc=80 with nc=1
+
+                   from  n    params  module                                       arguments                     
+  0                  -1  1       928  ultralytics.nn.modules.conv.Conv             [3, 32, 3, 2]                 
+  1                  -1  1     18560  ultralytics.nn.modules.conv.Conv             [32, 64, 3, 2]                
+  2                  -1  1     29056  ultralytics.nn.modules.block.C2f             [64, 64, 1, True]             
+  3                  -1  1     73984  ultralytics.nn.modules.conv.Conv             [64, 128, 3, 2]               
+  4                  -1  2    197632  ultralytics.nn.modules.block.C2f             [128, 128, 2, True]           
+  5                  -1  1    295424  ultralytics.nn.modules.conv.Conv             [128, 256, 3, 2]              
+  6                  -1  2    788480  ultralytics.nn.modules.block.C2f             [256, 256, 2, True]           
+  7                  -1  1   1180672  ultralytics.nn.modules.conv.Conv             [256, 512, 3, 2]              
+  8                  -1  1   1838080  ultralytics.nn.modules.block.C2f             [512, 512, 1, True]           
+  9                  -1  1    656896  ultralytics.nn.modules.block.SPPF            [512, 512, 5]                 
+ 10                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']          
+ 11             [-1, 6]  1         0  ultralytics.nn.modules.conv.Concat           [1]                           
+ 12                  -1  1    591360  ultralytics.nn.modules.block.C2f             [768, 256, 1]                 
+ 13                  -1  1         0  torch.nn.modules.upsampling.Upsample         [None, 2, 'nearest']          
+ 14             [-1, 4]  1         0  ultralytics.nn.modules.conv.Concat           [1]                           
+ 15                  -1  1    148224  ultralytics.nn.modules.block.C2f             [384, 128, 1]                 
+ 16                  -1  1    147712  ultralytics.nn.modules.conv.Conv             [128, 128, 3, 2]              
+ 17            [-1, 12]  1         0  ultralytics.nn.modules.conv.Concat           [1]                           
+ 18                  -1  1    493056  ultralytics.nn.modules.block.C2f             [384, 256, 1]                 
+ 19                  -1  1    590336  ultralytics.nn.modules.conv.Conv             [256, 256, 3, 2]              
+ 20             [-1, 9]  1         0  ultralytics.nn.modules.conv.Concat           [1]                           
+ 21                  -1  1   1969152  ultralytics.nn.modules.block.C2f             [768, 512, 1]                 
+ 22        [15, 18, 21]  1   2116435  ultralytics.nn.modules.head.Detect           [1, 16, None, [128, 256, 512]]
+Model summary: 130 layers, 11,135,987 parameters, 11,135,971 gradients, 28.6 GFLOPs
+
+Transferred 349/355 items from pretrained weights
+Freezing layer 'model.22.dfl.conv.weight'
+[34m[1mAMP: [0mrunning Automatic Mixed Precision (AMP) checks...
+[KDownloading https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n.pt to 'yolo26n.pt': 100% ━━━━━━━━━━━━ 5.3MB 86.6MB/s 0.1s
+[34m[1mAMP: [0mchecks passed ✅
+[34m[1mtrain: [0mFast image access ✅ (ping: 0.0±0.0 ms, read: 4279.8±1809.8 MB/s, size: 45.0 KB)
+[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 556 images, 1 backgrounds, 0 corrupt: 2% ──────────── 556/18578 1.7Kit/s 0.1s<10.8s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 1159 images, 1 backgrounds, 0 corrupt: 6% ╸─────────── 1159/18578 3.0Kit/s 0.2s<5.9s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 1751 images, 1 backgrounds, 0 corrupt: 9% ━─────────── 1751/18578 3.8Kit/s 0.3s<4.4s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 2373 images, 1 backgrounds, 0 corrupt: 12% ━╸────────── 2373/18578 4.5Kit/s 0.4s<3.6s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 2989 images, 1 backgrounds, 0 corrupt: 16% ━╸────────── 2989/18578 5.0Kit/s 0.5s<3.1s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 3632 images, 1 backgrounds, 0 corrupt: 19% ━━────────── 3632/18578 5.4Kit/s 0.6s<2.7s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 4304 images, 1 backgrounds, 0 corrupt: 23% ━━╸───────── 4304/18578 5.8Kit/s 0.7s<2.5s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 4893 images, 1 backgrounds, 0 corrupt: 26% ━━━───────── 4893/18578 5.8Kit/s 0.8s<2.4s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 5538 images, 1 backgrounds, 0 corrupt: 29% ━━━╸──────── 5538/18578 6.0Kit/s 0.9s<2.2s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 6117 images, 1 backgrounds, 0 corrupt: 32% ━━━╸──────── 6117/18578 5.9Kit/s 1.0s<2.1s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 6719 images, 1 backgrounds, 0 corrupt: 36% ━━━━──────── 6719/18578 5.9Kit/s 1.1s<2.0s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 7372 images, 1 backgrounds, 0 corrupt: 39% ━━━━╸─────── 7372/18578 6.1Kit/s 1.2s<1.8s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 7983 images, 1 backgrounds, 0 corrupt: 42% ━━━━━─────── 7983/18578 6.1Kit/s 1.3s<1.7s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 8595 images, 1 backgrounds, 0 corrupt: 46% ━━━━━╸────── 8595/18578 6.1Kit/s 1.4s<1.6s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 9243 images, 1 backgrounds, 0 corrupt: 49% ━━━━━╸────── 9243/18578 6.2Kit/s 1.5s<1.5s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 9924 images, 1 backgrounds, 0 corrupt: 53% ━━━━━━────── 9924/18578 6.4Kit/s 1.6s<1.4s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 10537 images, 1 backgrounds, 0 corrupt: 56% ━━━━━━╸───── 10537/18578 6.3Kit/s 1.7s<1.3s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 11185 images, 1 backgrounds, 0 corrupt: 60% ━━━━━━━───── 11185/18578 6.3Kit/s 1.8s<1.2s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 11826 images, 3 backgrounds, 0 corrupt: 63% ━━━━━━━╸──── 11826/18578 6.3Kit/s 1.9s<1.1s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 12452 images, 3 backgrounds, 0 corrupt: 67% ━━━━━━━━──── 12452/18578 6.3Kit/s 2.0s<1.0s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 13085 images, 3 backgrounds, 0 corrupt: 70% ━━━━━━━━──── 13085/18578 6.3Kit/s 2.1s<0.9s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 13732 images, 4 backgrounds, 0 corrupt: 73% ━━━━━━━━╸─── 13732/18578 6.3Kit/s 2.2s<0.8s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 14385 images, 4 backgrounds, 0 corrupt: 77% ━━━━━━━━━─── 14385/18578 6.4Kit/s 2.3s<0.7s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 15029 images, 4 backgrounds, 0 corrupt: 80% ━━━━━━━━━╸── 15029/18578 6.4Kit/s 2.4s<0.6s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 15635 images, 4 backgrounds, 0 corrupt: 84% ━━━━━━━━━━── 15635/18578 6.3Kit/s 2.5s<0.5s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 16241 images, 4 backgrounds, 0 corrupt: 87% ━━━━━━━━━━── 16241/18578 6.2Kit/s 2.6s<0.4s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 16877 images, 4 backgrounds, 0 corrupt: 90% ━━━━━━━━━━╸─ 16877/18578 6.2Kit/s 2.7s<0.3s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 17572 images, 4 backgrounds, 0 corrupt: 94% ━━━━━━━━━━━─ 17572/18578 6.4Kit/s 2.8s<0.2s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 18271 images, 4 backgrounds, 0 corrupt: 98% ━━━━━━━━━━━╸ 18271/18578 6.6Kit/s 2.9s<0.0s[K[34m[1mtrain: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels... 18578 images, 4 backgrounds, 0 corrupt: 100% ━━━━━━━━━━━━ 18578/18578 6.3Kit/s 3.0s
+[34m[1mtrain: [0mNew cache created: /home/projectwork/ansh_2026/alpr-university-gate/dataset/train/labels.cache
+WARNING ⚠️ cache='ram' may produce non-deterministic training results. Consider cache='disk' as a deterministic alternative if your disk space allows.
+[K[34m[1mtrain: [0mCaching images (0.7GB RAM): 3% ──────────── 600/18578 1.8Kit/s 0.1s<10.0s[K[34m[1mtrain: [0mCaching images (1.4GB RAM): 6% ╸─────────── 1263/18578 3.2Kit/s 0.2s<5.3s[K[34m[1mtrain: [0mCaching images (2.2GB RAM): 10% ━─────────── 1915/18578 4.2Kit/s 0.3s<3.9s[K[34m[1mtrain: [0mCaching images (3.0GB RAM): 13% ━╸────────── 2583/18578 5.0Kit/s 0.4s<3.2s[K[34m[1mtrain: [0mCaching images (3.7GB RAM): 17% ━━────────── 3263/18578 5.5Kit/s 0.5s<2.8s[K[34m[1mtrain: [0mCaching images (4.5GB RAM): 21% ━━╸───────── 3935/18578 5.9Kit/s 0.6s<2.5s[K[34m[1mtrain: [0mCaching images (5.3GB RAM): 24% ━━╸───────── 4590/18578 6.1Kit/s 0.7s<2.3s[K[34m[1mtrain: [0mCaching images (6.0GB RAM): 28% ━━━───────── 5208/18578 6.1Kit/s 0.8s<2.2s[K[34m[1mtrain: [0mCaching images (6.7GB RAM): 31% ━━━╸──────── 5897/18578 6.3Kit/s 0.9s<2.0s[K[34m[1mtrain: [0mCaching images (7.5GB RAM): 35% ━━━━──────── 6576/18578 6.5Kit/s 1.0s<1.9s[K[34m[1mtrain: [0mCaching images (8.1GB RAM): 38% ━━━━╸─────── 7118/18578 6.2Kit/s 1.1s<1.9s[K[34m[1mtrain: [0mCaching images (8.9GB RAM): 41% ━━━━━─────── 7802/18578 6.4Kit/s 1.2s<1.7s[K[34m[1mtrain: [0mCaching images (9.7GB RAM): 45% ━━━━━─────── 8492/18578 6.5Kit/s 1.3s<1.5s[K[34m[1mtrain: [0mCaching images (10.5GB RAM): 49% ━━━━━╸────── 9206/18578 6.7Kit/s 1.4s<1.4s[K[34m[1mtrain: [0mCaching images (11.4GB RAM): 53% ━━━━━━────── 9925/18578 6.8Kit/s 1.5s<1.3s[K[34m[1mtrain: [0mCaching images (12.1GB RAM): 57% ━━━━━━╸───── 10613/18578 6.8Kit/s 1.6s<1.2s[K[34m[1mtrain: [0mCaching images (12.9GB RAM): 60% ━━━━━━━───── 11265/18578 6.7Kit/s 1.7s<1.1s[K[34m[1mtrain: [0mCaching images (13.6GB RAM): 64% ━━━━━━━╸──── 11914/18578 6.7Kit/s 1.8s<1.0s[K[34m[1mtrain: [0mCaching images (14.4GB RAM): 67% ━━━━━━━━──── 12575/18578 6.6Kit/s 1.9s<0.9s[K[34m[1mtrain: [0mCaching images (15.1GB RAM): 71% ━━━━━━━━╸─── 13229/18578 6.6Kit/s 2.0s<0.8s[K[34m[1mtrain: [0mCaching images (15.8GB RAM): 74% ━━━━━━━━╸─── 13848/18578 6.5Kit/s 2.1s<0.7s[K[34m[1mtrain: [0mCaching images (16.7GB RAM): 78% ━━━━━━━━━─── 14568/18578 6.7Kit/s 2.2s<0.6s[K[34m[1mtrain: [0mCaching images (17.4GB RAM): 81% ━━━━━━━━━╸── 15211/18578 6.6Kit/s 2.3s<0.5s[K[34m[1mtrain: [0mCaching images (18.2GB RAM): 85% ━━━━━━━━━━── 15934/18578 6.8Kit/s 2.4s<0.4s[K[34m[1mtrain: [0mCaching images (19.1GB RAM): 89% ━━━━━━━━━━╸─ 16660/18578 6.9Kit/s 2.5s<0.3s[K[34m[1mtrain: [0mCaching images (19.9GB RAM): 93% ━━━━━━━━━━━─ 17371/18578 7.0Kit/s 2.6s<0.2s[K[34m[1mtrain: [0mCaching images (20.6GB RAM): 97% ━━━━━━━━━━━╸ 18043/18578 6.9Kit/s 2.7s<0.1s[K[34m[1mtrain: [0mCaching images (21.3GB RAM): 100% ━━━━━━━━━━━━ 18578/18578 6.7Kit/s 2.8s
+[34m[1mval: [0mFast image access ✅ (ping: 0.0±0.0 ms, read: 3133.0±1608.7 MB/s, size: 42.9 KB)
+[K[34m[1mval: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/val/labels... 510 images, 0 backgrounds, 0 corrupt: 25% ━━━───────── 510/1973 1.5Kit/s 0.1s<1.0s[K[34m[1mval: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/val/labels... 1059 images, 0 backgrounds, 0 corrupt: 53% ━━━━━━────── 1059/1973 2.7Kit/s 0.2s<0.3s[K[34m[1mval: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/val/labels... 1527 images, 0 backgrounds, 0 corrupt: 77% ━━━━━━━━━─── 1527/1973 3.3Kit/s 0.3s<0.1s[K[34m[1mval: [0mScanning /home/projectwork/ansh_2026/alpr-university-gate/dataset/val/labels... 1973 images, 0 backgrounds, 0 corrupt: 100% ━━━━━━━━━━━━ 1973/1973 5.0Kit/s 0.4s
+[34m[1mval: [0mNew cache created: /home/projectwork/ansh_2026/alpr-university-gate/dataset/val/labels.cache
+WARNING ⚠️ cache='ram' may produce non-deterministic training results. Consider cache='disk' as a deterministic alternative if your disk space allows.
+[K[34m[1mval: [0mCaching images (0.2GB RAM): 9% ━─────────── 194/1973 574.2it/s 0.1s<3.1s[K[34m[1mval: [0mCaching images (0.5GB RAM): 20% ━━────────── 403/1973 1.0Kit/s 0.2s<1.5s[K[34m[1mval: [0mCaching images (0.7GB RAM): 30% ━━━╸──────── 608/1973 1.3Kit/s 0.3s<1.0s[K[34m[1mval: [0mCaching images (0.9GB RAM): 41% ━━━━╸─────── 810/1973 1.5Kit/s 0.4s<0.8s[K[34m[1mval: [0mCaching images (1.2GB RAM): 52% ━━━━━━────── 1034/1973 1.7Kit/s 0.5s<0.6s[K[34m[1mval: [0mCaching images (1.5GB RAM): 64% ━━━━━━━╸──── 1273/1973 1.9Kit/s 0.6s<0.4s[K[34m[1mval: [0mCaching images (1.7GB RAM): 75% ━━━━━━━━━─── 1482/1973 1.9Kit/s 0.7s<0.3s[K[34m[1mval: [0mCaching images (2.3GB RAM): 100% ━━━━━━━━━━━━ 1973/1973 2.5Kit/s 0.8s
+[34m[1moptimizer:[0m SGD(lr=0.01, momentum=0.937) with parameter groups 57 weight(decay=0.0), 64 weight(decay=0.0005), 63 bias(decay=0.0)
+Plotting labels to /home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/train-2/labels.jpg... 
+Image sizes 640 train, 640 val
+Using 8 dataloader workers
+Logging results to [1m/home/projectwork/ansh_2026/alpr-university-gate/models/plate_detector/train-2[0m
+Starting training for 100 epochs...
+
+      Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size
+[K      1/100      6.64G      2.271         19      2.342         47        640: 0% ──────────── 0/581  2.4s[K      1/100      6.64G      2.238      19.92      2.308         47        640: 0% ──────────── 1/581 1.5s/it 2.8s<14:09[K      1/100      6.64G      2.239      19.53      2.281         56        640: 0% ──────────── 2/581 1.1it/s 3.3s<8:37[K      1/100      6.64G      2.224      19.39      2.257         48        640: 0% ──────────── 3/581 1.3it/s 3.8s<7:14[K      1/100      6.64G      2.219      19.14      2.246         54        640: 0% ──────────── 4/581 1.7it/s 4.2s<5:44[K      1/100      6.64G      2.261      19.22      2.304         49        640: 0% ──────────── 5/581 1.9it/s 4.6s<5:04[K      1/100      6.64G      2.272       19.2      2.303         51        640: 1% ──────────── 6/581 2.0it/s 5.1s<4:43[K      1/100      6.64G      2.283      19.51      2.301         48        640: 1% ──────────── 7/581 2.1it/s 5.5s<4:27[K      1/100      6.64G      2.299      19.58      2.316         46        640: 1% ──────────── 8/581 2.3it/s 5.9s<4:13[K      1/100      6.64G      2.281      19.36      2.295         54        640: 1% ──────────── 9/581 2.4it/s 6.3s<4:03[K      1/100      6.64G      2.285      19.65      2.287         44        640: 1% ──────────── 10/581 2.4it/s 6.7s<3:56[K      1/100      6.67G      2.279      19.46      2.286         54        640: 1% ──────────── 11/581 2.4it/s 7.1s<3:56[K      1/100      6.67G      2.286      19.33       2.29         59        640: 2% ──────────── 12/581 2.4it/s 7.5s<3:54[K      1/100      6.67G      2.277      19.16      2.277         55        640: 2% ──────────── 13/581 2.4it/s 7.9s<3:52[K      1/100      6.67G      2.273      19.15      2.278         43        640: 2% ──────────── 14/581 2.4it/s 8.3s<3:54[K      1/100      6.67G      2.277      19.08       2.28         44        640: 2% ──────────── 15/581 2.4it/s 8.7s<3:55[K      1/100      6.67G       2.28      18.85      2.289         52        640: 2% ──────────── 16/581 2.4it/s 9.1s<3:54[K      1/100      6.67G      2.288      18.55      2.289         51        640: 2% ──────────── 17/581 2.4it/s 9.5s<3:51[K      1/100      6.67G      2.284      18.12       2.29         56        640: 3% ──────────── 18/581 2.5it/s 9.9s<3:49[K      1/100      6.67G      2.294      17.75       2.29         54        640: 3% ──────────── 19/581 2.5it/s 10.3s<3:46[K      1/100      6.67G      2.297      17.35      2.284         53        640: 3% ──────────── 20/581 2.5it/s 10.7s<3:43[K      1/100      6.67G      2.304      16.92       2.29         56        640: 3% ──────────── 21/581 2.5it/s 11.1s<3:42[K      1/100      6.67G      2.292      16.48      2.283         48        640: 3% ──────────── 22/581 2.5it/s 11.5s<3:41[K      1/100      6.67G      2.283      16.04      2.273         56        640: 3% ──────────── 23/581 2.5it/s 11.9s<3:40[K      1/100      6.67G      2.278      15.64      2.268         50        640: 4% ──────────── 24/581 2.5it/s 12.3s<3:39[K      1/100      6.67G      2.275      15.23      2.263         56        640: 4% ╸─────────── 25/581 2.5it/s 12.7s<3:39[K      1/100      6.67G      2.278      14.87      2.267         46        640: 4% ╸─────────── 26/581 2.6it/s 13.1s<3:38[K      1/100      6.67G      2.269      14.51       2.26         52        640: 4% ╸─────────── 27/581 2.5it/s 13.5s<3:39[K      1/100      6.67G      2.263      14.16      2.254         59        640: 4% ╸─────────── 28/581 2.5it/s 13.9s<3:38[K      1/100      6.67G      2.258      13.83       2.25         51        640: 4% ╸─────────── 29/581 2.5it/s 14.2s<3:37[K      1/100      6.67G      2.255      13.52      2.256         47        640: 5% ╸─────────── 30/581 2.5it/s 14.6s<3:37[K      1/100      6.67G      2.252      13.22       2.25         59        640: 5% ╸─────────── 31/581 2.5it/s 15.0s<3:37[K      1/100      6.67G      2.245      12.93      2.245         61        640: 5% ╸─────────── 32/581 2.5it/s 15.4s<3:36[K      1/100      6.67G      2.247      12.66      2.247         56        640: 5% ╸─────────── 33/581 2.5it/s 15.8s<3:36[K      1/100      6.67G      2.249      12.41      2.252         54        640: 5% ╸─────────── 34/581 2.5it/s 16.2s<3:35[K      1/100      6.67G      2.245      12.16      2.255         41        640: 6% ╸─────────── 35/581 2.5it/s 16.6s<3:35[K      1/100      6.67G      2.244      11.93      2.259         50        640: 6% ╸─────────── 36/581 2.5it/s 17.0s<3:34[K      1/100      6.67G      2.239       11.7      2.258         55        640: 6% ╸─────────── 37/581 2.5it/s 17.4s<3:34[K      1/100      6.67G       2.24      11.48      2.266         54        640: 6% ╸─────────── 38/581 2.5it/s 17.8s<3:33[K      1/100      6.67G      2.239      11.27      2.267         49        640: 6% ╸─────────── 39/581 2.5it/s 18.2s<3:33[K      1/100      6.67G      2.236      11.07      2.268         54        640: 6% ╸─────────── 40/581 2.5it/s 18.6s<3:32[K      1/100      6.67G      2.235      10.87      2.267         59        640: 7% ╸─────────── 41/581 2.6it/s 19.0s<3:31[K      1/100      6.67G      2.234      10.69      2.268         44        640: 7% ╸─────────── 42/581 2.5it/s 19.4s<3:32[K      1/100      6.67G      2.231      10.51      2.268         52        640: 7% ╸─────────── 43/581 2.5it/s 19.7s<3:31[K      1/100      6.67G      2.228      10.33      2.268         47        640: 7% ╸─────────── 44/581 2.6it/s 20.1s<3:31[K      1/100      6.67G      2.225      10.16      2.268         57        640: 7% ╸─────────── 45/581 2.5it/s 20.5s<3:30[K      1/100      6.67G      2.218      9.999      2.265         56        640: 7% ╸─────────── 46/581 2.5it/s 20.9s<3:30[K      1/100      6.67G      2.213      9.845       2.26         53        640: 8% ╸─────────── 47/581 2.5it/s 21.3s<3:30[K      1/100      6.67G      2.213      9.699      2.266         64        640: 8% ╸─────────── 48/581 2.5it/s 21.7s<3:29[K      1/100      6.67G       2.21      9.559      2.265         48        640: 8% ━─────────── 49/581 2.5it/s 22.1s<3:29[K      1/100      6.67G      2.212      9.424       2.27         54        640: 8% ━─────────── 50/581 2.5it/s 22.5s<3:29[K      1/100      6.67G      2.207      9.292      2.264         63        640: 8% ━─────────── 51/581 2.5it/s 22.9s<3:29[K      1/100      6.67G      2.204      9.161      2.262         49        640: 8% ━─────────── 52/581 2.5it/s 23.3s<3:28[K      1/100      6.67G      2.202      9.036      2.262         47        640: 9% ━─────────── 53/581 2.5it/s 23.7s<3:28[K      1/100      6.67G      2.197      8.916      2.256         57        640: 9% ━─────────── 54/581 2.5it/s 24.1s<3:27[K      1/100      6.67G      2.192      8.796      2.252         55        640: 9% ━─────────── 55/581 2.5it/s 24.5s<3:27[K      1/100      6.67G      2.186      8.679      2.246         55        640: 9% ━─────────── 56/581 2.5it/s 24.9s<3:26[K      1/100      6.67G      2.183      8.567      2.245         53        640: 9% ━─────────── 57/581 2.5it/s 25.2s<3:26[K      1/100      6.67G      2.177      8.463       2.24         47        640: 9% ━─────────── 58/581 2.6it/s 25.6s<3:25[K      1/100      6.67G      2.175      8.356       2.24         48        640: 10% ━─────────── 59/581 2.5it/s 26.0s<3:25[K      1/100      6.67G      2.173      8.254      2.239         48        640: 10% ━─────────── 60/581 2.5it/s 26.4s<3:24[K      1/100      6.67G      2.168      8.151      2.235         46        640: 10% ━─────────── 61/581 2.6it/s 26.8s<3:24[K      1/100      6.67G      2.167      8.055      2.236         57        640: 10% ━─────────── 62/581 2.6it/s 27.2s<3:23[K      1/100      6.67G      2.165       7.96      2.237         54        640: 10% ━─────────── 63/581 2.5it/s 27.6s<3:23[K      1/100      6.67G      2.161       7.87      2.232         49        640: 11% ━─────────── 64/581 2.5it/s 28.0s<3:23[K      1/100      6.67G      2.154      7.775      2.228         51        640: 11% ━─────────── 65/581 2.5it/s 28.4s<3:23[K      1/100      6.67G      2.147      7.684      2.223         57        640: 11% ━─────────── 66/581 2.5it/s 28.8s<3:22[K      1/100      6.67G      2.142      7.597      2.219         55        640: 11% ━─────────── 67/581 2.5it/s 29.2s<3:22[K      1/100      6.67G      2.138      7.512      2.215         50        640: 11% ━─────────── 68/581 2.5it/s 29.6s<3:21[K      1/100      6.67G      2.134      7.431      2.212         56        640: 11% ━─────────── 69/581 2.5it/s 30.0s<3:21[K      1/100      6.67G      2.131       7.35      2.208         50        640: 12% ━─────────── 70/581 2.5it/s 30.4s<3:21[K      1/100      6.67G       2.13      7.275      2.206         52        640: 12% ━─────────── 71/581 2.5it/s 30.7s<3:21[K      1/100      6.67G      2.127        7.2      2.202         44        640: 12% ━─────────── 72/581 2.5it/s 31.1s<3:20[K      1/100      6.67G      2.124      7.124      2.199         51        640: 12% ━╸────────── 73/581 2.5it/s 31.5s<3:20[K      1/100      6.67G       2.12      7.053      2.197         45        640: 12% ━╸────────── 74/581 2.5it/s 31.9s<3:21[K      1/100      6.67G      2.116      6.981      2.195         54        640: 12% ━╸────────── 75/581 2.5it/s 32.3s<3:21[K      1/100      6.67G      2.111      6.912      2.192         44        640: 13% ━╸────────── 76/581 2.5it/s 32.7s<3:20[K      1/100      6.67G      2.106      6.847      2.187         43        640: 13% ━╸────────── 77/581 2.5it/s 33.1s<3:19[K      1/100      6.67G      2.103       6.78      2.185         49        640: 13% ━╸────────── 78/581 2.5it/s 33.5s<3:18[K      1/100      6.67G      2.098      6.715       2.18         58        640: 13% ━╸────────── 79/581 2.5it/s 33.9s<3:17[K      1/100      6.67G      2.094      6.651      2.176         53        640: 13% ━╸────────── 80/581 2.5it/s 34.3s<3:17[K      1/100      6.67G      2.088       6.59       2.17         53        640: 13% ━╸────────── 81/581 2.5it/s 34.7s<3:17[K      1/100      6.67G      2.085      6.531      2.168         47        640: 14% ━╸────────── 82/581 2.5it/s 35.1s<3:16[K      1/100      6.67G      2.081      6.471      2.164         51        640: 14% ━╸────────── 83/581 2.5it/s 35.5s<3:16[K      1/100      6.67G      2.075      6.412      2.159         42        640: 14% ━╸────────── 84/581 2.5it/s 35.9s<3:15[K      1/100      6.67G      2.073      6.356      2.156         50        640: 14% ━╸────────── 85/581 2.5it/s 36.3s<3:15[K      1/100      6.67G      2.068      6.299      2.151         45        640: 14% ━╸────────── 86/581 2.5it/s 36.7s<3:15[K      1/100      6.67G      2.065      6.242      2.148         52        640: 14% ━╸────────── 87/581 2.5it/s 37.0s<3:14[K      1/100      6.67G       2.06      6.188      2.144         41        640: 15% ━╸────────── 88/581 2.5it/s 37.4s<3:14[K      1/100      6.67G      2.057      6.138       2.14         49        640: 15% ━╸────────── 89/581 2.5it/s 37.9s<3:17[K      1/100      6.67G      2.053      6.086      2.138         53        640: 15% ━╸────────── 90/581 2.5it/s 38.3s<3:20[K      1/100      6.67G      2.051      6.036      2.135         57        640: 15% ━╸────────── 91/581 2.5it/s 38.7s<3:18[K      1/100      6.67G      2.047      5.985      2.132         48        640: 15% ━╸────────── 92/581 2.5it/s 39.1s<3:17[K      1/100      6.67G      2.044      5.936      2.128         60        640: 16% ━╸────────── 93/581 2.5it/s 39.5s<3:15[K      1/100      6.67G      2.041      5.888      2.126         46        640: 16% ━╸────────── 94/581 2.5it/s 39.9s<3:15[K      1/100      6.67G      2.039      5.841      2.124         51        640: 16% ━╸────────── 95/581 2.5it/s 40.3s<3:14[K      1/100      6.67G      2.037      5.797       2.12         59        640: 16% ━╸────────── 96/581 2.5it/s 40.7s<3:13[K      1/100      6.67G      2.033      5.753      2.116         50        640: 16% ━━────────── 97/581 2.5it/s 41.1s<3:12[K      1/100      6.67G      2.028      5.708      2.112         58        640: 16% ━━────────── 98/581 2.5it/s 41.5s<3:11[K      1/100      6.67G      2.026      5.665       2.11         51        640: 17% ━━────────── 99/581 2.5it/s 41.8s<3:10[K      1/100      6.67G       2.02       5.62      2.105         46        640: 17% ━━────────── 100/581 2.5it/s 42.2s<3:10[K      1/100      6.67G      2.019      5.578      2.103         56        640: 17% ━━────────── 101/581 2.5it/s 42.6s<3:09[K      1/100      6.67G      2.015      5.535      2.099         41        640: 17% ━━────────── 102/581 2.5it/s 43.0s<3:09[K      1/100      6.67G      2.013      5.494      2.097         55        640: 17% ━━────────── 103/581 2.5it/s 43.4s<3:09[K      1/100      6.67G      2.008      5.452      2.093         46        640: 17% ━━────────── 104/581 2.5it/s 43.8s<3:08[K      1/100      6.67G      2.006      5.413       2.09         51        640: 18% ━━────────── 105/581 2.5it/s 44.2s<3:07[K      1/100      6.67G      2.003      5.375      2.087         51        640: 18% ━━────────── 106/581 2.5it/s 44.6s<3:07[K      1/100      6.67G          2      5.337      2.084         47        640: 18% ━━────────── 107/581 2.5it/s 45.0s<3:07[K      1/100      6.67G      1.997      5.299      2.082         50        640: 18% ━━────────── 108/581 2.5it/s 45.4s<3:07[K      1/100      6.67G      1.996      5.263      2.079         50        640: 18% ━━────────── 109/581 2.5it/s 45.8s<3:08[K      1/100      6.67G      1.995      5.226      2.077         44        640: 18% ━━────────── 110/581 2.5it/s 46.2s<3:07[K      1/100      6.67G      1.994      5.195      2.075         51        640: 19% ━━────────── 111/581 2.5it/s 46.6s<3:10[K      1/100      6.67G      1.992       5.16      2.074         55        640: 19% ━━────────── 112/581 2.4it/s 47.0s<3:12[K      1/100      6.67G      1.989      5.126      2.072         48        640: 19% ━━────────── 113/581 2.5it/s 47.4s<3:11[K      1/100      6.67G      1.986      5.091      2.069         45        640: 19% ━━────────── 114/581 2.5it/s 47.8s<3:08[K      1/100      6.67G      1.985      5.058      2.066         57        640: 19% ━━────────── 115/581 2.5it/s 48.2s<3:07[K      1/100      6.67G      1.983      5.026      2.065         61        640: 19% ━━────────── 116/581 2.5it/s 48.6s<3:06[K      1/100      6.67G      1.981      4.993      2.063         48        640: 20% ━━────────── 117/581 2.5it/s 49.1s<3:09[K      1/100      6.67G       1.98      4.961       2.06         47        640: 20% ━━────────── 118/581 2.4it/s 49.5s<3:10[K      1/100      6.67G      1.979       4.93      2.058         56        640: 20% ━━────────── 119/581 2.5it/s 49.9s<3:08[K      1/100      6.67G      1.978        4.9      2.057         55        640: 20% ━━────────── 120/581 2.5it/s 50.3s<3:06[K      1/100      6.67G      1.977      4.871      2.056         54        640: 20% ━━────────── 121/581 2.5it/s 50.7s<3:06

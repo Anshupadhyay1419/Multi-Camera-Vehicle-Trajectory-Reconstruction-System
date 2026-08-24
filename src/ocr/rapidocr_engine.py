@@ -96,7 +96,7 @@ class RapidOCREngine(OCREngine):
     def _initialize(self) -> None:
         """Initialize RapidOCR engine. Logs error and sets flag on failure."""
         try:
-            from rapidocr import RapidOCR
+            from rapidocr_onnxruntime import RapidOCR
 
             _logger.info("Initializing RapidOCR engine...")
             self._engine = RapidOCR()
@@ -178,20 +178,147 @@ class RapidOCREngine(OCREngine):
                 text_score=self.text_score,
             )
 
-            # RapidOCR returns None when nothing is detected
-            if result is None or result.txts is None or len(result.txts) == 0:
+            # Debug: log raw result shape/types so we can diagnose unexpected
+            # return formats in different RapidOCR/onnxruntime builds.
+            try:
+                _logger.debug("RapidOCR raw result type=%s", type(result))
+                if hasattr(result, "txts"):
+                    _logger.debug("RapidOCR object txts=%d scores=%d",
+                                  len(result.txts or []), len(result.scores or []))
+                elif isinstance(result, (tuple, list)):
+                    _logger.debug("RapidOCR tuple len=%d", len(result))
+                    try:
+                        types = [type(x).__name__ for x in result[:3]]
+                        _logger.debug("RapidOCR tuple element types=%s", types)
+                        preview = []
+                        for i, part in enumerate(result[:3]):
+                            if hasattr(part, "__len__") and len(part) > 0:
+                                first = part[0]
+                                preview.append((i, type(first).__name__, len(part), str(first)[:120]))
+                            else:
+                                preview.append((i, type(part).__name__, 0, None))
+                        _logger.debug("RapidOCR tuple preview=%s", preview)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # RapidOCR returns None when nothing is detected.
+            # Some versions or wrappers return a tuple-like structure instead of
+            # an object with .txts/.scores attributes, so we support both.
+            if result is None:
+                return ("", 0.0)
+
+            if hasattr(result, "txts") and hasattr(result, "scores"):
+                txts = list(result.txts or [])
+                scores = list(result.scores or [])
+            elif isinstance(result, (tuple, list)):
+                # Support several observed RapidOCR return shapes:
+                # 1) (boxes, txts, scores)
+                # 2) (txts, scores)
+                # 3) (detections_list, time_float) where detections_list contains
+                #    items like [box, text, score]
+                if len(result) >= 3:
+                    txts = list(result[1] or [])
+                    scores = list(result[2] or [])
+                elif len(result) == 2:
+                    first, second = result[0], result[1]
+                    # Case: (txts, scores)
+                    if isinstance(first, (list, tuple)) and isinstance(second, (list, tuple)):
+                        txts = list(first or [])
+                        scores = list(second or [])
+                    # Case: (detections_list, time_float) where detections_list
+                    # contains entries like [box, text, score]
+                    elif isinstance(first, (list, tuple)) and (isinstance(second, float) or isinstance(second, int)):
+                        dets = list(first or [])
+                        txts = []
+                        scores = []
+                        for item in dets:
+                            try:
+                                # item may be (box, text, score) or similar
+                                txt = item[1]
+                                score = item[2]
+                            except Exception:
+                                continue
+                            txts.append(txt)
+                            scores.append(score)
+                    else:
+                        return ("", 0.0)
+                else:
+                    return ("", 0.0)
+            else:
+                return ("", 0.0)
+
+            if not txts or len(txts) == 0:
                 return ("", 0.0)
 
             texts: list[str] = []
-            scores: list[float] = []
+            scores_list: list[float] = []
 
-            for txt, score in zip(result.txts, result.scores):
-                if txt is None:
+            for txt, score in zip(txts, scores):
+                # Normalize txt to a plain string if possible. Some RapidOCR
+                # builds return nested structures (box, text, score) inside
+                # the txts list — detect and extract the textual element.
+                extracted_text = None
+                try:
+                    if isinstance(txt, str):
+                        extracted_text = txt
+                    elif isinstance(txt, bytes):
+                        extracted_text = txt.decode('utf-8', errors='ignore')
+                    elif isinstance(txt, (list, tuple)):
+                        # Look for the first string-like element inside
+                        for part in txt:
+                            if isinstance(part, str):
+                                extracted_text = part
+                                break
+                            if isinstance(part, bytes):
+                                extracted_text = part.decode('utf-8', errors='ignore')
+                                break
+                        # Fallback: if second element looks like the usual text
+                        if extracted_text is None and len(txt) >= 2 and isinstance(txt[1], (str, bytes)):
+                            part = txt[1]
+                            extracted_text = part.decode('utf-8', errors='ignore') if isinstance(part, bytes) else part
+                    elif hasattr(txt, 'astype'):
+                        # numpy array or similar — convert and try to find string
+                        s = str(txt)
+                        extracted_text = s
+                    else:
+                        extracted_text = str(txt)
+                except Exception:
+                    extracted_text = None
+
+                if extracted_text is None:
                     continue
-                cleaned = re.sub(r"[^A-Z0-9]", "", str(txt).upper())
-                if cleaned:
-                    texts.append(cleaned)
-                    scores.append(float(score) if score is not None else 0.0)
+
+                cleaned = re.sub(r"[^A-Z0-9]", "", str(extracted_text).upper())
+                if not cleaned:
+                    continue
+
+                texts.append(cleaned)
+                try:
+                    scores_list.append(float(score) if score is not None else 0.0)
+                except Exception:
+                    scores_list.append(0.0)
+
+            if not texts:
+                return ("", 0.0)
+
+            # Join all detected text regions.
+            # For a tightly-cropped plate there's usually one region; two for
+            # plates where the state emblem/IND text appears on a separate row.
+            combined = "".join(texts)
+            avg_score = float(np.mean(scores_list))
+            avg_score = float(np.clip(avg_score, 0.0, 1.0))
+
+            try:
+                _logger.debug("RapidOCR recognized='%s' conf=%.4f", combined, avg_score)
+            except Exception:
+                pass
+
+            return (combined, avg_score)
+
+        except Exception as exc:
+            _logger.warning("RapidOCR inference failed: %s", exc)
+            return ("", 0.0)
 
             if not texts:
                 return ("", 0.0)

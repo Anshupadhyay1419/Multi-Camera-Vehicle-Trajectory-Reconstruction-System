@@ -32,6 +32,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from src.utils.config import load_config
+from pathlib import Path
 from src.database import db as database
 
 
@@ -70,7 +71,9 @@ st.markdown("""
 def init_db_connection():
     """Initialize database connection."""
     try:
-        config = load_config("config/config.yaml")
+        repo_root = Path(__file__).resolve().parents[2]
+        config_path = str(repo_root / "config" / "config.yaml")
+        config = load_config(config_path)
         db_path = config.get("database", {}).get("path", "data/alpr.db")
         database.init_db(db_path)
         return True
@@ -83,7 +86,9 @@ def init_db_connection():
 def load_config_cached():
     """Load and cache configuration."""
     try:
-        return load_config("config/config.yaml")
+        repo_root = Path(__file__).resolve().parents[2]
+        config_path = str(repo_root / "config" / "config.yaml")
+        return load_config(config_path)
     except Exception as e:
         st.error(f"Config load failed: {e}")
         return {}

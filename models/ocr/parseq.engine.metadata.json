@@ -1,0 +1,8 @@
+{
+  "tensorrt_version": "10.16.2.10",
+  "cuda_version": "Cuda compilation tools, release 13.2, V13.2.78",
+  "jetpack_version": "# R39 (release), REVISION: 2.0, GCID: 45755727, BOARD: generic, EABI: aarch64, DATE: Mon Jun  1 09:28:48 PM UTC 2026\n# KERNEL_VARIANT: oot\nTARGET_USERSPACE_LIB_DIR=nvidia\nTARGET_USERSPACE_LIB_DIR_PATH=usr/lib/aarch64-linux-gnu/nvidia",
+  "gpu_name": "Orin (nvgpu)",
+  "execute_async_v2": false,
+  "execute_async_v3": true
+}

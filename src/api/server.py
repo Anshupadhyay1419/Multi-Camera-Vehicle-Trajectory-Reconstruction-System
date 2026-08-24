@@ -198,8 +198,10 @@ def get_system_settings():
     """Return current system configuration (read-only)."""
     try:
         from src.utils.config import load_config
+        from pathlib import Path
 
-        config = load_config("config/config.yaml")
+        repo_root = Path(__file__).resolve().parents[2]
+        config = load_config(str(repo_root / "config" / "config.yaml"))
 
         # Filter sensitive information
         safe_config = {

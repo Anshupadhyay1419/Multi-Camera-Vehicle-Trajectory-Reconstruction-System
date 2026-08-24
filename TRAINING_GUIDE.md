@@ -309,13 +309,27 @@ TRAINING_CONFIG["epochs"] = 150  # Longer training
 
 ### Prerequisites
 ```bash
-# On Jetson, install dependencies
-pip install torch torchvision torchaudio
-pip install onnxruntime  # For ONNX inference
+# On Jetson, install NVIDIA JetPack PyTorch wheel first if available.
+# The standard PyPI torch packages may not provide Jetson CUDA support.
+export TORCH_INSTALL_URL="https://developer.download.nvidia.cn/compute/redist/jp/v72/pytorch/<torch-wheel-file>.whl"
+python3 -m pip install --no-cache-dir "$TORCH_INSTALL_URL"
 
-# Optional: GPU acceleration
+# Then install the rest of the Jetson requirements.
+pip install -r requirements-jetson.txt
+
+# For ONNX inference
+pip install onnxruntime
+
+# Optional: GPU acceleration when onnxruntime-gpu is available
 pip install onnxruntime-gpu
 ```
+
+> If you see a warning like:
+> `No published PyTorch CUDA builds for release 2.13.0+cu132 support this GPU`,
+> it means the installed wheel is not compiled for Jetson Orin's compute capability
+> 8.7. This warning can appear even when `torch.cuda.is_available()` is True.
+> Prefer a JetPack-specific NVIDIA wheel built for Orin 8.7, or use ONNX/TensorRT
+> for production deployment if no compatible PyTorch wheel is available.
 
 ### Transfer Model
 ```bash
