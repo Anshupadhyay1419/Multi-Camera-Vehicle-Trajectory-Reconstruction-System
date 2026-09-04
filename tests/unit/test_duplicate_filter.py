@@ -38,10 +38,25 @@ class TestDuplicateFilterExamples:
         assert df.is_duplicate("PLATE_B", track_id=5, now=t0 + 5) is True
 
     def test_different_plate_and_track_not_duplicate(self):
+        # Genuinely different plates (edit distance well above
+        # max_edit_distance), not a one-character OCR-confusion pair --
+        # see test_near_miss_plate_is_treated_as_duplicate below for that
+        # intentionally-fuzzy case.
         df = DuplicateFilter(window_seconds=30)
         t0 = 1000.0
-        df.record("PLATE_A", track_id=1, now=t0)
-        assert df.is_duplicate("PLATE_B", track_id=2, now=t0 + 5) is False
+        df.record("KA19TR0234", track_id=1, now=t0)
+        assert df.is_duplicate("DL05AB9876", track_id=2, now=t0 + 5) is False
+
+    def test_near_miss_plate_is_treated_as_duplicate(self):
+        # A single-character difference (the kind of OCR confusion a
+        # fragmented track produces re-reading the same physical plate,
+        # e.g. O/C, O/0) is intentionally treated as the same plate within
+        # the default max_edit_distance=1 -- this is the fuzzy-match
+        # behavior duplicate_filter.py documents, not a false positive.
+        df = DuplicateFilter(window_seconds=30)
+        t0 = 1000.0
+        df.record("DL7CD5017", track_id=1, now=t0)
+        assert df.is_duplicate("DD7CD5017", track_id=2, now=t0 + 5) is True
 
     def test_cleanup_removes_expired_entries(self):
         df = DuplicateFilter(window_seconds=30)

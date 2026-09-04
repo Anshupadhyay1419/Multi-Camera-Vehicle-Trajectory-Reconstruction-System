@@ -63,6 +63,13 @@ class PARSeqTensorRTOCREngine(OCREngine):
         self._input_dtype = np.dtype(np.float32)
         self._output_dtype = np.dtype(np.float32)
         self.last_inference_ms: float | None = None
+        # Persistent GPU buffers + stream, allocated once (input size is fixed
+        # at batch=1) instead of cudaMalloc/cudaFree on every recognize() call.
+        self._stream: Any = None
+        self._input_mem: Any = None
+        self._output_mem: Any = None
+        self._host_output: np.ndarray | None = None
+        self._output_shape: tuple[int, ...] | None = None
         self._initialize()
 
     # ---- Startup and engine compatibility ---------------------------------
@@ -115,6 +122,7 @@ class PARSeqTensorRTOCREngine(OCREngine):
             if self._context is None:
                 raise RuntimeError("TensorRT failed to create an execution context")
             self._configure_io(trt)
+            self._allocate_io_buffers()
             self._write_engine_metadata(engine_file, info)
             _logger.info(
                 "PARSeq TensorRT engine loaded from %s using %s (wrapper=%s)",
@@ -204,12 +212,20 @@ class PARSeqTensorRTOCREngine(OCREngine):
             _logger.error("Cannot rebuild incompatible engine: ONNX model is missing at %s", self.onnx_path)
             return False
         _logger.warning("Rebuilding PARSeq engine on this Jetson (%s): %s", self._gpu_name(), reason)
-        command = [
-            "trtexec", f"--onnx={self.onnx_path}", f"--saveEngine={engine_file}", "--fp16",
-            "--minShapes=input:1x3x%dx%d" % (self.input_h, self.input_w),
-            "--optShapes=input:1x3x%dx%d" % (self.input_h, self.input_w),
-            "--maxShapes=input:1x3x%dx%d" % (self.input_h, self.input_w),
-        ]
+        command = ["trtexec", f"--onnx={self.onnx_path}", f"--saveEngine={engine_file}", "--fp16"]
+        if self.decoder_mode != "official_parseq_94":
+            # scripts/export_official_parseq.py exports a fixed batch=1
+            # static-shape graph (no dynamic_axes declared) -- trtexec
+            # rejects *any* --*Shapes flags against a static graph
+            # ("Static model does not take explicit shapes"). The older
+            # custom-trained model (training/export_onnx.py) does declare a
+            # dynamic batch axis and needs an explicit shape profile to
+            # build at all, so only add these for that model.
+            command += [
+                "--minShapes=input:1x3x%dx%d" % (self.input_h, self.input_w),
+                "--optShapes=input:1x3x%dx%d" % (self.input_h, self.input_w),
+                "--maxShapes=input:1x3x%dx%d" % (self.input_h, self.input_w),
+            ]
         try:
             subprocess.run(command, cwd=Path(__file__).resolve().parents[2], check=True)
             return True
@@ -278,6 +294,57 @@ class PARSeqTensorRTOCREngine(OCREngine):
             return
         raise RuntimeError("Installed TensorRT exposes neither supported execution API")
 
+    def _free_io_buffers(self) -> None:
+        for attr in ("_input_mem", "_output_mem"):
+            mem = getattr(self, attr)
+            if mem is not None:
+                try:
+                    mem.free()
+                except Exception as exc:
+                    # A handle can already be invalid if the CUDA context was
+                    # disrupted (e.g. by another CUDA-using library). Freeing
+                    # is best-effort cleanup, never a reason to crash.
+                    _logger.warning("Failed to free TensorRT buffer %s: %s", attr, exc)
+            setattr(self, attr, None)
+        self._stream = None
+        self._host_output = None
+        self._output_shape = None
+
+    def _allocate_io_buffers(self) -> None:
+        """Allocate the fixed-shape GPU input/output buffers and CUDA stream
+        once at load time. Input size is always batch=1 x 3 x H x W, so these
+        never need to be resized between calls — reusing them avoids a
+        cudaMalloc/cudaFree pair (and its implicit device sync) per frame,
+        which otherwise dominates OCR latency variance under load.
+        """
+        import pycuda.driver as cuda
+
+        self._free_io_buffers()
+        input_shape = (1, 3, self.input_h, self.input_w)
+        host_input = np.empty(input_shape, dtype=self._input_dtype)
+
+        if self._api.startswith("TensorRT 10"):
+            if not self._context.set_input_shape(self._input_name, input_shape):
+                raise RuntimeError("TensorRT rejected PARSeq input shape %s" % (input_shape,))
+            output_shape = self._shape(self._context.get_tensor_shape(self._output_name))
+        else:
+            if not self._context.set_binding_shape(self._input_index, input_shape):
+                raise RuntimeError("TensorRT rejected PARSeq input shape %s" % (input_shape,))
+            output_shape = self._shape(self._context.get_binding_shape(self._output_index))
+
+        self._output_shape = output_shape
+        self._host_output = np.empty(output_shape, dtype=self._output_dtype)
+        try:
+            self._input_mem = cuda.mem_alloc(host_input.nbytes)
+            self._output_mem = cuda.mem_alloc(self._host_output.nbytes)
+            self._stream = cuda.Stream()
+        except Exception:
+            # Free whichever allocation(s) succeeded before the failure
+            # (e.g. _input_mem allocated, then _output_mem raised on a
+            # near-OOM GPU) instead of leaking them for the process lifetime.
+            self._free_io_buffers()
+            raise
+
     # ---- Preprocessing, allocation and inference --------------------------
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
@@ -332,23 +399,16 @@ class PARSeqTensorRTOCREngine(OCREngine):
     def recognize(self, image: np.ndarray) -> tuple[str, float]:
         if self._init_failed or self._context is None or image is None or image.size == 0:
             return "", 0.0
-        input_mem = output_mem = None
+        if self._input_mem is None or self._output_mem is None or self._stream is None:
+            return "", 0.0
         try:
             import pycuda.driver as cuda
             import pycuda.autoprimaryctx  # noqa: F401: retains the CUDA primary context.
 
             host_input = self._preprocess(image)
-            stream = cuda.Stream()
-            if self._api.startswith("TensorRT 10"):
-                if not self._context.set_input_shape(self._input_name, host_input.shape):
-                    raise RuntimeError("TensorRT rejected PARSeq input shape %s" % (host_input.shape,))
-                output_shape = self._shape(self._context.get_tensor_shape(self._output_name))
-            else:
-                if not self._context.set_binding_shape(self._input_index, host_input.shape):
-                    raise RuntimeError("TensorRT rejected PARSeq input shape %s" % (host_input.shape,))
-                output_shape = self._shape(self._context.get_binding_shape(self._output_index))
-            host_output = np.empty(output_shape, dtype=self._output_dtype)
-            input_mem, output_mem = cuda.mem_alloc(host_input.nbytes), cuda.mem_alloc(host_output.nbytes)
+            stream = self._stream
+            input_mem, output_mem = self._input_mem, self._output_mem
+            host_output = self._host_output
             start_event, end_event = cuda.Event(), cuda.Event()
             start_event.record(stream)
             cuda.memcpy_htod_async(input_mem, host_input, stream)
@@ -373,7 +433,7 @@ class PARSeqTensorRTOCREngine(OCREngine):
                     raise RuntimeError("TensorRT execute_async_v2 failed")
             cuda.memcpy_dtoh_async(host_output, output_mem, stream)
             end_event.record(stream)
-            stream.synchronize()  # Required before host_output is decoded or allocations are freed.
+            stream.synchronize()  # Required before host_output is decoded.
             self.last_inference_ms = float(start_event.time_till(end_event))
             return self._decode(host_output)
         except ImportError:
@@ -382,27 +442,39 @@ class PARSeqTensorRTOCREngine(OCREngine):
             return "", 0.0
         except Exception as exc:
             _logger.warning("PARSeq TensorRT inference failed: %s", exc)
-            if self._should_rebuild_after_execution_error():
-                # Release allocations before trtexec writes a replacement plan.
-                if input_mem is not None:
-                    input_mem.free()
-                    input_mem = None
-                if output_mem is not None:
-                    output_mem.free()
-                    output_mem = None
-                self._execution_rebuild_attempted = True
-                if self._rebuild_engine(Path(self.engine_path), "TensorRT Cask execution failure"):
-                    self._init_failed = False
-                    self._initialize()
-                    if not self._init_failed:
-                        _logger.info("Retrying PARSeq inference with engine rebuilt on this Jetson")
-                        return self.recognize(image)
+            try:
+                if self._should_rebuild_after_execution_error():
+                    # Release the persistent buffers before trtexec writes a
+                    # replacement plan; _initialize() reallocates them on success.
+                    self._free_io_buffers()
+                    self._execution_rebuild_attempted = True
+                    if self._rebuild_engine(Path(self.engine_path), "TensorRT Cask execution failure"):
+                        self._init_failed = False
+                        self._initialize()
+                        if not self._init_failed:
+                            _logger.info("Retrying PARSeq inference with engine rebuilt on this Jetson")
+                            return self.recognize(image)
+                    else:
+                        # _free_io_buffers() above already cleared
+                        # _input_mem/_output_mem/_stream, so every future
+                        # recognize() call would otherwise hit the top-of-
+                        # method buffer guard and return ("", 0.0) silently
+                        # forever. Mark the engine failed and log once here
+                        # so this doesn't read as "OCR has no errors" when
+                        # it has in fact stopped working.
+                        _logger.error(
+                            "PARSeq TensorRT engine rebuild failed after a Cask "
+                            "execution error; OCR is disabled for the rest of "
+                            "this process."
+                        )
+                        self._init_failed = True
+            except Exception as recovery_exc:
+                # Never let a failure during error recovery (e.g. freeing an
+                # already-invalid CUDA handle) escape and take down the
+                # pipeline — recognize() must always degrade to ("", 0.0).
+                _logger.error("PARSeq TensorRT recovery failed: %s", recovery_exc)
+                self._init_failed = True
             return "", 0.0
-        finally:
-            if input_mem is not None:
-                input_mem.free()
-            if output_mem is not None:
-                output_mem.free()
 
     def _trt_major_version(self) -> int:
         try:

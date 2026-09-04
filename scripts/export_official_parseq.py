@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export official PARSeq-Tiny to ONNX")
     parser.add_argument("--source-dir", default="/tmp/baudm-parseq", help="Clone of https://github.com/baudm/parseq")
     parser.add_argument("--checkpoint", default="models/ocr/parseq_official_tiny.pt")
+    parser.add_argument(
+        "--local-checkpoint", default=None,
+        help="Path to a locally fine-tuned bare-model state_dict (e.g. the output of "
+             "training/finetune_parseq_official.py) to export instead of downloading "
+             "the stock pretrained weights.",
+    )
     parser.add_argument("--output", default="models/ocr/parseq_official_tiny.onnx")
     return parser.parse_args()
 
@@ -62,10 +68,23 @@ def main() -> None:
     ).eval()
     checkpoint_path = Path(args.checkpoint)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    state = torch.hub.load_state_dict_from_url(WEIGHTS_URL, model_dir=str(checkpoint_path.parent), map_location="cpu")
+    if args.local_checkpoint:
+        local_path = Path(args.local_checkpoint)
+        state = torch.load(local_path, map_location="cpu")
+        print(f"Loading fine-tuned checkpoint: {local_path}")
+    else:
+        state = torch.hub.load_state_dict_from_url(
+            WEIGHTS_URL, model_dir=str(checkpoint_path.parent), map_location="cpu"
+        )
     model.load_state_dict(state, strict=True)
-    # Keep an explicit, reproducible checkpoint name next to the ONNX artefact.
-    torch.save(state, checkpoint_path)
+    # Keep an explicit, reproducible checkpoint name next to the ONNX
+    # artefact -- but only for the stock-download path. --checkpoint's
+    # default is the *original* pretrained weights file; if a
+    # --local-checkpoint was given, that file already exists on disk, and
+    # saving over --checkpoint's default here would silently destroy the
+    # only copy of the un-fine-tuned baseline.
+    if not args.local_checkpoint:
+        torch.save(state, checkpoint_path)
 
     export_model = PARSeqTensorRTExport(model, tokenizer).eval()
     output_path = Path(args.output)
@@ -76,7 +95,10 @@ def main() -> None:
             export_model, dummy, output_path, input_names=["input"], output_names=["output"],
             opset_version=17, dynamo=False,
         )
-    print(f"Exported official PARSeq-Tiny checkpoint: {checkpoint_path}")
+    if args.local_checkpoint:
+        print(f"Exported official PARSeq-Tiny checkpoint (source unchanged): {local_path}")
+    else:
+        print(f"Exported official PARSeq-Tiny checkpoint: {checkpoint_path}")
     print(f"Exported ONNX: {output_path}")
 
 

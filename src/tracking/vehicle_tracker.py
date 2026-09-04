@@ -31,11 +31,24 @@ class VehicleTracker:
     """Assign and maintain consistent tracking IDs using ByteTrack.
 
     Args:
-        lost_track_timeout: Number of frames before a lost track is retired.
+        lost_track_timeout:       Number of frames before a lost track is retired.
+        minimum_matching_threshold: IOU threshold ByteTrack requires to keep
+            associating a detection with an existing track. The supervision
+            default (0.8) assumes small inter-frame motion; with frame_skip
+            > 1 a vehicle's box can move enough between processed frames to
+            drop under 0.8 IOU, which fragments one physical vehicle into
+            several track IDs (each restarting OCR fusion from zero votes,
+            so plates and cars go unstored). Lowering it tolerates that
+            larger jump.
     """
 
-    def __init__(self, lost_track_timeout: int = 30) -> None:
+    def __init__(
+        self,
+        lost_track_timeout: int = 30,
+        minimum_matching_threshold: float = 0.5,
+    ) -> None:
         self.lost_track_timeout = lost_track_timeout
+        self.minimum_matching_threshold = minimum_matching_threshold
         self._tracker = None
         self._track_labels: dict[int, str] = {}  # track_id → class_label
 
@@ -47,9 +60,12 @@ class VehicleTracker:
             import supervision as sv
             self._tracker = sv.ByteTrack(
                 lost_track_buffer=self.lost_track_timeout,
+                minimum_matching_threshold=self.minimum_matching_threshold,
             )
-            _logger.info("ByteTrack tracker initialized (lost_track_timeout=%d)",
-                         self.lost_track_timeout)
+            _logger.info(
+                "ByteTrack tracker initialized (lost_track_timeout=%d, minimum_matching_threshold=%.2f)",
+                self.lost_track_timeout, self.minimum_matching_threshold,
+            )
         except Exception as exc:
             _logger.error("Failed to initialize ByteTrack: %s", exc)
             raise

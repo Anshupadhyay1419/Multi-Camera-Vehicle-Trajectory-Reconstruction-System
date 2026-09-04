@@ -4,7 +4,15 @@ Config loader utility for the ALPR University Gate system.
 Provides:
 - ConfigError: custom exception raised on any configuration problem
 - load_config(path): reads and validates config.yaml, returning the full dict
+
+Secrets (camera URLs with embedded credentials, etc.) should never be
+written into config.yaml -- it's tracked in git. Put them in a local .env
+file instead (already gitignored); load_config() applies a small set of
+recognized environment-variable overrides on top of the YAML.
 """
+
+import os
+from pathlib import Path
 
 import yaml
 
@@ -35,6 +43,44 @@ REQUIRED_KEYS = [
 
 class ConfigError(Exception):
     """Raised when the configuration file is missing, unparseable, or invalid."""
+
+
+# config key (dot path) -> environment variable name. Extend this as more
+# values need to move out of the tracked config.yaml.
+_ENV_OVERRIDES = {
+    ("video", "source"): "ALPR_VIDEO_SOURCE",
+}
+
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Load KEY=value lines from a local .env file into os.environ.
+
+    Never overwrites a variable already set in the real environment (so an
+    explicit `export FOO=bar` before running always wins). No external
+    dependency -- the file format needed here (plain KEY=value lines,
+    '#' comments) doesn't warrant one.
+    """
+    env_path = Path(path)
+    if not env_path.is_file():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+def _apply_env_overrides(config: dict) -> None:
+    _load_dotenv()
+    for (top_key, sub_key), env_var in _ENV_OVERRIDES.items():
+        value = os.environ.get(env_var)
+        if value:
+            config[top_key][sub_key] = value
+            _logger.info("Config override from $%s: %s.%s", env_var, top_key, sub_key)
 
 
 def load_config(path: str = "config/config.yaml") -> dict:
@@ -105,4 +151,5 @@ def load_config(path: str = "config/config.yaml") -> dict:
             _logger.critical(msg)
             raise ConfigError(msg)
 
+    _apply_env_overrides(raw)
     return raw

@@ -5,6 +5,9 @@ Endpoints:
   POST /entry          — Record a vehicle event
   GET  /logs           — Retrieve all events (newest first)
   GET  /search?plate=  — Search events by plate number
+  GET  /stream         — Live annotated camera feed (MJPEG)
+  GET  /snapshot       — Single current frame (JPEG)
+  POST /clear          — Delete all stored events, images, and the live frame
 
 Run with:
   uvicorn src.api.server:app --host 0.0.0.0 --port 8000
@@ -12,17 +15,23 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from src.api.schemas import EntryRequest, EventResponse
 from src.database import db as database
+from src.utils.config import load_config
+from src.utils.data_reset import clear_all_data
 from src.utils.logger import get_logger
 
 _logger = get_logger("api.server")
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @asynccontextmanager
@@ -43,6 +52,25 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+def _load_app_config() -> dict:
+    try:
+        return load_config(str(_REPO_ROOT / "config" / "config.yaml"))
+    except Exception as exc:
+        _logger.warning("Could not load config.yaml (%s); using defaults", exc)
+        return {}
+
+
+_config = _load_app_config()
+_live_frame_path = _REPO_ROOT / _config.get("api", {}).get("live_frame_path", "data/live_frame.jpg")
+_plate_crops_dir = _REPO_ROOT / _config.get("database", {}).get("image_save_path", "data/plate_crops/")
+_plate_crops_dir.mkdir(parents=True, exist_ok=True)
+
+# Plate crop thumbnails, served under /media/<filename> -- deliberately a
+# narrow mount (just this one directory) rather than all of data/, which
+# also holds the sqlite database file.
+app.mount("/media", StaticFiles(directory=str(_plate_crops_dir)), name="media")
 
 
 def _get_db_session():
@@ -227,3 +255,85 @@ def get_system_settings():
 def health_check():
     """Simple health check endpoint."""
     return {"status": "ok"}
+
+
+@app.post("/clear")
+def clear_all():
+    """Delete every stored event, plate-crop image, and the live frame.
+
+    Confirmation happens client-side (the dashboard asks before calling
+    this) -- this endpoint itself performs the deletion unconditionally,
+    same as scripts/clear_data.py --yes.
+    """
+    try:
+        counts = clear_all_data(_config)
+        _logger.info(
+            "Cleared all data via dashboard: %d event(s), %d image(s)",
+            counts["events"], counts["images"],
+        )
+        return counts
+    except Exception as exc:
+        _logger.error("Failed to clear data: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/snapshot")
+def get_snapshot():
+    """Return the pipeline's current camera frame as a single JPEG.
+
+    The pipeline (scripts/run_pipeline.py) writes this file continuously
+    while running -- see src/utils/live_frame.py. If it hasn't run yet, or
+    isn't running right now, there is no file to serve.
+    """
+    if not _live_frame_path.exists():
+        raise HTTPException(
+            status_code=503,
+            detail="No live frame available -- is the pipeline running?",
+        )
+    return FileResponse(str(_live_frame_path), media_type="image/jpeg")
+
+
+@app.get("/stream")
+async def get_stream():
+    """Live camera feed as an MJPEG multipart stream.
+
+    A plain <img src="/stream"> renders this as live video in every
+    browser with no extra client-side code -- the standard simple way to
+    show a Python vision pipeline's output in a web page, short of a full
+    WebRTC setup.
+    """
+    boundary = "alprframe"
+    poll_interval = 1.0 / max(
+        float(_config.get("api", {}).get("live_frame_fps", 8.0)), 0.1
+    )
+
+    async def frame_generator():
+        last_mtime = None
+        while True:
+            try:
+                mtime = _live_frame_path.stat().st_mtime
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    data = _live_frame_path.read_bytes()
+                    yield (
+                        f"--{boundary}\r\n"
+                        f"Content-Type: image/jpeg\r\n"
+                        f"Content-Length: {len(data)}\r\n\r\n"
+                    ).encode("ascii") + data + b"\r\n"
+            except FileNotFoundError:
+                pass
+            await asyncio.sleep(poll_interval)
+
+    return StreamingResponse(
+        frame_generator(),
+        media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+    )
+
+
+# Serves the dashboard's HTML/CSS/JS. Mounted last and at the root path so
+# every API route above (all under distinct paths like /logs, /search)
+# still matches first -- Starlette checks routes in the order they were
+# added, and this mount is the fallback for anything that isn't one of
+# them, including "/" itself (html=True serves index.html there).
+_dashboard_dir = Path(__file__).resolve().parents[1] / "dashboard_web"
+app.mount("/", StaticFiles(directory=str(_dashboard_dir), html=True), name="dashboard")

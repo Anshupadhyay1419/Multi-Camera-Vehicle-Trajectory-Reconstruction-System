@@ -10,17 +10,28 @@ from __future__ import annotations
 import time
 from typing import Optional
 
+# Reuse the existing edit-distance implementation (src.validation.ocr_fusion
+# already has one for its own similarity-aware merge) instead of adding a
+# third hand-rolled copy to the codebase.
+from src.validation.ocr_fusion import _levenshtein
+
 
 class DuplicateFilter:
     """Suppress duplicate vehicle events within a time window.
 
     Args:
-        window_seconds: Events for the same plate/track within this window
-                        are considered duplicates (default 30).
+        window_seconds:   Events for the same plate/track within this window
+                          are considered duplicates (default 30).
+        max_edit_distance: Two plate strings within this Levenshtein distance
+                          are treated as the same plate. A single-character
+                          OCR confusion (O/C, O/0, ...) between two track
+                          fragments of the same physical vehicle otherwise
+                          slips past exact-match dedup and gets stored twice.
     """
 
-    def __init__(self, window_seconds: int = 30) -> None:
+    def __init__(self, window_seconds: int = 30, max_edit_distance: int = 1) -> None:
         self.window_seconds = window_seconds
+        self.max_edit_distance = max_edit_distance
         # plate_number → last recorded timestamp
         self._plate_times: dict[str, float] = {}
         # track_id → last recorded timestamp
@@ -30,7 +41,10 @@ class DuplicateFilter:
     def from_config(cls, config: dict) -> "DuplicateFilter":
         """Construct from the full config dict."""
         dedup_cfg = config.get("deduplication", {})
-        return cls(window_seconds=int(dedup_cfg.get("window_seconds", 30)))
+        return cls(
+            window_seconds=int(dedup_cfg.get("window_seconds", 30)),
+            max_edit_distance=int(dedup_cfg.get("max_edit_distance", 1)),
+        )
 
     def is_duplicate(
         self,
@@ -46,14 +60,29 @@ class DuplicateFilter:
             now:          Current timestamp (defaults to time.time()).
 
         Returns:
-            True if the same plate or track_id was recorded within the window.
+            True if the same plate (exact or within max_edit_distance) or
+            track_id was recorded within the window.
         """
         t = now if now is not None else time.time()
 
-        # Check plate
-        last_plate = self._plate_times.get(plate_number)
-        if last_plate is not None and (t - last_plate) < self.window_seconds:
-            return True
+        # Prune expired entries first. Nothing else in the pipeline calls
+        # cleanup() periodically, so without this both _plate_times and
+        # _track_times would otherwise grow for the life of a long-running
+        # (24/7) process, and the fuzzy-match loop below would scan an
+        # ever-growing number of already-expired entries on every call.
+        self.cleanup(now=t)
+
+        # Check plate — exact match first (cheap), then fuzzy match against
+        # every recently-seen plate so a fragmented track that re-reads the
+        # same physical plate with one OCR-confused character doesn't get
+        # stored as a second event.
+        for seen_plate, last_seen in self._plate_times.items():
+            if (t - last_seen) >= self.window_seconds:
+                continue
+            if seen_plate == plate_number:
+                return True
+            if len(seen_plate) == len(plate_number) and _levenshtein(seen_plate, plate_number) <= self.max_edit_distance:
+                return True
 
         # Check track_id
         last_track = self._track_times.get(track_id)

@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ALPR University Gate</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-title">
+      <span class="app-name">ALPR University Gate</span>
+      <span class="app-sub">Vehicle entry log</span>
+    </div>
+    <div class="topbar-status">
+      <span id="status-dot" class="status-dot status-unknown"></span>
+      <span id="status-text">Connecting</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel panel-feed">
+      <div class="panel-header">
+        <h2>Live camera feed</h2>
+        <span id="feed-updated" class="muted">—</span>
+      </div>
+      <div class="feed-frame">
+        <img id="feed-img" alt="Live camera feed" src="/snapshot">
+        <div id="feed-offline" class="feed-offline hidden">
+          <p>No live feed available.</p>
+          <p class="muted">The recognition pipeline is not currently running or has not produced a frame yet.</p>
+        </div>
+      </div>
+      <div class="feed-legend">
+        <span><i class="swatch swatch-amber"></i>Reading</span>
+        <span><i class="swatch swatch-green"></i>Confirmed</span>
+      </div>
+    </section>
+
+    <section class="panel panel-stats">
+      <div class="panel-header">
+        <h2>Today</h2>
+      </div>
+      <div class="stat-grid">
+        <div class="stat">
+          <span class="stat-value" id="stat-entries">—</span>
+          <span class="stat-label">Entries</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-exits">—</span>
+          <span class="stat-label">Exits</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-unique">—</span>
+          <span class="stat-label">Unique vehicles</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-total">—</span>
+          <span class="stat-label">Total events</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel panel-search">
+      <div class="panel-header">
+        <h2>Search records</h2>
+      </div>
+      <form id="search-form" class="search-form">
+        <input id="search-input" type="text" placeholder="Plate number, e.g. DL3CBJ1384" autocomplete="off" spellcheck="false">
+        <button type="submit">Search</button>
+        <button type="button" id="search-clear" class="secondary">Clear</button>
+      </form>
+      <p id="search-summary" class="muted"></p>
+    </section>
+
+    <section class="panel panel-table">
+      <div class="panel-header">
+        <h2 id="table-title">Recent entries</h2>
+        <div class="panel-header-actions">
+          <label class="auto-refresh">
+            <input type="checkbox" id="auto-refresh-toggle" checked>
+            Auto-refresh
+          </label>
+          <button type="button" id="clear-data-button" class="danger">Clear all data</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table id="events-table">
+          <thead>
+            <tr>
+              <th></th>
+              <th>Plate</th>
+              <th>Direction</th>
+              <th>Vehicle type</th>
+              <th>Color</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody id="events-body">
+            <tr><td colspan="6" class="muted center">Loading records…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <div id="detail-overlay" class="overlay hidden">
+    <div class="overlay-card">
+      <button id="detail-close" class="overlay-close" aria-label="Close">Close</button>
+      <img id="detail-img" alt="Plate capture">
+      <dl id="detail-fields" class="detail-fields"></dl>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -9,6 +9,7 @@ by confidence threshold.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -37,19 +38,59 @@ class VehicleDetector:
         confidence_threshold: Minimum confidence score to keep a detection.
     """
 
-    def __init__(self, model_path: str, confidence_threshold: float = 0.5) -> None:
+    def __init__(
+        self,
+        model_path: str,
+        confidence_threshold: float = 0.5,
+        imgsz: int = 480,
+        device: str | int = 0,
+        half: bool = True,
+    ) -> None:
         self.model_path = model_path
         self.confidence_threshold = confidence_threshold
+        self.imgsz = imgsz
+        self.device = device
+        self.half = half
         self._model = None
+        # A pre-exported TensorRT/ONNX plan already fixes its precision and
+        # device at export time; only a live .pt/torch model needs these
+        # passed again at predict() time.
+        self._predict_kwargs = (
+            {"imgsz": self.imgsz}
+            if Path(model_path).suffix.lower() in {".engine", ".onnx"}
+            else {"imgsz": self.imgsz, "device": self.device, "half": self.half}
+        )
+
+    @classmethod
+    def from_config(cls, config: dict) -> "VehicleDetector":
+        det_cfg = config.get("detection", {})
+        return cls(
+            model_path=det_cfg["vehicle_model_path"],
+            confidence_threshold=float(det_cfg.get("vehicle_confidence", 0.5)),
+            imgsz=int(det_cfg.get("vehicle_imgsz", 480)),
+            device=det_cfg.get("device", 0),
+            half=bool(det_cfg.get("half", True)),
+        )
 
     def _load_model(self) -> None:
-        """Lazy-load the YOLO model on first use."""
+        """Lazy-load the YOLO model on first use and warm it up.
+
+        A model's first inference pays for CUDA context / TensorRT engine
+        initialization (can be 1-2s), which otherwise shows up as a huge
+        outlier on whichever frame happens to trigger it mid-pipeline.
+        Running one dummy inference here moves that cost to startup.
+        """
         if self._model is not None:
             return
         try:
             from ultralytics import YOLO
             self._model = YOLO(self.model_path)
-            _logger.info("Vehicle detector loaded from '%s'", self.model_path)
+            dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
+            self._model(dummy, verbose=False, **self._predict_kwargs)
+            _logger.info(
+                "Vehicle detector loaded from '%s' (imgsz=%d device=%s half=%s)",
+                self.model_path, self.imgsz, self.device, self.half,
+            )
         except Exception as exc:
             _logger.error("Failed to load vehicle detector from '%s': %s", self.model_path, exc)
             raise
@@ -67,7 +108,7 @@ class VehicleDetector:
         self._load_model()
 
         try:
-            results = self._model(frame, verbose=False)
+            results = self._model(frame, verbose=False, **self._predict_kwargs)
         except Exception as exc:
             _logger.warning("Vehicle detection inference failed: %s", exc)
             return []

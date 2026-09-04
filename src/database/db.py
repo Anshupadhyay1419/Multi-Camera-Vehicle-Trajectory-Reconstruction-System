@@ -201,28 +201,49 @@ def get_events_by_direction(session: Session, direction: str, limit: int = 100) 
     return [e.to_dict() for e in events]
 
 
+def _event_local_date(timestamp: str):
+    """Parse a stored ISO timestamp and return its date in the local
+    timezone, or None if it can't be parsed (never let one bad row break
+    the whole stats query).
+    """
+    try:
+        ts = datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return None
+    if ts.tzinfo is None:
+        # Older/malformed rows without a UTC offset -- assume UTC, since
+        # that's what every current write path uses.
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone().date()
+
+
 def get_daily_stats(session: Session) -> dict:
-    """Return today's traffic statistics."""
-    from sqlalchemy import and_
-    from datetime import date
+    """Return today's traffic statistics.
 
-    today = date.today()
-    today_start = datetime(today.year, today.month, today.day)
-    today_end = datetime(today.year, today.month, today.day, 23, 59, 59)
+    "Today" means the local calendar day (what a human operator means by
+    it), even though events are stored with UTC timestamps
+    (datetime.now(timezone.utc).isoformat() -- see insert_event()). The
+    previous version compared local-date boundaries as plain strings
+    against those UTC timestamps with no timezone conversion, which is
+    wrong for roughly a third of the day (UTC and IST, for example, are
+    5.5 hours apart -- from local midnight until UTC's own midnight, an
+    event correctly stored for "today" sorts as "yesterday" against a
+    same-looking-but-wrong string boundary). Parsing to real datetimes and
+    comparing local calendar dates avoids the whole class of bug.
+    """
+    local_today = datetime.now().astimezone().date()
 
-    events = session.query(VehicleEvent).filter(
-        and_(
-            VehicleEvent.timestamp >= today_start.isoformat(),
-            VehicleEvent.timestamp <= today_end.isoformat()
-        )
-    ).all()
+    events = [
+        e for e in session.query(VehicleEvent).all()
+        if _event_local_date(e.timestamp) == local_today
+    ]
 
     in_count = sum(1 for e in events if e.direction == "IN")
     out_count = sum(1 for e in events if e.direction == "OUT")
     unique_vehicles = len(set(e.plate_number for e in events))
 
     return {
-        "date": today.isoformat(),
+        "date": local_today.isoformat(),
         "entries": in_count,
         "exits": out_count,
         "unique_vehicles": unique_vehicles,

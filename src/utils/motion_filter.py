@@ -19,15 +19,23 @@ class MotionFilter:
     Args:
         min_displacement_px: Minimum pixel movement to consider a vehicle moving.
         history_frames:      Number of frames to track centroid history.
+        enabled:             When False, is_moving() always returns True --
+                             i.e. every tracked vehicle is treated as moving.
+                             Useful for testing against a stationary target
+                             (e.g. a video played on a phone/laptop screen
+                             held in front of the camera), where a real
+                             vehicle's spatial movement never happens.
     """
 
     def __init__(
         self,
         min_displacement_px: float = 15.0,
         history_frames: int = 10,
+        enabled: bool = True,
     ) -> None:
         self.min_displacement_px = min_displacement_px
         self.history_frames = history_frames
+        self.enabled = enabled
         # track_id → deque of (cx, cy) centroids
         self._history: dict[int, deque[tuple[float, float]]] = {}
 
@@ -38,6 +46,7 @@ class MotionFilter:
         return cls(
             min_displacement_px=float(motion_cfg.get("min_displacement_px", 15.0)),
             history_frames=int(motion_cfg.get("history_frames", 10)),
+            enabled=bool(motion_cfg.get("enabled", True)),
         )
 
     def update(self, track_id: int, centroid: tuple[float, float]) -> None:
@@ -48,6 +57,8 @@ class MotionFilter:
 
     def is_moving(self, track_id: int) -> bool:
         """Return True if the vehicle has moved enough to be considered moving."""
+        if not self.enabled:
+            return True
         history = self._history.get(track_id)
         if not history or len(history) < 2:
             return True

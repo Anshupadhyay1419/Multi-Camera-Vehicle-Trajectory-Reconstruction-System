@@ -7,6 +7,8 @@ within vehicle crops. Returns cropped plate images as NumPy arrays.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from src.utils.logger import get_logger
@@ -22,19 +24,62 @@ class PlateDetector:
         confidence_threshold: Minimum confidence to keep a plate detection.
     """
 
-    def __init__(self, model_path: str, confidence_threshold: float = 0.4) -> None:
+    def __init__(
+        self,
+        model_path: str,
+        confidence_threshold: float = 0.4,
+        imgsz: int = 320,
+        device: str | int = 0,
+        half: bool = True,
+    ) -> None:
         self.model_path = model_path
         self.confidence_threshold = confidence_threshold
+        # Plate crops are already localized inside the vehicle box, so a
+        # small imgsz is plenty and cuts inference time substantially versus
+        # ultralytics' 640 default.
+        self.imgsz = imgsz
+        self.device = device
+        self.half = half
         self._model = None
+        # Pre-exported TensorRT/ONNX plans already fix their precision and
+        # device at export time; passing `half=`/`device=` again at predict()
+        # time only applies to a live .pt/torch model.
+        self._predict_kwargs = (
+            {"imgsz": self.imgsz}
+            if Path(model_path).suffix.lower() in {".engine", ".onnx"}
+            else {"imgsz": self.imgsz, "device": self.device, "half": self.half}
+        )
+
+    @classmethod
+    def from_config(cls, config: dict) -> "PlateDetector":
+        det_cfg = config.get("detection", {})
+        return cls(
+            model_path=det_cfg["plate_model_path"],
+            confidence_threshold=float(det_cfg.get("plate_confidence", 0.4)),
+            imgsz=int(det_cfg.get("plate_imgsz", 320)),
+            device=det_cfg.get("device", 0),
+            half=bool(det_cfg.get("half", True)),
+        )
 
     def _load_model(self) -> None:
-        """Lazy-load the YOLO model on first use."""
+        """Lazy-load the YOLO model on first use and warm it up.
+
+        A model's first inference pays for CUDA context / TensorRT engine
+        initialization (can be 1-2s), which otherwise shows up as a huge
+        outlier on whichever frame happens to trigger it mid-pipeline.
+        Running one dummy inference here moves that cost to startup.
+        """
         if self._model is not None:
             return
         try:
             from ultralytics import YOLO
             self._model = YOLO(self.model_path)
-            _logger.info("Plate detector loaded from '%s'", self.model_path)
+            dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
+            self._model(dummy, verbose=False, **self._predict_kwargs)
+            _logger.info(
+                "Plate detector loaded from '%s' (imgsz=%d device=%s half=%s)",
+                self.model_path, self.imgsz, self.device, self.half,
+            )
         except Exception as exc:
             _logger.error(
                 "Failed to load plate detector from '%s': %s", self.model_path, exc
@@ -57,7 +102,7 @@ class PlateDetector:
         self._load_model()
 
         try:
-            results = self._model(vehicle_crop, verbose=False)
+            results = self._model(vehicle_crop, verbose=False, **self._predict_kwargs)
         except Exception as exc:
             _logger.warning("Plate detection inference failed: %s", exc)
             return []

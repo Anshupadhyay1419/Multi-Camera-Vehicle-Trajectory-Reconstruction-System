@@ -46,8 +46,17 @@ def main():
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     log.info("Loading models...")
-    vehicle_detector = VehicleDetector(det_cfg["vehicle_model_path"], 0.2)
-    plate_detector   = PlateDetector(det_cfg["plate_model_path"], 0.15)
+    # Use from_config() (not the old positional 2-arg constructor) so
+    # imgsz/device/half stay in sync with config.yaml's detection section --
+    # vehicle_model_path/plate_model_path may point at pre-exported
+    # .engine/.onnx plans whose expected imgsz is config-driven, not the
+    # class defaults. Confidence thresholds here are intentionally more
+    # permissive than config.yaml for this visualization tool, so override
+    # them after construction.
+    vehicle_detector = VehicleDetector.from_config(config)
+    vehicle_detector.confidence_threshold = 0.2
+    plate_detector = PlateDetector.from_config(config)
+    plate_detector.confidence_threshold = 0.15
     ocr_backend      = str(config.get("ocr", {}).get("backend", "paddleocr"))
     ocr_engine       = create_ocr_engine(ocr_backend, config)
     plate_validator  = PlateValidator()

@@ -1,22 +1,79 @@
 video:
-  source: "mycarplate.mp4"              # local video file
-  frame_skip: 2                            # Process every 2nd frame for SPEED (complete coverage with performance)
+  source: "mycarplate.mp4"              # local video file, or rtsp://... / 0 (webcam) for live
+  # frame_skip=2 was needed when OCR preprocessing/inference were slow
+  # (NLM denoise + per-call CUDA alloc). Both are now ~1-6ms, so the real
+  # cost per frame is detection, not OCR — and skipping frames doubles the
+  # inter-frame box motion ByteTrack has to match, which was fragmenting a
+  # single vehicle into multiple track IDs (each restarting fusion voting
+  # from zero, so plates went unstored). Process every frame instead.
+  # Only applies to local video files -- a live source (rtsp://, webcam
+  # index, http(s)://) always runs through a background reader thread that
+  # keeps only the newest frame, which supersedes frame-skipping.
+  frame_skip: 1
   max_retries: 5                           # reconnect attempts on failure
+  # Live sources only: how long read_frame() waits for a new frame before
+  # treating the connection as stalled and forcing a reconnect. Guards
+  # against a network fault that hangs the read instead of failing it.
+  stall_timeout: 10.0
 
 detection:
-  vehicle_model_path: "models/vehicle_detector/yolov8n.pt"
+  # ── Jetson Orin Nano edge tuning ────────────────────────────────────────
+  # device: GPU index (0) to run YOLO on the Orin's CUDA cores, or "cpu".
+  # half: fp16 inference — ~2x faster on Jetson GPU, negligible accuracy hit.
+  # Both are ignored automatically when a model_path points at a pre-exported
+  # .engine/.onnx plan (those already fix precision/device at export time).
+  # Point *_model_path at a .engine file (run scripts/export_detectors_trt.sh
+  # once on-device) for the biggest latency win — raw .pt inference through
+  # PyTorch/ultralytics is 3-5x slower than TensorRT on this hardware.
+  device: 0
+  half: true
+  vehicle_model_path: "models/vehicle_detector/yolov8n.engine"
   vehicle_confidence: 0.5                  # Back to conservative (0.4 catches too many false positives)
-  plate_model_path: "models/plate_detector/best.pt"
+  vehicle_imgsz: 480                       # full-frame detection; 480 balances speed/recall
+  plate_model_path: "models/plate_detector/best.engine"
   plate_confidence: 0.4                    # Back to conservative
+  plate_imgsz: 320                         # plate search is within an already-localized vehicle crop
 
 tracking:
-  lost_track_timeout: 30                   # frames before track is retired
+  # In PROCESSED frames, not video frames. frame_skip went from 2 to 1
+  # above, doubling the processing rate — so this had to double too, or a
+  # track now gets dropped (and a re-detected vehicle gets a brand new ID)
+  # after half the real-world time it used to tolerate.
+  lost_track_timeout: 60                   # frames before track is retired
+  # ByteTrack's default (0.8) requires 80% IOU overlap to keep matching a
+  # detection to its track. Lowered so a fast-moving or partially-occluded
+  # vehicle doesn't get split into a new track ID mid-pass (see frame_skip
+  # comment above — same underlying symptom).
+  minimum_matching_threshold: 0.5
+  # Live sources only (ignored for a video file — see frame_capture.py: a
+  # file has no real-time pressure, so every track gets serviced every
+  # frame regardless of this setting). Caps how many tracks get the full
+  # plate-detect + preprocess + SR + OCR chain on any one processed frame;
+  # the rest rotate in on later frames. On-device benchmarking showed that
+  # chain scales linearly with simultaneously-visible vehicles (~38ms/frame
+  # at 1, ~98ms/frame at 4, against a ~33ms budget at 30fps) even though
+  # each model call alone is fast (plate detect ~13ms, OCR ~4ms) — once a
+  # frame overruns the camera's own interval, frame_capture.py's live path
+  # correctly drops frames to avoid unbounded latency, but a moving
+  # vehicle's box then jumps far enough between processed frames to break
+  # ByteTrack's IOU match, fragmenting the track and resetting OCR fusion's
+  # vote count right as the vehicle passes. Raise this only after
+  # confirming (e.g. via `--benchmark`) that your camera's typical
+  # simultaneous-vehicle count still fits your frame budget at the higher
+  # value.
+  live_max_heavy_tracks_per_frame: 1
 
 preprocessing:
   clahe_clip_limit: 2.0                    # Balanced for speed
   clahe_tile_size: 8
   denoise_h: 10
   sharpen_strength: 1.5
+  # Auto gamma-correct each crop toward mid-gray (brightens night/
+  # underexposed plates, recovers detail from glare/overexposed ones) and
+  # scale CLAHE's clip limit to the crop's own contrast. Needed for a live
+  # feed with real day/night/glare variance; a recorded, evenly-lit video
+  # won't visibly change since well-exposed crops are left alone.
+  adaptive_lighting: true
 
 enhancement:
   # sr_threshold_px: plates narrower than this (px) get upscaled before OCR.
@@ -74,12 +131,27 @@ ocr:
 fusion:
   window_size: 5                           # majority vote over 5 reads for accuracy
   min_confidence: 0.55                     # minimum confidence threshold
-  # Do not store a plausible-looking string unless PARSeq reads it identically
-  # in at least three frames. This prevents unstable live OCR false positives.
-  min_exact_votes: 3
+  # Was 3 when using the un-fine-tuned PARSeq model (noisy per-frame reads,
+  # needed extra repeats to trust a plate). The fine-tuned model now reads
+  # at 0.95-1.00 confidence consistently, so 3 identical votes is often
+  # more than a short-lived, fragmented track (2-3 frames) ever gets --
+  # which silently drops an otherwise-correct plate. 2 is enough given the
+  # model's now much lower per-frame error rate.
+  min_exact_votes: 2
 
 deduplication:
   window_seconds: 30
+  # Two plate strings within this Levenshtein distance count as the same
+  # plate. Catches a fragmented track re-reading the same physical vehicle
+  # with one or two OCR-confused characters (O/C, O/0, L/D, C/7, ...)
+  # instead of storing it as a second, wrong event. Was 1; raised to 2
+  # after a real fragment misread 2 characters at once (DL7CD5017 read as
+  # DD77D5017 by a short-lived track). Tradeoff: two DIFFERENT vehicles
+  # that both pass within window_seconds AND happen to have plates within
+  # edit distance 2 (e.g. sequential fleet/batch registrations) would also
+  # get merged. Acceptable for a lower-traffic gate; revisit if that
+  # becomes a real collision case.
+  max_edit_distance: 2
 
 color_classifier:
   hsv_ranges:
@@ -101,6 +173,12 @@ motion_filter:
   # per frame, so displacement per frame is slightly higher than with SR.
   min_displacement_px: 3.0
   history_frames: 3
+  # Set to false when testing against a stationary target (e.g. a video
+  # played on a phone/laptop screen held up to the camera) -- a real
+  # vehicle's spatial displacement never happens there, so this filter
+  # would otherwise silently block plate detection/OCR for it entirely.
+  # Set back to true for real deployment (ignores parked/stationary vehicles).
+  enabled: false
 
 database:
   path: "data/alpr.db"
@@ -109,6 +187,12 @@ database:
 api:
   host: "0.0.0.0"
   port: 8000
+  # Live camera feed (dashboard's /stream, /snapshot). The pipeline writes
+  # the current annotated frame here at up to live_frame_fps; the API just
+  # reads and serves whatever's currently on disk.
+  live_stream_enabled: true
+  live_frame_path: "data/live_frame.jpg"
+  live_frame_fps: 8.0
 
 dashboard:
   enabled: true

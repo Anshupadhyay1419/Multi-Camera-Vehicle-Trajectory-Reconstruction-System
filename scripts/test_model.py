@@ -113,7 +113,14 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("Loading models...")
-    plate_detector = PlateDetector(det_cfg["plate_model_path"], 0.15)
+    # from_config() (not the old positional 2-arg constructor) so
+    # imgsz/device/half stay in sync with config.yaml's detection section --
+    # plate_model_path may point at a pre-exported .engine/.onnx plan whose
+    # expected imgsz is config-driven, not the class default. This tool's
+    # confidence threshold is intentionally more permissive than
+    # config.yaml, so override it after construction.
+    plate_detector = PlateDetector.from_config(config)
+    plate_detector.confidence_threshold = 0.15
     ocr_engine     = PaddleOCREngine(use_angle_cls=True, lang="en")
     plate_validator = PlateValidator()
 
