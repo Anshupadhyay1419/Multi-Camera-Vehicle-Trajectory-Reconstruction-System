@@ -68,6 +68,16 @@ body {
   font-size: 13px;
 }
 
+/* Which gate this dashboard belongs to -- filled from GET /settings. */
+.camera-label {
+  font-size: 12px;
+  color: var(--accent);
+  background: var(--accent-weak);
+  border-radius: 999px;
+  padding: 2px 10px;
+  white-space: nowrap;
+}
+
 .topbar-status {
   display: flex;
   align-items: center;
@@ -387,6 +397,36 @@ tbody tr:hover {
   font-family: var(--mono);
   font-weight: 600;
   letter-spacing: 0.02em;
+}
+
+/* Camera name on top, its id beneath in smaller muted type -- both fit in
+   one column instead of costing the table two. */
+.camera-cell {
+  line-height: 1.25;
+}
+
+.camera-name {
+  display: block;
+}
+
+.camera-id {
+  display: block;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.coords {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.coords a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.coords a:hover {
+  text-decoration: underline;
 }
 
 .pill {

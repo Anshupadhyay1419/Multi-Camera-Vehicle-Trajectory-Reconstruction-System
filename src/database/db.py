@@ -19,7 +19,8 @@ from typing import Generator, Optional
 from urllib.parse import urlparse
 
 import numpy as np
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.database.models import Base, VehicleEvent
@@ -30,6 +31,105 @@ _logger = get_logger("database.db")
 _engine = None
 _SessionFactory = None
 _db_type = None  # "sqlite" or "postgres"
+
+
+# Columns added to vehicle_events after the first deployment, as
+# (name, SQL type) in the order they should be appended.
+#
+# Base.metadata.create_all() below only creates *missing tables* -- it never
+# alters an existing one. So a Jetson that has already been running has a
+# vehicle_events table with the original eight columns, and every query
+# naming a new column would fail with "no such column: camera_id" until the
+# table is actually altered. _migrate_schema() does that in place, keeping
+# the rows already recorded (their new columns read as NULL, which is what
+# nullable=True on the model is for).
+#
+# The types are spelled so one statement works on both backends: SQLite maps
+# VARCHAR/DOUBLE PRECISION onto its TEXT/REAL affinities, and PostgreSQL
+# takes them literally.
+_ADDED_COLUMNS = (
+    ("camera_id",   "VARCHAR"),
+    ("camera_name", "VARCHAR"),
+    ("latitude",    "DOUBLE PRECISION"),
+    ("longitude",   "DOUBLE PRECISION"),
+)
+
+
+# Substrings both backends use when asked to create something that is
+# already there -- SQLite says "duplicate column name: camera_id", PostgreSQL
+# says "column \"camera_id\" of relation ... already exists".
+_ALREADY_APPLIED_MARKERS = ("duplicate column", "already exists")
+
+
+def _apply_additive_ddl(conn, statement: str, description: str) -> None:
+    """Run one additive DDL statement, tolerating "already applied".
+
+    The pipeline and the API each call init_db() on startup, and on a Jetson
+    they are usually started together. Both would inspect the old table,
+    both would see the same column missing, and both would try to add it --
+    so the loser of that race gets a "duplicate column" error for work that
+    is now, in fact, done. Treating that as success keeps one process from
+    dying at startup over a migration the other just completed.
+
+    Scoped deliberately to additive DDL (ADD COLUMN / CREATE INDEX): for
+    those, "it already exists" really is the desired end state. Any other
+    failure propagates -- init_db() must not report a healthy database it
+    could not actually migrate.
+    """
+    try:
+        conn.execute(text(statement))
+        _logger.info("Schema migration: %s", description)
+    except OperationalError as exc:
+        message = str(exc).lower()
+        if any(marker in message for marker in _ALREADY_APPLIED_MARKERS):
+            _logger.debug(
+                "Schema migration: %s already applied by another process",
+                description,
+            )
+            return
+        raise
+
+
+def _migrate_schema(engine) -> None:
+    """Add any post-release columns missing from an existing vehicle_events.
+
+    A no-op for a database create_all() just built from the current model
+    (nothing is missing) and for one already migrated, so it is safe to run
+    unconditionally on every startup.
+    """
+    inspector = inspect(engine)
+    if "vehicle_events" not in inspector.get_table_names():
+        return
+
+    existing = {col["name"] for col in inspector.get_columns("vehicle_events")}
+    missing = [(name, sql_type) for name, sql_type in _ADDED_COLUMNS
+               if name not in existing]
+    if not missing:
+        return
+
+    for name, sql_type in missing:
+        # Always ADD COLUMN with no NOT NULL/DEFAULT -- existing rows have no
+        # camera to attribute them to, so NULL is the correct value for them
+        # and the cheapest ALTER on both backends.
+        #
+        # One transaction per statement, not one for the whole batch: if a
+        # concurrent starter has already added some of these columns, the
+        # tolerated error must not roll back the ones this process did add.
+        with engine.begin() as conn:
+            _apply_additive_ddl(
+                conn,
+                f"ALTER TABLE vehicle_events ADD COLUMN {name} {sql_type}",
+                f"added vehicle_events.{name}",
+            )
+
+    # create_all() builds this index for a fresh database; an altered one
+    # needs it created alongside the column it covers.
+    with engine.begin() as conn:
+        _apply_additive_ddl(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_camera_id ON vehicle_events (camera_id)",
+            "created index idx_camera_id",
+        )
 
 
 def init_db(db_url: str = None) -> None:
@@ -87,9 +187,11 @@ def init_db(db_url: str = None) -> None:
 
     _engine = create_engine(db_url, **engine_kwargs)
 
-    # Create all tables (SQLite) or verify they exist (PostgreSQL)
+    # Create all tables (SQLite) or verify they exist (PostgreSQL), then
+    # bring an older table up to the current model's column set.
     try:
         Base.metadata.create_all(_engine)
+        _migrate_schema(_engine)
         _SessionFactory = sessionmaker(bind=_engine)
         _logger.info("✓ Database connection established")
     except Exception as exc:
@@ -127,12 +229,32 @@ def get_session() -> Generator[Session, None, None]:
         session.close()
 
 
+def _as_optional_float(value) -> Optional[float]:
+    """Coerce a coordinate to float, or None if it isn't a usable number.
+
+    config.yaml is hand-edited, so a latitude can arrive as the string
+    "28.6139" (quoted by the editor) or as an empty value. Neither should
+    cost the gate an event, so an unusable coordinate is simply dropped --
+    utils/config.get_camera_metadata() has already logged the reason for
+    the pipeline's own path.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def insert_event(session: Session, event_data: dict) -> Optional[VehicleEvent]:
     """Insert a vehicle event record with one retry on failure.
 
     Args:
         session:    Active SQLAlchemy session.
-        event_data: Dict with keys matching VehicleEvent columns.
+        event_data: Dict with keys matching VehicleEvent columns. The four
+                    camera fields (camera_id, camera_name, latitude,
+                    longitude) are optional -- omitted, they store as NULL,
+                    so callers that predate camera attribution still work.
 
     Returns:
         The inserted VehicleEvent, or None if both attempts failed.
@@ -150,6 +272,10 @@ def insert_event(session: Session, event_data: dict) -> Optional[VehicleEvent]:
                 ),
                 direction=event_data["direction"],
                 image_path=event_data.get("image_path", ""),
+                camera_id=event_data.get("camera_id"),
+                camera_name=event_data.get("camera_name"),
+                latitude=_as_optional_float(event_data.get("latitude")),
+                longitude=_as_optional_float(event_data.get("longitude")),
             )
             session.add(event)
             session.flush()

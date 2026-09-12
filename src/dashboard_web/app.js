@@ -24,6 +24,7 @@
   const detailFields = el("detail-fields");
   const detailClose = el("detail-close");
   const clearDataButton = el("clear-data-button");
+  const cameraLabel = el("camera-label");
 
   let currentSearch = null; // null = showing recent events, else the query string
   let lastEvents = [];
@@ -38,6 +39,28 @@
     });
   }
 
+  // Coordinates are nullable in the database -- events recorded before
+  // camera attribution existed have none, and a gate that hasn't been
+  // surveyed yet has none either. Both cases render as a dash rather than
+  // as "0, 0", which is a real place in the Atlantic.
+  function hasCoords(ev) {
+    return typeof ev.latitude === "number" && typeof ev.longitude === "number";
+  }
+
+  // 5 decimal places is ~1m at the equator -- more than enough to identify
+  // a gate, and short enough to read in a table cell.
+  function fmtCoords(ev) {
+    if (!hasCoords(ev)) return null;
+    return `${ev.latitude.toFixed(5)}, ${ev.longitude.toFixed(5)}`;
+  }
+
+  // OpenStreetMap needs no API key and loads no third-party script into
+  // this page -- it's just an href the operator can click.
+  function mapUrl(ev) {
+    if (!hasCoords(ev)) return null;
+    return `https://www.openstreetmap.org/?mlat=${ev.latitude}&mlon=${ev.longitude}#map=18/${ev.latitude}/${ev.longitude}`;
+  }
+
   function thumbUrl(imagePath) {
     if (!imagePath) return null;
     const name = imagePath.split("/").pop();
@@ -47,13 +70,15 @@
   function renderTable(events) {
     lastEvents = events;
     if (!events.length) {
-      eventsBody.innerHTML = `<tr><td colspan="6" class="muted center">No records found.</td></tr>`;
+      eventsBody.innerHTML = `<tr><td colspan="8" class="muted center">No records found.</td></tr>`;
       return;
     }
 
     eventsBody.innerHTML = events.map((ev, idx) => {
       const thumb = thumbUrl(ev.image_path);
       const pillClass = ev.direction === "IN" ? "pill-in" : "pill-out";
+      const coords = fmtCoords(ev);
+      const map = mapUrl(ev);
       return `
         <tr data-idx="${idx}">
           <td>${thumb
@@ -64,6 +89,17 @@
           <td><span class="pill ${pillClass}">${escapeHtml(ev.direction)}</span></td>
           <td>${escapeHtml(ev.vehicle_type || "—")}</td>
           <td>${escapeHtml(ev.plate_color || "—")}</td>
+          <td class="camera-cell">
+            <span class="camera-name">${escapeHtml(ev.camera_name || "—")}</span>
+            ${ev.camera_id ? `<span class="camera-id muted">${escapeHtml(ev.camera_id)}</span>` : ""}
+          </td>
+          <td class="coords">${
+            // stopPropagation: the whole row opens the detail overlay on
+            // click, and following the map link shouldn't also do that.
+            map
+              ? `<a href="${map}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${escapeHtml(coords)}</a>`
+              : `<span class="muted">—</span>`
+          }</td>
           <td>${fmtTime(ev.timestamp)}</td>
         </tr>
       `;
@@ -90,6 +126,13 @@
       <dt>Vehicle type</dt><dd>${escapeHtml(ev.vehicle_type || "—")}</dd>
       <dt>Color</dt><dd>${escapeHtml(ev.plate_color || "—")}</dd>
       <dt>Series</dt><dd>${escapeHtml(ev.series_type || "—")}</dd>
+      <dt>Camera ID</dt><dd>${escapeHtml(ev.camera_id || "—")}</dd>
+      <dt>Camera name</dt><dd>${escapeHtml(ev.camera_name || "—")}</dd>
+      <dt>Latitude</dt><dd>${hasCoords(ev) ? ev.latitude.toFixed(6) : "—"}</dd>
+      <dt>Longitude</dt><dd>${hasCoords(ev) ? ev.longitude.toFixed(6) : "—"}</dd>
+      ${mapUrl(ev)
+        ? `<dt>Location</dt><dd><a href="${mapUrl(ev)}" target="_blank" rel="noopener noreferrer">View on map</a></dd>`
+        : ""}
       <dt>Timestamp</dt><dd>${fmtTime(ev.timestamp)}</dd>
     `;
     detailOverlay.classList.remove("hidden");
@@ -116,7 +159,7 @@
       const data = await fetchJson("/live?limit=50");
       renderTable(data.events || []);
     } catch (err) {
-      eventsBody.innerHTML = `<tr><td colspan="6" class="muted center">Could not load records.</td></tr>`;
+      eventsBody.innerHTML = `<tr><td colspan="8" class="muted center">Could not load records.</td></tr>`;
     }
   }
 
@@ -128,7 +171,7 @@
         ? `${data.length} record${data.length === 1 ? "" : "s"} for ${query.toUpperCase()}`
         : `No records found for ${query.toUpperCase()}`;
     } catch (err) {
-      eventsBody.innerHTML = `<tr><td colspan="6" class="muted center">Search failed.</td></tr>`;
+      eventsBody.innerHTML = `<tr><td colspan="8" class="muted center">Search failed.</td></tr>`;
       searchSummary.textContent = "";
     }
   }
@@ -168,6 +211,26 @@
     } catch (err) {
       // Leave existing values in place rather than blanking them on a
       // transient failure.
+    }
+  }
+
+  // Which gate this dashboard is showing, from the server's own
+  // config.yaml. Read once at load -- it's static per device, so there's
+  // nothing to poll for. Shown in the header so the page identifies its
+  // camera even when the event log is empty.
+  async function loadCameraLabel() {
+    try {
+      const settings = await fetchJson("/settings");
+      const cam = settings.camera;
+      if (!cam || !cam.camera_id) return;
+      const coords = fmtCoords(cam);
+      cameraLabel.textContent = coords
+        ? `${cam.camera_name} · ${cam.camera_id} · ${coords}`
+        : `${cam.camera_name} · ${cam.camera_id}`;
+      cameraLabel.classList.remove("hidden");
+    } catch (err) {
+      // Leave the label hidden -- a missing camera block is not worth an
+      // error message on an otherwise working dashboard.
     }
   }
 
@@ -254,6 +317,7 @@
   });
 
   // Initial load
+  loadCameraLabel();
   checkHealth();
   checkFeed();
   refreshStats();

@@ -240,6 +240,10 @@ def main():
                         vehicle_type = event.get("vehicle_type", "N/A")
                         color = event.get("plate_color", "N/A")
                         series = event.get("series_type", "N/A")
+                        camera_name = event.get("camera_name") or "N/A"
+                        camera_id = event.get("camera_id") or "N/A"
+                        latitude = event.get("latitude")
+                        longitude = event.get("longitude")
 
                         # Plate in badge
                         st.markdown(
@@ -261,7 +265,16 @@ def main():
                         with col_d4:
                             st.write(f"📌 {series}")
 
-                        st.caption(f"⏰ {timestamp}")
+                        # Coordinates are nullable (pre-camera-metadata rows,
+                        # and gates that haven't been surveyed), so only
+                        # render them when they're actually there.
+                        if latitude is not None and longitude is not None:
+                            location = f" · 📍 {latitude:.5f}, {longitude:.5f}"
+                        else:
+                            location = ""
+                        st.caption(
+                            f"⏰ {timestamp} · 🎥 {camera_name} ({camera_id}){location}"
+                        )
 
                     st.divider()
 
@@ -312,7 +325,8 @@ def main():
 
                 # Detailed table
                 st.write("**Event Details**")
-                display_cols = ["plate_number", "direction", "vehicle_type", "plate_color", "timestamp"]
+                display_cols = ["plate_number", "direction", "vehicle_type", "plate_color",
+                                "camera_id", "camera_name", "latitude", "longitude", "timestamp"]
                 df_display = df_results[[col for col in display_cols if col in df_results.columns]]
                 st.dataframe(df_display, use_container_width=True)
             else:
@@ -426,13 +440,20 @@ def main():
                 with col4:
                     st.write(f"**Total Events:** {len(history)}")
 
+                st.write(
+                    f"**Last seen at:** {vehicle_info.get('camera_name') or 'N/A'} "
+                    f"({vehicle_info.get('camera_id') or 'N/A'})"
+                )
+
                 st.divider()
 
                 # Events table
                 st.write("**Complete Event Log**")
-                display_cols = ["direction", "vehicle_type", "timestamp"]
-                if all(col in df_history.columns for col in display_cols):
-                    st.dataframe(df_history[display_cols], use_container_width=True)
+                display_cols = ["direction", "vehicle_type", "camera_id", "camera_name",
+                                "latitude", "longitude", "timestamp"]
+                present_cols = [col for col in display_cols if col in df_history.columns]
+                if present_cols:
+                    st.dataframe(df_history[present_cols], use_container_width=True)
             else:
                 st.warning(f"No history found for {plate_input}")
         else:

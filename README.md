@@ -600,10 +600,36 @@ Example response from `GET /logs`:
     "plate_color": "White",
     "direction": "IN",
     "timestamp": "2026-05-03T05:20:51Z",
-    "image_path": "data/plate_crops/KA02MN1828_20260503_052051.jpg"
+    "image_path": "data/plate_crops/KA02MN1828_20260503_052051.jpg",
+    "camera_id": "GATE-01",
+    "camera_name": "Main Gate",
+    "latitude": 28.613939,
+    "longitude": 77.209023
   }
 ]
 ```
+
+### Camera attribution
+
+Every event records which camera saw it and where that camera is, taken from
+the `camera:` block of the capturing device's `config.yaml`:
+
+```yaml
+camera:
+  camera_id: "GATE-01"        # short stable code, unique per deployment
+  camera_name: "Main Gate"    # label shown in the dashboard
+  latitude: 28.613939         # decimal degrees (WGS84), or null if unsurveyed
+  longitude: 77.209023
+```
+
+Set these per Jetson when provisioning it; the pipeline reads them once at
+startup. `POST /entry` fills them in from the server's own config when the
+request omits them, so an existing client needs no changes.
+
+All four columns are nullable: events recorded before camera attribution
+existed, and gates whose coordinates haven't been surveyed, show as `—` on
+the dashboard. `init_db()` adds the columns to an existing database in place
+on first start, keeping the events already recorded.
 
 Full interactive docs at `http://localhost:8000/docs`.
 
@@ -617,7 +643,8 @@ streamlit run src/dashboard/app.py
 
 - URL: `http://localhost:8501`
 - Auto-refreshes every 3 seconds
-- Shows: live event table, plate crop thumbnails, total count, IN/OUT breakdown
+- Shows: live event table, plate crop thumbnails, total count, IN/OUT breakdown,
+  and the camera (id, name, coordinates) each event came from
 
 ---
 

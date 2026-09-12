@@ -11,6 +11,7 @@
     <div class="topbar-title">
       <span class="app-name">ALPR University Gate</span>
       <span class="app-sub">Vehicle entry log</span>
+      <span id="camera-label" class="camera-label hidden"></span>
     </div>
     <div class="topbar-status">
       <span id="status-dot" class="status-dot status-unknown"></span>
@@ -93,11 +94,13 @@
               <th>Direction</th>
               <th>Vehicle type</th>
               <th>Color</th>
+              <th>Camera</th>
+              <th>Location</th>
               <th>Time</th>
             </tr>
           </thead>
           <tbody id="events-body">
-            <tr><td colspan="6" class="muted center">Loading records…</td></tr>
+            <tr><td colspan="8" class="muted center">Loading records…</td></tr>
           </tbody>
         </table>
       </div>

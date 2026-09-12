@@ -1,3 +1,31 @@
+# ── Camera identity / siting ────────────────────────────────────────────────
+# Who and where this unit is. One Jetson watches one gate, so these are
+# static per-device facts, not per-frame data -- they get stamped onto every
+# event this device stores so the dashboard can show *which* gate a plate was
+# seen at, not just when.
+#
+# Set these per unit when provisioning a new Jetson:
+#   camera_id    short stable code, unique across the deployment. This is the
+#                value the dashboard groups and filters by, so don't reuse or
+#                renumber it after events have been stored against it.
+#   camera_name  human-readable label shown in the dashboard UI.
+#   latitude /   decimal degrees, WGS84 -- the format a phone's map app shows
+#   longitude    (e.g. 28.613939, 77.209023), NOT degrees/minutes/seconds.
+#                Leave both null until the gate is actually surveyed; the
+#                dashboard then just shows the name with no coordinates,
+#                which is honest. A wrong-but-plausible pair is worse than
+#                none, since it plots the gate somewhere it isn't.
+#
+# Existing events (stored before this block existed) keep NULL camera fields
+# and render as "--" -- only newly stored events carry this metadata. If the
+# whole block is missing, the pipeline falls back to an obvious "UNKNOWN"
+# placeholder rather than inventing a plausible one.
+camera:
+  camera_id: "GATE-01"
+  camera_name: "Main Gate"
+  latitude: null
+  longitude: null
+
 video:
   source: "mycarplate.mp4"              # local video file, or rtsp://... / 0 (webcam) for live
   # frame_skip=2 was needed when OCR preprocessing/inference were slow

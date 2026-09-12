@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 
 from src.api.schemas import EntryRequest, EventResponse
 from src.database import db as database
-from src.utils.config import load_config
+from src.utils.config import get_camera_metadata, load_config
 from src.utils.data_reset import clear_all_data
 from src.utils.logger import get_logger
 
@@ -67,6 +67,10 @@ _live_frame_path = _REPO_ROOT / _config.get("api", {}).get("live_frame_path", "d
 _plate_crops_dir = _REPO_ROOT / _config.get("database", {}).get("image_save_path", "data/plate_crops/")
 _plate_crops_dir.mkdir(parents=True, exist_ok=True)
 
+# This device's camera identity/location, used to stamp any event posted to
+# /entry without its own camera fields (see config.yaml's `camera:` block).
+_camera_meta = get_camera_metadata(_config)
+
 # Plate crop thumbnails, served under /media/<filename> -- deliberately a
 # narrow mount (just this one directory) rather than all of data/, which
 # also holds the sqlite database file.
@@ -82,6 +86,40 @@ def _get_db_session():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
 
+def _resolve_event_camera(request: EntryRequest) -> dict:
+    """Decide which camera fields to store for a posted event.
+
+    A caller on this device can omit the camera fields entirely and inherit
+    this gate's configured identity -- the normal single-camera case, and
+    why the fields are optional on EntryRequest at all.
+
+    But inheritance only applies to *this* camera. If the request names a
+    different camera_id, the rest of this device's block describes a
+    different place, so filling in its name and coordinates would label the
+    event with a gate it never passed. Those fields stay as sent (possibly
+    None) instead.
+    """
+    sent = {
+        "camera_id":   request.camera_id,
+        "camera_name": request.camera_name,
+        "latitude":    request.latitude,
+        "longitude":   request.longitude,
+    }
+
+    is_other_camera = (
+        request.camera_id is not None
+        and request.camera_id != _camera_meta["camera_id"]
+    )
+    if is_other_camera:
+        return sent
+
+    # Same camera (or unspecified): fill each blank field from local config.
+    return {
+        key: _camera_meta[key] if value is None else value
+        for key, value in sent.items()
+    }
+
+
 @app.post("/entry", response_model=EventResponse, status_code=201)
 def create_entry(request: EntryRequest):
     """Record a new vehicle entry/exit event."""
@@ -95,6 +133,8 @@ def create_entry(request: EntryRequest):
                 "direction":    request.direction,
                 "image_path":   request.image_path,
                 "timestamp":    datetime.now(timezone.utc).isoformat(),
+                # camera_id / camera_name / latitude / longitude
+                **_resolve_event_camera(request),
             }
             event = database.insert_event(session, event_data)
             if event is None:
@@ -233,6 +273,7 @@ def get_system_settings():
 
         # Filter sensitive information
         safe_config = {
+            "camera": get_camera_metadata(config),
             "video": config.get("video", {}),
             "detection": {
                 "vehicle_confidence": config.get("detection", {}).get("vehicle_confidence"),

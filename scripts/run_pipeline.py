@@ -38,7 +38,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.utils.benchmark import BenchmarkRecorder
-from src.utils.config import load_config
+from src.utils.config import get_camera_metadata, load_config
 from src.utils.logger import get_logger
 from src.ocr.ocr_postprocessor import correct_ocr_text, remove_noise_characters
 
@@ -72,10 +72,16 @@ def _store_event(
     track_id: int,
     centroid: tuple,
     image_save_path: str,
+    camera_meta: dict,
     database,
     log,
 ) -> bool:
-    """Classify, deduplicate, and store a confirmed plate event."""
+    """Classify, deduplicate, and store a confirmed plate event.
+
+    *camera_meta* is this device's camera_id / camera_name / latitude /
+    longitude, read once at startup by get_camera_metadata() and stamped
+    onto every event -- see config.yaml's `camera:` block.
+    """
     if dup_filter.is_duplicate(plate_number, track_id):
         log.info("DUPLICATE skipped: %s (track %d)", plate_number, track_id)
         return False
@@ -93,6 +99,8 @@ def _store_event(
         "direction":    direction,
         "image_path":   image_path,
         "timestamp":    datetime.now(timezone.utc).isoformat(),
+        # camera_id / camera_name / latitude / longitude
+        **camera_meta,
     }
 
     try:
@@ -100,8 +108,9 @@ def _store_event(
             database.insert_event(session, event_data)
         dup_filter.record(plate_number, track_id)
         log.info(
-            "✅ STORED: plate=%s type=%s color=%s dir=%s",
+            "✅ STORED: plate=%s type=%s color=%s dir=%s camera=%s",
             plate_number, vehicle_type, color, direction,
+            camera_meta.get("camera_id"),
         )
         return True
     except Exception as exc:
@@ -204,6 +213,14 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
 
     database.init_db(db_cfg["path"])
     image_save_path = db_cfg.get("image_save_path", "data/plate_crops/")
+    # Static for the life of the process -- one Jetson watches one gate, so
+    # this is read once here rather than per event.
+    camera_meta = get_camera_metadata(config)
+    log.info(
+        "Camera: %s (%s) at lat=%s lon=%s",
+        camera_meta["camera_id"], camera_meta["camera_name"],
+        camera_meta["latitude"], camera_meta["longitude"],
+    )
     fusion_window   = int(fus_cfg.get("window_size", 5))
     min_conf        = float(fus_cfg.get("min_confidence", 0.70))
 
@@ -484,6 +501,7 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
                                 track_id=tid,
                                 centroid=track.centroid,
                                 image_save_path=image_save_path,
+                                camera_meta=camera_meta,
                                 database=database,
                                 log=log,
                             )
@@ -541,6 +559,7 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
                 track_id=tid,
                 centroid=centroid,
                 image_save_path=image_save_path,
+                camera_meta=camera_meta,
                 database=database,
                 log=log,
             )
