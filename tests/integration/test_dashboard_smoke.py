@@ -43,10 +43,15 @@ _SITES = [
 ]
 
 
-@pytest.fixture(scope="module")
-def seeded_db(tmp_path_factory):
-    """A real database with a real multi-camera journey in it."""
-    path = tmp_path_factory.mktemp("dashboard") / "alpr.db"
+@pytest.fixture()
+def seeded_db(tmp_path):
+    """A real database with a real multi-camera journey in it.
+
+    Function-scoped, not module-scoped: the deletion tests really do remove
+    these rows, and a shared database would leave every test that ran after
+    them looking at an empty system.
+    """
+    path = tmp_path / "alpr.db"
     database.init_db(str(path))
     with database.get_session() as session:
         for camera_id, name, lat, lon, order, minute in _SITES:
@@ -359,6 +364,70 @@ class TestSidebar:
         button = next(b for b in at.button if "Reload" in b.label)
         button.click().run()
         _assert_clean(at, "after reloading the camera config")
+
+
+class TestSessionDeletion:
+    """The sidebar's delete control, clicked the way an operator would."""
+
+    def _events(self) -> int:
+        with database.get_session() as session:
+            return len(database.get_all_events(session, limit=500))
+
+    def test_the_delete_control_offers_the_real_sessions(self, app):
+        at = app()
+        options = [o for box in at.get("selectbox") for o in box.options]
+        assert any("SMOKE" in option for option in options)
+
+    def test_deleting_asks_for_confirmation_before_removing_anything(self, app):
+        """One mis-click on a narrow sidebar control must not destroy a run."""
+        at = app()
+        before = self._events()
+
+        picker = next(
+            box for box in at.get("selectbox")
+            if box.options and box.options[0] == "—"
+            and any("SMOKE" in o for o in box.options)
+        )
+        picker.set_value(next(o for o in picker.options if "SMOKE" in o)).run()
+        delete_button = next(b for b in at.button if b.label.startswith("Delete session"))
+        delete_button.click().run()
+        _assert_clean(at, "after asking to delete")
+
+        # Still nothing deleted -- only a confirmation prompt.
+        assert self._events() == before
+        assert at.warning, "a confirmation warning should be shown"
+        assert any(b.label == "Yes, delete" for b in at.button)
+        assert any(b.label == "Cancel" for b in at.button)
+
+    def test_cancelling_leaves_the_events_alone(self, app):
+        at = app()
+        before = self._events()
+        picker = next(
+            box for box in at.get("selectbox")
+            if box.options and box.options[0] == "—"
+            and any("SMOKE" in o for o in box.options)
+        )
+        picker.set_value(next(o for o in picker.options if "SMOKE" in o)).run()
+        next(b for b in at.button if b.label.startswith("Delete session")).click().run()
+        next(b for b in at.button if b.label == "Cancel").click().run()
+        _assert_clean(at, "after cancelling")
+        assert self._events() == before
+
+    def test_confirming_deletes_the_session_and_its_events(self, app):
+        at = app()
+        assert self._events() > 0
+
+        picker = next(
+            box for box in at.get("selectbox")
+            if box.options and box.options[0] == "—"
+            and any("SMOKE" in o for o in box.options)
+        )
+        picker.set_value(next(o for o in picker.options if "SMOKE" in o)).run()
+        next(b for b in at.button if b.label.startswith("Delete session")).click().run()
+        next(b for b in at.button if b.label == "Yes, delete").click().run()
+        _assert_clean(at, "after confirming the delete")
+
+        assert self._events() == 0, "the session's events were not removed"
 
 
 class TestSearch:

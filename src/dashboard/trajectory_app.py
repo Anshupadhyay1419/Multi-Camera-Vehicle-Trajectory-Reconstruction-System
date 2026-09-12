@@ -51,6 +51,7 @@ from src.database import db as database
 from src.mapping import render_trajectory_map
 from src.trajectory import TrajectoryEngine, trajectory_to_geojson
 from src.utils.config import load_config
+from src.utils.data_reset import delete_processing_session
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPO_ROOT / "config" / "config.yaml"
@@ -1052,6 +1053,65 @@ def main() -> None:
             ),
         )
         session_filter = None if picked == "All sessions" else picked.split()[0]
+
+        # ── delete a session ──────────────────────────────────────────────
+        # Two-step on purpose: this removes stored detections and their
+        # images and cannot be undone, so a single mis-click on a narrow
+        # sidebar control must not be enough to destroy a run.
+        if sessions:
+            deletable = st.selectbox(
+                "Delete a session",
+                ["—"] + [
+                    f"{row['processing_session']}  ({row['detections']} events)"
+                    for row in sessions
+                ],
+                help=(
+                    "Permanently removes every event recorded in that run, "
+                    "and the plate and vehicle crops they reference."
+                ),
+            )
+            if deletable != "—":
+                target = deletable.split()[0]
+                confirm_key = f"confirm_delete_{target}"
+                if not st.session_state.get(confirm_key):
+                    if st.button(
+                        f"Delete session {target}",
+                        use_container_width=True,
+                        disabled=manager.is_running(),
+                    ):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+                else:
+                    st.warning(
+                        f"Delete **{target}** and all its events? "
+                        "This cannot be undone."
+                    )
+                    confirm_columns = st.columns(2)
+                    if confirm_columns[0].button(
+                        "Yes, delete", type="primary", use_container_width=True
+                    ):
+                        try:
+                            counts = delete_processing_session(
+                                _bootstrap()["config"], target
+                            )
+                            st.session_state.pop(confirm_key, None)
+                            # A trajectory on screen may have just lost its
+                            # underlying events.
+                            if st.session_state.get("active_plate"):
+                                st.session_state.pop("active_plate", None)
+                            st.success(
+                                f"Deleted {counts['events']} event(s) and "
+                                f"{counts['images']} image(s)."
+                            )
+                            time.sleep(0.8)
+                            st.rerun()
+                        except (ValueError, RuntimeError) as exc:
+                            st.error(f"Delete failed: {exc}")
+                    if confirm_columns[1].button("Cancel", use_container_width=True):
+                        st.session_state.pop(confirm_key, None)
+                        st.rerun()
+            if manager.is_running():
+                st.caption("Sessions cannot be deleted while a run is in progress.")
 
         st.divider()
         st.subheader("Camera network")

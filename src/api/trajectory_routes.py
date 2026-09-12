@@ -19,6 +19,7 @@ behaviour; this module only adds.
   GET  /trajectory-api/statistics             session/camera aggregates
   GET  /trajectory-api/plates                 plates worth plotting
   GET  /trajectory-api/sessions               recent processing sessions
+  DEL  /trajectory-api/sessions/{id}          delete a session and its events
 """
 
 from __future__ import annotations
@@ -401,6 +402,54 @@ def list_trackable_plates(
     except RuntimeError as exc:
         _logger.error("Database unavailable on /plates: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable")
+
+
+@router.delete("/sessions/{session_id}")
+def delete_processing_session_route(session_id: str):
+    """Delete one processing session and every event recorded in it.
+
+    Removes the rows and the plate/vehicle crops they referenced. Refused
+    while a session is running: deleting the events of a run that is still
+    writing them would leave the status file describing detections that no
+    longer exist.
+    """
+    from src.utils.config import load_config
+    from src.utils.data_reset import delete_processing_session
+
+    manager = _get_manager()
+    if manager.is_running():
+        raise HTTPException(
+            status_code=409,
+            detail="A processing session is running; stop it before deleting sessions",
+        )
+
+    try:
+        config = load_config(str(_REPO_ROOT / "config" / "config.yaml"))
+        counts = delete_processing_session(config, session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        _logger.error("Database unavailable deleting session %s: %s", session_id, exc)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    except Exception as exc:
+        _logger.error("Failed to delete session %s: %s", session_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if counts["events"] == 0:
+        raise HTTPException(
+            status_code=404, detail=f"No events found for session {session_id!r}"
+        )
+
+    _logger.info(
+        "Deleted session %s: %d event(s), %d image(s)",
+        session_id, counts["events"], counts["images"],
+    )
+    return {
+        "processing_session": session_id,
+        "deleted_events": counts["events"],
+        "deleted_images": counts["images"],
+        "message": f"Deleted {counts['events']} event(s) from session {session_id}",
+    }
 
 
 @router.get("/sessions")

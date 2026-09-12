@@ -104,6 +104,52 @@ def _event(**overrides) -> dict:
     return base
 
 
+@pytest.fixture()
+def client(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_URL", f"sqlite:///{tmp_path}/api.db")
+    from src.api import trajectory_routes
+    from src.api.server import app
+    from src.cameras.manager import CameraManager
+    from src.cameras.registry import load_camera_registry
+    from src.cameras.status_store import StatusStore
+
+    # Give the routes a manager whose uploads and status land in tmp_path.
+    # Without this the module-level manager uses the real registry, and
+    # an upload test would write junk .mp4 files into the project's own
+    # data/uploads -- leaving cameras looking "ready" with 256 bytes of
+    # test data in them.
+    registry = load_camera_registry("config/camera_config.yaml")
+    registry._settings["processing"] = {
+        "upload_dir": str(tmp_path / "uploads"),
+        "status_file": str(tmp_path / "status.json"),
+    }
+    monkeypatch.setattr(
+        trajectory_routes, "_manager",
+        CameraManager(
+            {"video": {}}, registry,
+            runner=lambda **kwargs: {},
+            status_store=StatusStore(str(tmp_path / "status.json")),
+        ),
+    )
+    monkeypatch.setattr(trajectory_routes, "_registry", registry)
+
+    with TestClient(app) as client:
+        with database.get_session() as session:
+            sites = [
+                ("CAM001", "India Gate", 28.6129, 77.2295, 1, 0),
+                ("CAM002", "Connaught Place", 28.6315, 77.2167, 2, 12),
+                ("CAM003", "Karol Bagh", 28.6519, 77.1909, 3, 25),
+                ("CAM004", "Kashmere Gate", 28.6675, 77.2273, 4, 48),
+            ]
+            for camera_id, name, lat, lon, order, minute in sites:
+                database.insert_event(session, _event(
+                    camera_id=camera_id, camera_name=name,
+                    latitude=lat, longitude=lon, trajectory_order=order,
+                    timestamp=f"2026-09-12T09:{minute:02d}:00+00:00",
+                ))
+        yield client
+
+
 class TestSchemaMigration:
     @pytest.mark.parametrize(
         "schema,name",
@@ -245,51 +291,6 @@ class TestInsertAndRead:
 
 
 class TestTrajectoryRoutes:
-    @pytest.fixture()
-    def client(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("DB_URL", f"sqlite:///{tmp_path}/api.db")
-        from src.api import trajectory_routes
-        from src.api.server import app
-        from src.cameras.manager import CameraManager
-        from src.cameras.registry import load_camera_registry
-        from src.cameras.status_store import StatusStore
-
-        # Give the routes a manager whose uploads and status land in tmp_path.
-        # Without this the module-level manager uses the real registry, and
-        # an upload test would write junk .mp4 files into the project's own
-        # data/uploads -- leaving cameras looking "ready" with 256 bytes of
-        # test data in them.
-        registry = load_camera_registry("config/camera_config.yaml")
-        registry._settings["processing"] = {
-            "upload_dir": str(tmp_path / "uploads"),
-            "status_file": str(tmp_path / "status.json"),
-        }
-        monkeypatch.setattr(
-            trajectory_routes, "_manager",
-            CameraManager(
-                {"video": {}}, registry,
-                runner=lambda **kwargs: {},
-                status_store=StatusStore(str(tmp_path / "status.json")),
-            ),
-        )
-        monkeypatch.setattr(trajectory_routes, "_registry", registry)
-
-        with TestClient(app) as client:
-            with database.get_session() as session:
-                sites = [
-                    ("CAM001", "India Gate", 28.6129, 77.2295, 1, 0),
-                    ("CAM002", "Connaught Place", 28.6315, 77.2167, 2, 12),
-                    ("CAM003", "Karol Bagh", 28.6519, 77.1909, 3, 25),
-                    ("CAM004", "Kashmere Gate", 28.6675, 77.2273, 4, 48),
-                ]
-                for camera_id, name, lat, lon, order, minute in sites:
-                    database.insert_event(session, _event(
-                        camera_id=camera_id, camera_name=name,
-                        latitude=lat, longitude=lon, trajectory_order=order,
-                        timestamp=f"2026-09-12T09:{minute:02d}:00+00:00",
-                    ))
-            yield client
-
     def test_camera_registry_is_served_in_processing_order(self, client):
         response = client.get("/trajectory-api/cameras")
         assert response.status_code == 200
@@ -398,6 +399,114 @@ class TestTrajectoryRoutes:
             files={"file": ("clip.mp4", b"data", "video/mp4")},
         )
         assert response.status_code == 404
+
+
+class TestSessionDeletion:
+    """Deleting one run, its events, and its images."""
+
+    @pytest.fixture()
+    def seeded(self, tmp_path):
+        database.init_db(str(tmp_path / "del.db"))
+        images = []
+        with database.get_session() as session:
+            for index, run in enumerate(("RUN_A", "RUN_A", "RUN_B")):
+                plate_image = tmp_path / f"plate_{index}.jpg"
+                vehicle_image = tmp_path / f"vehicle_{index}.jpg"
+                plate_image.write_bytes(b"x")
+                vehicle_image.write_bytes(b"x")
+                images.append((run, plate_image, vehicle_image))
+                database.insert_event(session, _event(
+                    processing_session=run,
+                    image_path=str(plate_image),
+                    vehicle_image_path=str(vehicle_image),
+                ))
+        return images
+
+    def test_deleting_a_session_removes_only_its_events(self, seeded):
+        with database.get_session() as session:
+            result = database.delete_session(session, "RUN_A")
+        assert result["events"] == 2
+
+        with database.get_session() as session:
+            remaining = database.get_all_events(session)
+        assert len(remaining) == 1
+        assert remaining[0]["processing_session"] == "RUN_B"
+
+    def test_the_images_of_the_deleted_events_are_reported(self, seeded):
+        with database.get_session() as session:
+            result = database.delete_session(session, "RUN_A")
+        # Both the plate crop and the vehicle crop of each deleted event.
+        assert len(result["image_paths"]) == 4
+
+    def test_deleting_without_a_session_id_is_refused(self, seeded):
+        """An empty id would match every single-gate event ever recorded --
+        never what a 'delete this run' button means."""
+        for empty in ("", "   ", None):
+            with database.get_session() as session:
+                with pytest.raises(ValueError, match="needs a session id"):
+                    database.delete_session(session, empty)
+        with database.get_session() as session:
+            assert len(database.get_all_events(session)) == 3
+
+    def test_deleting_an_unknown_session_removes_nothing(self, seeded):
+        with database.get_session() as session:
+            assert database.delete_session(session, "NOPE")["events"] == 0
+            assert len(database.get_all_events(session)) == 3
+
+    def test_the_helper_also_deletes_the_image_files(self, seeded, tmp_path):
+        from src.utils.data_reset import delete_processing_session
+
+        config = {"database": {"path": str(tmp_path / "del.db")}}
+        counts = delete_processing_session(config, "RUN_A")
+
+        assert counts["events"] == 2
+        assert counts["images"] == 4
+        for run, plate_image, vehicle_image in seeded:
+            if run == "RUN_A":
+                assert not plate_image.exists()
+                assert not vehicle_image.exists()
+            else:
+                assert plate_image.exists(), "another run's images were deleted"
+
+    def test_a_missing_image_file_does_not_fail_the_delete(self, seeded, tmp_path):
+        """The rows are already gone; a stuck file must not hide that."""
+        from src.utils.data_reset import delete_processing_session
+
+        for run, plate_image, _ in seeded:
+            if run == "RUN_A":
+                plate_image.unlink()
+
+        counts = delete_processing_session(
+            {"database": {"path": str(tmp_path / "del.db")}}, "RUN_A"
+        )
+        assert counts["events"] == 2
+
+
+class TestSessionDeleteRoute:
+    def test_deleting_a_session_over_the_api(self, client):
+        listed = client.get("/trajectory-api/sessions").json()
+        assert listed and listed[0]["processing_session"] == "SESS1"
+
+        response = client.delete("/trajectory-api/sessions/SESS1")
+        assert response.status_code == 200, response.text
+        assert response.json()["deleted_events"] == 4
+
+        assert client.get("/trajectory-api/sessions").json() == []
+        assert client.get("/trajectory-api/trajectory/DL8CA1234").status_code == 404
+
+    def test_deleting_an_unknown_session_is_a_404(self, client):
+        assert client.delete("/trajectory-api/sessions/NOPE").status_code == 404
+
+    def test_deleting_is_refused_while_a_run_is_in_progress(self, client, monkeypatch):
+        from src.api import trajectory_routes
+
+        monkeypatch.setattr(
+            trajectory_routes._manager, "is_running", lambda: True
+        )
+        response = client.delete("/trajectory-api/sessions/SESS1")
+        assert response.status_code == 409
+        # ...and nothing was deleted.
+        assert client.get("/trajectory-api/sessions").json()
 
 
 class TestDatabaseBinding:

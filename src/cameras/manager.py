@@ -160,6 +160,22 @@ class CameraManager:
         self._live_duration_seconds = processing.get("live_duration_seconds", 60)
         self._upload_dir = Path(processing.get("upload_dir", "data/uploads"))
 
+        # Loaded on the first session and KEPT for the life of this
+        # process. Two reasons, both learned the hard way:
+        #
+        #   * Releasing them killed the dashboard. PipelineModels.close()
+        #     frees PyCUDA device buffers and drops the TensorRT objects,
+        #     and doing that inside a long-lived process aborts it outright
+        #     ("PyCUDA ERROR: context stack was not empty") -- so the server
+        #     died the moment a run finished and the browser showed
+        #     "Connection error".
+        #   * Keeping them makes every session after the first start
+        #     immediately instead of paying the load again.
+        #
+        # The memory stays allocated, which is exactly what a second run
+        # would have re-allocated anyway. A short-lived CLI run is unaffected:
+        # run_pipeline still builds and releases its own models there.
+        self._models = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -566,6 +582,15 @@ class CameraManager:
         status = self._status
         assert status is not None  # set by start() before the thread launched
 
+        # Make the CUDA primary context current on THIS thread, and make sure
+        # the stack is empty again before the thread ends -- see
+        # cameras.cuda_context. Skipping the drain aborts the whole process
+        # when the worker exits, which is what used to take the dashboard
+        # down every time a run finished.
+        from src.cameras import cuda_context
+
+        cuda_context.push_primary_context()
+
         failures = 0
         models = None
         try:
@@ -578,17 +603,27 @@ class CameraManager:
             # is nothing else to show, and a motionless "0% / 0.0 FPS" for
             # minutes is indistinguishable from a hang.
             if self._uses_real_pipeline:
-                from src.cameras.pipeline_models import PipelineModels
+                if self._models is not None:
+                    models = self._models
+                    self._append_log("Reusing the models already loaded in this process.")
+                    self._publish()
+                else:
+                    from src.cameras.pipeline_models import PipelineModels
 
-                self._append_log("Loading detection and OCR models (once for this session)…")
-                self._publish()
-                started = time.monotonic()
-                models = PipelineModels.load(self._config, on_progress=self._append_log)
-                self._append_log(
-                    f"Models ready in {time.monotonic() - started:.0f}s — "
-                    f"shared across all {len(queue)} camera(s)."
-                )
-                self._publish()
+                    self._append_log(
+                        "Loading detection and OCR models (once per process)…"
+                    )
+                    self._publish()
+                    started = time.monotonic()
+                    models = PipelineModels.load(
+                        self._config, on_progress=self._append_log
+                    )
+                    self._models = models
+                    self._append_log(
+                        f"Models ready in {time.monotonic() - started:.0f}s — "
+                        f"shared across all {len(queue)} camera(s)."
+                    )
+                    self._publish()
 
             for position, camera in enumerate(queue, start=1):
                 if self._stop_event.is_set():
@@ -630,11 +665,9 @@ class CameraManager:
             self._append_log(f"Session failed: {exc}")
 
         finally:
-            # The models outlive every camera in the queue, so they are
-            # released here rather than in any one camera's shutdown.
-            if models is not None:
-                models.close()
-
+            # The models are deliberately NOT released here. They outlive the
+            # session as well as the queue: see self._models above -- closing
+            # them mid-process aborts it and takes the dashboard down with it.
             status.current_camera_id = None
             status.finished_at = time.time()
             self._append_log(
@@ -647,6 +680,11 @@ class CameraManager:
                 "Session %s finished with state=%s (%d detections)",
                 session_id, status.state.value, status.total_detections,
             )
+
+            # Last thing this thread does. The models stay loaded and stay
+            # valid -- the primary context is reference-counted and survives
+            # the pop; the next session's worker pushes it again.
+            cuda_context.drain_contexts()
 
     def _process_camera(
         self,
@@ -811,6 +849,20 @@ class CameraManager:
         """Snapshot the status to the shared file for other processes."""
         if self._status is not None:
             self._status_store.write(self._status.to_dict())
+
+    def release_models(self) -> None:
+        """Free the shared models. For a process that is about to exit.
+
+        NOT called at the end of a session on purpose. Releasing PyCUDA
+        buffers and TensorRT objects inside a long-lived process aborts it
+        ("PyCUDA ERROR: context stack was not empty"), which killed the
+        dashboard every time a run completed. A caller that is shutting down
+        anyway can use this; a server should simply let process exit handle
+        it.
+        """
+        if self._models is not None:
+            self._models.close()
+            self._models = None
 
     def _clear_live_frames(self) -> None:
         """Delete the per-camera preview frames from the previous session."""

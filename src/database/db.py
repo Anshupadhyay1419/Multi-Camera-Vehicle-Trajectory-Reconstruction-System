@@ -655,6 +655,57 @@ def get_processing_sessions(session: Session, limit: int = 20) -> list[dict]:
     ]
 
 
+def delete_session(session, processing_session: str) -> dict:
+    """Delete every event recorded in one processing session.
+
+    Returns the images those events referenced so the caller can remove them
+    too -- this function deliberately does NOT touch the filesystem.
+    Deleting rows and deleting files are different failure modes (a locked or
+    missing file must not roll back the database delete), so the two are kept
+    separate and the caller decides how to handle each.
+
+    Args:
+        session:            Active SQLAlchemy session.
+        processing_session: The run to delete. Must be a non-empty id --
+                            deleting "everything with no session" would wipe
+                            every single-gate event ever recorded, which is
+                            never what a "delete this run" button means.
+
+    Returns:
+        {"events": N, "image_paths": [...]} -- how many rows were removed and
+        the image files those rows leave orphaned.
+
+    Raises:
+        ValueError: No session id was given.
+    """
+    processing_session = (processing_session or "").strip()
+    if not processing_session:
+        raise ValueError(
+            "delete_session() needs a session id; refusing to delete events "
+            "that belong to no session"
+        )
+
+    rows = (
+        session.query(VehicleEvent)
+        .filter(VehicleEvent.processing_session == processing_session)
+        .all()
+    )
+    image_paths = [
+        path
+        for event in rows
+        for path in (event.image_path, event.vehicle_image_path)
+        if path
+    ]
+
+    deleted = (
+        session.query(VehicleEvent)
+        .filter(VehicleEvent.processing_session == processing_session)
+        .delete(synchronize_session=False)
+    )
+    _logger.info("Deleted %d event(s) from session %s", deleted, processing_session)
+    return {"events": int(deleted or 0), "image_paths": image_paths}
+
+
 def save_vehicle_image(
     vehicle_crop: np.ndarray,
     plate_number: str,
