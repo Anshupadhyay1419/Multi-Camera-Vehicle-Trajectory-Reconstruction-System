@@ -86,6 +86,45 @@ class PlateDetector:
             )
             raise
 
+    def close(self) -> None:
+        """Release the loaded model and its GPU memory.
+
+        Needed because the multi-camera manager runs one pipeline per camera
+        inside a single process: a four-camera queue otherwise loads four
+        copies of this detector and frees none of them until the process
+        exits. With a TensorRT (.engine) model that also leaves CUDA state
+        alive per copy, which surfaces as a context-stack error at
+        interpreter teardown.
+
+        Idempotent and non-throwing -- called from a finally-block during
+        shutdown, where raising would mask whatever is already unwinding.
+        """
+        model, self._model = self._model, None
+        if model is None:
+            return
+        try:
+            # Ultralytics keeps the torch module (or the TensorRT wrapper) on
+            # .model; dropping both references lets the allocator reclaim the
+            # device memory at the next collection.
+            inner = getattr(model, "model", None)
+            if inner is not None and hasattr(inner, "cpu"):
+                inner.cpu()
+            del inner, model
+            import gc
+
+            gc.collect()
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                # torch is optional at runtime for an ONNX/TensorRT-only
+                # deployment; nothing to reclaim through it in that case.
+                pass
+        except Exception as exc:
+            _logger.warning("Failed to release %s: %s", type(self).__name__, exc)
+
     def detect(self, vehicle_crop: np.ndarray) -> list[np.ndarray]:
         """Detect license plates within a vehicle crop.
 

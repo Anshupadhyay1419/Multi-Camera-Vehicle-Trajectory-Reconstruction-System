@@ -1,0 +1,124 @@
+# ══════════════════════════════════════════════════════════════════════════
+#  Multi-Camera Vehicle Trajectory Reconstruction — camera registry
+# ══════════════════════════════════════════════════════════════════════════
+#
+# One entry per camera in the deployment. Every entry describes a physically
+# distinct site: its identity, where it stands on the map, and where its
+# video comes from. The trajectory engine reconstructs a vehicle's path by
+# joining detections back to these coordinates, so the lat/lon here are the
+# only place a site's real-world position is defined -- nothing downstream
+# hardcodes a route.
+#
+# ── Fields ────────────────────────────────────────────────────────────────
+#   camera_id    Short stable code, unique across the deployment. Stored on
+#                every event; never renumber it after events exist against
+#                it, or history re-attributes itself to the wrong site.
+#   camera_name  Human-readable label shown in the dashboard, on map popups
+#                and in the trajectory timeline.
+#   latitude /   Decimal degrees, WGS84 -- the format a phone's map app
+#   longitude    shows (e.g. 28.612900, 77.229500), NOT degrees/min/sec.
+#                Leave null until the site is actually surveyed: a camera
+#                with no coordinates still records events and still appears
+#                in the timeline, it just cannot be plotted on the map. A
+#                wrong-but-plausible pair is worse than none.
+#   video_path   Recorded file to process for this camera. Used when
+#                `source_type: upload`. The dashboard overwrites this at
+#                runtime with whatever file the operator uploaded.
+#   rtsp_url     Live stream URL, used when `source_type: rtsp`. Keep
+#                credentials OUT of this file (it is tracked in git) --
+#                write ${ENV_VAR} and export the real URL instead; see
+#                "Future RTSP migration" in docs/.
+#   source_type  "upload" (recorded file) or "rtsp" (live stream). This is
+#                the ONLY field that changes when migrating a site from
+#                demo playback to a real camera.
+#   enabled      false skips the camera entirely -- it is not queued, not
+#                processed, and contributes no trajectory points.
+#   order        Position in the sequential processing queue, and the
+#                fallback ordering for trajectory reconstruction when
+#                timestamps are unusable. Ascending; ties broken by the
+#                order entries appear in this file.
+#
+# ── Processing ────────────────────────────────────────────────────────────
+# Cameras are processed STRICTLY ONE AT A TIME, in ascending `order`. Each
+# camera runs its full ALPR pass to completion before the next one opens its
+# source. This is deliberate: the Jetson has one GPU and the ALPR pipeline
+# already saturates it, so parallel cameras would contend for the same
+# TensorRT context and make every stream slower than running them in turn.
+
+defaults:
+  # Applied to every camera that does not override the key itself. Keeps the
+  # per-camera blocks to just what actually differs between sites.
+  source_type: "upload"
+  enabled: true
+  rtsp_url: null
+
+cameras:
+  - camera_id: "CAM001"
+    camera_name: "India Gate"
+    latitude: 28.6129
+    longitude: 77.2295
+    video_path: "data/uploads/CAM001.mp4"
+    order: 1
+
+  - camera_id: "CAM002"
+    camera_name: "Connaught Place"
+    latitude: 28.6315
+    longitude: 77.2167
+    video_path: "data/uploads/CAM002.mp4"
+    order: 2
+
+  - camera_id: "CAM003"
+    camera_name: "Karol Bagh"
+    latitude: 28.6519
+    longitude: 77.1909
+    video_path: "data/uploads/CAM003.mp4"
+    order: 3
+
+  - camera_id: "CAM004"
+    camera_name: "Kashmere Gate"
+    latitude: 28.6675
+    longitude: 77.2273
+    video_path: "data/uploads/CAM004.mp4"
+    order: 4
+
+processing:
+  # Where the dashboard writes uploaded videos before queueing them.
+  upload_dir: "data/uploads"
+  # Cross-process handoff for live status: the worker (which may be a
+  # background thread in Streamlit, or the API process) writes here, and
+  # every reader -- dashboard, API, CLI -- polls this one file. A plain JSON
+  # file rather than a queue/broker because there is exactly one writer and
+  # the payload is a few hundred bytes.
+  status_file: "data/processing_status.json"
+  # Stop the whole run when one camera fails, or log it and carry on with
+  # the next. Continuing is the better default for a survey: three good
+  # cameras still reconstruct a usable partial trajectory.
+  continue_on_error: true
+  # How long each LIVE (rtsp) camera is sampled before the queue moves on.
+  #
+  # A recorded file ends by itself and ignores this setting entirely. An RTSP
+  # stream never ends, so without a bound a sequential queue would block
+  # forever on its first live camera and never reach the second. Each live
+  # camera therefore gets a fixed dwell time: long enough for vehicles to
+  # pass and for OCR fusion to accumulate votes, short enough that a four
+  # camera sweep completes in a few minutes.
+  #
+  # Set to 0 to run a live camera until it is stopped by hand -- only
+  # sensible when exactly one camera is enabled, since nothing after it in
+  # the queue would ever run.
+  live_duration_seconds: 60
+
+trajectory:
+  # How detections are ordered into a path.
+  #   auto             timestamp when every point has one, else camera order
+  #   timestamp        strictly chronological (correct for live RTSP)
+  #   trajectory_order camera queue position (deterministic for the demo)
+  order_by: "auto"
+  # Collapse repeated detections of one plate at one camera into a single
+  # trajectory point (the first sighting, which is when the vehicle actually
+  # reached that site). The full un-collapsed list stays available for the
+  # history table.
+  collapse_per_camera: true
+  # Points closer together in time than this at the SAME camera are treated
+  # as one visit rather than a re-entry.
+  revisit_gap_seconds: 300

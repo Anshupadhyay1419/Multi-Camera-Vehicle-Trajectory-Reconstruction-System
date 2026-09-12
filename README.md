@@ -7,6 +7,7 @@ A production-quality **Automatic License Plate Recognition (ALPR)** system built
 ##  Table of Contents
 
 - [Features](#-features)
+- [Multi-Camera Trajectory Reconstruction](#-multi-camera-trajectory-reconstruction)
 - [Pipeline Overview](#-pipeline-overview)
 - [Project Structure](#-project-structure)
 - [What Each File Does](#-what-each-file-does)
@@ -40,6 +41,45 @@ A production-quality **Automatic License Plate Recognition (ALPR)** system built
 - Virtual line IN/OUT direction detection
 - SQLite database + FastAPI REST API + Streamlit live dashboard
 - CSV output mode for quick batch video processing
+
+---
+
+##  Multi-Camera Trajectory Reconstruction
+
+The system also runs as a **multi-camera vehicle trajectory reconstruction
+system**: several ALPR cameras across a city, each recognising plates
+independently, with a trajectory engine that joins those sightings into an
+ordered, mapped path for any given vehicle.
+
+```
+CAM001 India Gate ──┐
+CAM002 Connaught ───┤   processed SEQUENTIALLY,     ┌─▶ Trajectory engine
+CAM003 Karol Bagh ──┤   one camera at a time  ──────┤   (order · legs · GeoJSON)
+CAM004 Kashmere ────┘   into one shared database    └─▶ Leaflet map + timeline
+```
+
+Quick start:
+
+```bash
+streamlit run src/dashboard/trajectory_app.py
+# per camera: upload a video OR set an RTSP URL (one or the other)
+# → START PROCESSING → search a plate → Trajectory tab
+```
+
+- Cameras are configured in **`config/camera_config.yaml`** (id, name,
+  latitude, longitude, video or RTSP source) — nothing is hardcoded.
+- Cameras are processed **strictly one at a time**: one GPU, and it keeps
+  demo timestamps monotonic across the queue.
+- Every camera takes **one** source: an uploaded video **or** an RTSP stream.
+  Both run through the same pipeline; switching is a one-field change with no
+  code changes. Live streams are sampled for a bounded time
+  (`processing.live_duration_seconds`, default 60 s) so the queue advances.
+- The single-gate pipeline, API and dashboard below are **unchanged** and
+  still work exactly as documented.
+
+**Full documentation: [`docs/MULTI_CAMERA_TRAJECTORY_SYSTEM.md`](docs/MULTI_CAMERA_TRAJECTORY_SYSTEM.md)**
+— architecture, data flow, database schema, trajectory engine, map engine,
+API reference, and the RTSP migration guide.
 
 ---
 

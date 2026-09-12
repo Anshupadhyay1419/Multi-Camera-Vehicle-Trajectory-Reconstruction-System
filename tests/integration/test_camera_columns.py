@@ -26,6 +26,7 @@ from sqlalchemy import create_engine, inspect
 
 from src.database import db as database
 from src.database.db import get_all_events, insert_event
+from src.database.models import VehicleEvent
 
 CAMERA_COLUMNS = ["camera_id", "camera_name", "latitude", "longitude"]
 
@@ -135,7 +136,13 @@ class TestSchemaMigration:
         database.init_db(db_path)
         cols = [c["name"] for c in
                 inspect(database.get_engine()).get_columns("vehicle_events")]
-        assert len(cols) == len(set(cols)) == 12
+        # No column added twice, and the migrated table matches the model
+        # exactly. Derived from VehicleEvent rather than a hardcoded count so
+        # this keeps testing idempotency as the schema grows, instead of
+        # needing an edit every time a column is added.
+        expected = [c.name for c in VehicleEvent.__table__.columns]
+        assert len(cols) == len(set(cols))
+        assert set(cols) == set(expected)
 
     def test_partially_migrated_table_is_completed(self, tmp_path, reset_db_module):
         """Another process (or an interrupted start) may have added only some

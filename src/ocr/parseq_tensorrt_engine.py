@@ -310,6 +310,29 @@ class PARSeqTensorRTOCREngine(OCREngine):
         self._host_output = None
         self._output_shape = None
 
+    def close(self) -> None:
+        """Free the GPU buffers and drop the TensorRT objects.
+
+        Called once per camera by the pipeline's shutdown path. Without it,
+        a four-camera queue builds four engines in one process and frees
+        none of them until the process exits -- which on a Jetson's unified
+        memory is a real ceiling, and which also leaves the CUDA context
+        stack non-empty at interpreter teardown.
+
+        Idempotent and non-throwing: safe to call twice, and safe to call on
+        an engine whose initialisation failed.
+        """
+        self._free_io_buffers()
+        # Dropped newest-first: the execution context references the engine,
+        # which references the runtime. Releasing in the other order leaves
+        # TensorRT holding a pointer to something already collected.
+        self._context = None
+        self._engine = None
+        self._runtime = None
+        self._trt_logger = None
+        self._init_failed = True   # any further recognize() no-ops instead of
+                                   # touching freed device memory
+
     def _allocate_io_buffers(self) -> None:
         """Allocate the fixed-shape GPU input/output buffers and CUDA stream
         once at load time. Input size is always batch=1 x 3 x H x W, so these

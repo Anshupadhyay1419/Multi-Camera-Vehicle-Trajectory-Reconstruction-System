@@ -28,6 +28,15 @@ class EntryRequest(BaseModel):
     latitude:     Optional[float] = None
     longitude:    Optional[float] = None
 
+    # Multi-camera trajectory fields. Optional for the same reason as the
+    # camera block: a single-gate caller never sends them.
+    vehicle_image_path: Optional[str]   = None
+    trajectory_order:   Optional[int]   = None
+    processing_session: Optional[str]   = None
+    video_source:       Optional[str]   = None
+    confidence:         Optional[float] = None
+    ocr_text:           Optional[str]   = None
+
 
 class EventResponse(BaseModel):
     id:           int
@@ -47,3 +56,111 @@ class EventResponse(BaseModel):
     camera_name:  Optional[str]   = None
     latitude:     Optional[float] = None
     longitude:    Optional[float] = None
+
+    # Nullable for every row that is not part of a multi-camera run.
+    vehicle_image_path: Optional[str]   = None
+    trajectory_order:   Optional[int]   = None
+    processing_session: Optional[str]   = None
+    video_source:       Optional[str]   = None
+    confidence:         Optional[float] = None
+    ocr_text:           Optional[str]   = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Multi-camera trajectory reconstruction
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class CameraResponse(BaseModel):
+    """One configured camera, as the dashboard needs it."""
+
+    camera_id:    str
+    camera_name:  str
+    latitude:     Optional[float] = None
+    longitude:    Optional[float] = None
+    order:        int
+    source_type:  str
+    video_path:   Optional[str] = None
+    rtsp_url:     Optional[str] = None
+    enabled:      bool = True
+    has_location: bool = False
+
+
+class StartProcessingRequest(BaseModel):
+    """Kick off a sequential run over the camera queue."""
+
+    # None runs every enabled camera, which is the normal case; a list
+    # restricts the run without changing the order they run in.
+    camera_ids: Optional[list[str]] = None
+    session_id: Optional[str] = None
+
+
+class StartProcessingResponse(BaseModel):
+    session_id: str
+    queued_cameras: list[str]
+    message: str
+
+
+class RTSPRequest(BaseModel):
+    """Point a camera at a live stream instead of an uploaded file."""
+
+    rtsp_url: str
+
+
+class TrajectoryPointResponse(BaseModel):
+    """One camera visit on a reconstructed path."""
+
+    sequence:           int
+    camera_id:          str
+    camera_name:        str
+    latitude:           Optional[float] = None
+    longitude:          Optional[float] = None
+    timestamp:          Optional[str]   = None
+    confidence:         Optional[float] = None
+    detection_count:    int = 1
+    plate_image_path:   Optional[str] = None
+    vehicle_image_path: Optional[str] = None
+    vehicle_type:       Optional[str] = None
+    plate_color:        Optional[str] = None
+    direction:          Optional[str] = None
+    trajectory_order:   Optional[int] = None
+    video_source:       Optional[str] = None
+    ocr_text:           Optional[str] = None
+    has_location:       bool = False
+    all_timestamps:     list[str] = []
+
+
+class TrajectoryLegResponse(BaseModel):
+    """Measured movement between two consecutive points.
+
+    Every measurement is independently optional -- an unsurveyed camera
+    yields no distance, an unparseable timestamp no duration, and speed
+    needs both.
+    """
+
+    from_camera_id:   str
+    from_camera_name: str
+    to_camera_id:     str
+    to_camera_name:   str
+    distance_km:      Optional[float] = None
+    duration_seconds: Optional[float] = None
+    speed_kmh:        Optional[float] = None
+    bearing_degrees:  Optional[float] = None
+
+
+class TrajectoryResponse(BaseModel):
+    """A vehicle's reconstructed path across the camera network."""
+
+    plate_number:       str
+    processing_session: Optional[str] = None
+    ordering:           str = "timestamp"
+    points:             list[TrajectoryPointResponse] = []
+    legs:               list[TrajectoryLegResponse] = []
+    cameras_visited:    int = 0
+    total_detections:   int = 0
+    first_seen:         Optional[str] = None
+    last_seen:          Optional[str] = None
+    duration_seconds:   Optional[float] = None
+    total_distance_km:  Optional[float] = None
+    average_confidence: Optional[float] = None
+    path_labels:        list[str] = []

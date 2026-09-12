@@ -29,15 +29,29 @@ def clear_all_data(config: dict) -> dict[str, int]:
         deleted_events = session.query(VehicleEvent).delete()
         session.commit()
 
-    crops_dir = REPO_ROOT / db_cfg.get("image_save_path", "data/plate_crops/")
+    # Both crop directories: plate crops (every deployment) and whole-vehicle
+    # crops (multi-camera runs only). Leaving the vehicle crops behind would
+    # orphan them -- the rows referencing them have just been deleted.
     deleted_images = 0
-    if crops_dir.is_dir():
-        for image_path in crops_dir.glob("*.jpg"):
-            image_path.unlink()
-            deleted_images += 1
+    for setting, default in (
+        ("image_save_path", "data/plate_crops/"),
+        ("vehicle_image_save_path", "data/vehicle_crops/"),
+    ):
+        crops_dir = REPO_ROOT / db_cfg.get(setting, default)
+        if crops_dir.is_dir():
+            for image_path in crops_dir.glob("*.jpg"):
+                image_path.unlink()
+                deleted_images += 1
 
     live_frame_path = REPO_ROOT / config.get("api", {}).get("live_frame_path", "data/live_frame.jpg")
     if live_frame_path.exists():
         live_frame_path.unlink()
+
+    # The processing status file describes a session whose events no longer
+    # exist; leaving it would have the dashboard report detections that have
+    # just been cleared.
+    status_path = REPO_ROOT / "data" / "processing_status.json"
+    if status_path.exists():
+        status_path.unlink()
 
     return {"events": deleted_events, "images": deleted_images}

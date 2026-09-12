@@ -52,13 +52,14 @@ def _init_logger(config: dict):
 
 
 def _ensure_system_site_packages() -> None:
-    """Enable system-installed Jetson Python packages inside a virtualenv."""
-    if sys.prefix == sys.base_prefix:
-        return
+    """Enable system-installed Jetson Python packages inside a virtualenv.
 
-    for path in ("/usr/lib/python3.12/dist-packages", "/usr/lib/python3/dist-packages"):
-        if Path(path).is_dir() and str(path) not in sys.path:
-            sys.path.append(str(path))
+    Delegates to utils.jetson_paths so the multi-camera session, which loads
+    its models before any pipeline starts, applies exactly the same fix.
+    """
+    from src.utils.jetson_paths import ensure_system_site_packages
+
+    ensure_system_site_packages()
 
 
 def _store_event(
@@ -75,12 +76,35 @@ def _store_event(
     camera_meta: dict,
     database,
     log,
+    vehicle_crop: np.ndarray | None = None,
+    confidence: float | None = None,
+    ocr_text: str | None = None,
+    session_context: dict | None = None,
+    vehicle_image_save_path: str = "data/vehicle_crops/",
+    progress=None,
 ) -> bool:
     """Classify, deduplicate, and store a confirmed plate event.
 
-    *camera_meta* is this device's camera_id / camera_name / latitude /
-    longitude, read once at startup by get_camera_metadata() and stamped
-    onto every event -- see config.yaml's `camera:` block.
+    *camera_meta* is the capturing camera's camera_id / camera_name /
+    latitude / longitude -- read once at startup by get_camera_metadata()
+    for the single-gate path, or supplied per camera by the multi-camera
+    manager.
+
+    The trailing arguments are all optional and all default to the
+    single-gate behaviour this function has always had:
+
+      vehicle_crop     Whole-vehicle image to archive alongside the plate
+                       crop. None (the default) stores no vehicle image and
+                       leaves the column NULL, exactly as before.
+      confidence /     Recorded on the event for the map popups and the
+      ocr_text         search page. None leaves them NULL.
+      session_context  processing_session / trajectory_order / video_source
+                       for a multi-camera run. None means this event is not
+                       part of one.
+      progress         Optional reporter notified of each stored event, so a
+                       dashboard can show detections as they happen. Any
+                       exception it raises is swallowed -- reporting must
+                       never cost the pipeline an event.
     """
     if dup_filter.is_duplicate(plate_number, track_id):
         log.info("DUPLICATE skipped: %s (track %d)", plate_number, track_id)
@@ -90,6 +114,14 @@ def _store_event(
     vehicle_type = vehicle_classifier.classify(color)
     direction = direction_detector.update(track_id, centroid) or "IN"
     image_path = database.save_plate_image(plate_crop, plate_number, image_save_path)
+
+    # Only written when a crop was actually passed in, so the single-gate
+    # path does no extra disk I/O and the column stays NULL for it.
+    vehicle_image_path = ""
+    if vehicle_crop is not None and getattr(vehicle_crop, "size", 0):
+        vehicle_image_path = database.save_vehicle_image(
+            vehicle_crop, plate_number, vehicle_image_save_path
+        )
 
     event_data = {
         "plate_number": plate_number,
@@ -101,6 +133,11 @@ def _store_event(
         "timestamp":    datetime.now(timezone.utc).isoformat(),
         # camera_id / camera_name / latitude / longitude
         **camera_meta,
+        "vehicle_image_path": vehicle_image_path or None,
+        "confidence": confidence,
+        "ocr_text":   ocr_text,
+        # processing_session / trajectory_order / video_source
+        **(session_context or {}),
     }
 
     try:
@@ -108,10 +145,21 @@ def _store_event(
             database.insert_event(session, event_data)
         dup_filter.record(plate_number, track_id)
         log.info(
-            "✅ STORED: plate=%s type=%s color=%s dir=%s camera=%s",
+            "✅ STORED: plate=%s type=%s color=%s dir=%s camera=%s conf=%s",
             plate_number, vehicle_type, color, direction,
             camera_meta.get("camera_id"),
+            f"{confidence:.2f}" if confidence is not None else "n/a",
         )
+        if progress is not None:
+            try:
+                progress.on_detection(
+                    plate_number=plate_number,
+                    confidence=confidence,
+                    plate_image=image_path,
+                    vehicle_image=vehicle_image_path,
+                )
+            except Exception as exc:
+                log.debug("Progress reporter raised on_detection: %s", exc)
         return True
     except Exception as exc:
         log.error("Failed to store event for %s: %s", plate_number, exc)
@@ -159,9 +207,110 @@ def _draw_live_overlay(
     return overlay
 
 
-def run_pipeline(config: dict, benchmark: bool = False) -> None:
+# How often the progress reporter is called, in processed frames. Each call
+# ends in an atomic file write for the dashboard to poll, which is orders of
+# magnitude more expensive than a frame of bookkeeping -- so it happens a few
+# times a second, not thirty.
+_PROGRESS_EVERY_N_FRAMES = 10
+
+
+def _probe_total_frames(source) -> int:
+    """Frame count of a recorded source, or 0 when there isn't one.
+
+    Only used to size a progress bar. A live stream, an unreadable file, or
+    a container with no frame count all return 0, and the dashboard shows an
+    indeterminate bar for that rather than a percentage it cannot honour.
+    """
+    try:
+        probe = cv2.VideoCapture(str(source))
+        try:
+            return max(0, int(probe.get(cv2.CAP_PROP_FRAME_COUNT)))
+        finally:
+            probe.release()
+    except Exception:
+        return 0
+
+
+class VideoSourceUnavailable(RuntimeError):
+    """The configured video source could not be opened.
+
+    Raised instead of calling sys.exit() so an embedding caller -- the
+    multi-camera manager, which must mark one camera failed and move on to
+    the next -- can catch it. main() still turns it into exit status 1, so
+    the CLI behaves exactly as it did.
+    """
+
+
+def run_pipeline(
+    config: dict,
+    benchmark: bool = False,
+    camera_meta: dict | None = None,
+    session_context: dict | None = None,
+    progress=None,
+    source_override: str | None = None,
+    max_duration_seconds: float | None = None,
+    models=None,
+) -> dict:
+    """Run the ALPR pipeline over one video source, start to finish.
+
+    The first two arguments are the original single-gate interface and are
+    unchanged. The rest are optional and exist so the multi-camera manager
+    can run this same pipeline once per camera without forking it:
+
+      camera_meta      The capturing camera's camera_id / camera_name /
+                       latitude / longitude. None (default) reads this
+                       device's own `camera:` block from config.yaml, which
+                       is exactly what the single-gate path has always done.
+      session_context  processing_session / trajectory_order / video_source
+                       stamped onto every event this run stores.
+      progress         Optional reporter (see cameras.manager.ProgressReporter)
+                       notified of frames and detections as they happen.
+                       Never affects pipeline behaviour; exceptions from it
+                       are swallowed.
+      source_override  Process this source instead of config["video"]["source"].
+                       Applied to a COPY of the video config, so the caller's
+                       config dict is not mutated between cameras.
+      models           A preloaded cameras.pipeline_models.PipelineModels to
+                       use instead of building the detectors and OCR engine
+                       here. None (the default) builds them, exactly as the
+                       single-gate CLI has always done.
+
+                       The multi-camera manager passes one so a four-camera
+                       queue deserialises its TensorRT plans ONCE rather than
+                       four times -- measured at ~2m40s per load on a Jetson
+                       Orin, so this is the difference between a ten-minute
+                       and a three-minute sweep. A bundle that was passed in
+                       is NOT released here: the next camera still needs it,
+                       and whoever built it closes it.
+      max_duration_seconds
+                       Stop after roughly this long. None (the default) means
+                       run until the source is exhausted -- correct for a
+                       recorded file, which ends on its own.
+
+                       A LIVE source never ends, so a sequential queue over
+                       RTSP cameras would block forever on the first one and
+                       never reach the second. The manager therefore gives
+                       every live camera a bounded dwell time, and this is
+                       how that bound reaches the loop. Enforced
+                       cooperatively at the top of the frame loop, so the
+                       final OCR-fusion flush still runs and plates that were
+                       mid-vote are stored rather than dropped.
+
+    Returns:
+        A summary dict (frames, stored events, elapsed, latency averages).
+        The CLI ignores it; the manager records it on the camera's progress.
+
+    Raises:
+        VideoSourceUnavailable: The source could not be opened.
+    """
     log = _init_logger(config)
     log.info("ALPR University Gate pipeline starting...")
+
+    if source_override:
+        # Copy rather than mutate: the manager reuses one config dict across
+        # four cameras, and rewriting video.source in place would leak each
+        # camera's source into the next one's run.
+        config = {**config, "video": {**config.get("video", {}), "source": source_override}}
 
     _ensure_system_site_packages()
 
@@ -190,16 +339,41 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
     db_cfg  = config["database"]
 
     # ── component init ────────────────────────────────────────────────────
+    #
+    # Split in two on purpose:
+    #
+    #   SHARED   the detectors, OCR engine and upscaler are stateless with
+    #            respect to the video, so a multi-camera session loads them
+    #            once and passes them in. `owns_models` records whether this
+    #            run built them and must therefore release them.
+    #
+    #   PER RUN  everything below carries state between frames -- track ids,
+    #            fusion votes, duplicate windows, motion history -- and is
+    #            rebuilt for every camera so no camera can contaminate the
+    #            next. The duplicate filter especially: sharing one across
+    #            cameras would suppress the second, third and fourth sighting
+    #            of a plate as duplicates, which is exactly what a trajectory
+    #            is made of.
+    owns_models = models is None
+    if owns_models:
+        vehicle_detector = VehicleDetector.from_config(config)
+        plate_detector   = PlateDetector.from_config(config)
+        sr_enhancer      = SuperResolutionEnhancer(
+            enh_cfg["realesrgan_model_path"], int(enh_cfg["sr_threshold_px"])
+        )
+        ocr_engine       = create_ocr_engine(str(ocr_cfg.get("backend", "paddleocr")), config)
+    else:
+        vehicle_detector = models.vehicle_detector
+        plate_detector   = models.plate_detector
+        sr_enhancer      = models.sr_enhancer
+        ocr_engine       = models.ocr_engine
+
     frame_capture      = FrameCapture.from_config(config)
-    vehicle_detector   = VehicleDetector.from_config(config)
     vehicle_tracker    = VehicleTracker(
         int(config["tracking"]["lost_track_timeout"]),
         float(config["tracking"].get("minimum_matching_threshold", 0.5)),
     )
-    plate_detector     = PlateDetector.from_config(config)
     plate_preprocessor = PlatePreprocessor.from_config(config)
-    sr_enhancer        = SuperResolutionEnhancer(enh_cfg["realesrgan_model_path"], int(enh_cfg["sr_threshold_px"]))
-    ocr_engine         = create_ocr_engine(str(ocr_cfg.get("backend", "paddleocr")), config)
     plate_validator    = PlateValidator()
     ocr_fusion         = OCRFusion(
         window_size=int(fus_cfg.get("window_size", 5)),
@@ -213,9 +387,12 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
 
     database.init_db(db_cfg["path"])
     image_save_path = db_cfg.get("image_save_path", "data/plate_crops/")
-    # Static for the life of the process -- one Jetson watches one gate, so
-    # this is read once here rather than per event.
-    camera_meta = get_camera_metadata(config)
+    vehicle_image_save_path = db_cfg.get("vehicle_image_save_path", "data/vehicle_crops/")
+    # Static for the life of this run. For the single-gate path that means
+    # one Jetson watching one gate (read once from config.yaml); for a
+    # multi-camera run the manager supplies the current camera's block.
+    if camera_meta is None:
+        camera_meta = get_camera_metadata(config)
     log.info(
         "Camera: %s (%s) at lat=%s lon=%s",
         camera_meta["camera_id"], camera_meta["camera_name"],
@@ -253,9 +430,25 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
     _heavy_rr_offset = 0
 
     api_cfg = config.get("api", {})
+    # Where this run publishes its annotated frames.
+    #
+    # Single-gate: one shared file, which the API's /stream endpoint serves.
+    #
+    # Multi-camera: one file PER CAMERA, so the dashboard can show all four
+    # feeds side by side. Cameras run one at a time, so a single shared file
+    # would only ever show whichever camera is currently active and the other
+    # three panels would show that same camera's frames mislabelled as their
+    # own. Keyed by camera_id, each panel keeps the last frame that camera
+    # actually produced.
+    if session_context and camera_meta.get("camera_id"):
+        live_frames_dir = Path(api_cfg.get("live_frames_dir", "data/live_frames"))
+        live_frame_target = str(live_frames_dir / f"{camera_meta['camera_id']}.jpg")
+    else:
+        live_frame_target = api_cfg.get("live_frame_path", "data/live_frame.jpg")
+
     live_frame_publisher = (
         LiveFramePublisher(
-            path=api_cfg.get("live_frame_path", "data/live_frame.jpg"),
+            path=live_frame_target,
             max_fps=float(api_cfg.get("live_frame_fps", 8.0)),
         )
         if api_cfg.get("live_stream_enabled", True) else None
@@ -299,13 +492,65 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
         frame_capture.open()
     except RuntimeError as exc:
         log.critical("Cannot open video source: %s", exc)
-        sys.exit(1)
+        raise VideoSourceUnavailable(str(exc)) from exc
 
     log.info("Pipeline running. Press Ctrl+C to stop.")
+
+    # Progress bookkeeping. Cheap by construction: two integer increments per
+    # frame, and the reporter is only *called* every _PROGRESS_EVERY_N_FRAMES
+    # -- a status write is a file rename, far too expensive to do at 30fps.
+    frames_processed = 0
+    events_stored = 0
+    run_started = time.perf_counter()
+    _last_progress_frame = 0
+    # Separate clock for max_duration_seconds, started at the FIRST decoded
+    # frame rather than here. The detectors and the OCR engine are lazily
+    # loaded on their first call, and deserialising two TensorRT plans plus
+    # warmup costs tens of seconds on a Jetson -- all of it inside the first
+    # iteration of the loop below. Measuring the dwell time from loop entry
+    # therefore spends most of a short budget on warmup and samples almost no
+    # video (measured: a 20s budget yielded ONE processed frame). Timing from
+    # the first frame makes "sample this camera for N seconds" mean N seconds
+    # of actual streaming, which is what the setting promises.
+    sampling_started: float | None = None
+
+    if progress is not None:
+        try:
+            progress.on_start(total_frames=_probe_total_frames(config["video"]["source"]))
+        except Exception as exc:
+            log.debug("Progress reporter raised on_start: %s", exc)
 
     # ── main loop ─────────────────────────────────────────────────────────
     try:
         while True:
+            if sampling_started is None and frames_processed > 0:
+                # Frame 1 is complete, so every lazily-loaded model is now
+                # warm. Start the sampling clock here, at the top of the
+                # second iteration, rather than inside frame 1 -- placing it
+                # there would put the warmup inside the window it is meant to
+                # exclude. Done here rather than at the end of the loop body
+                # because several paths `continue` before reaching the end.
+                sampling_started = time.perf_counter()
+
+            if (
+                max_duration_seconds is not None
+                and sampling_started is not None
+                and time.perf_counter() - sampling_started >= max_duration_seconds
+            ):
+                log.info(
+                    "Reached the %.0fs limit for this source — ending this "
+                    "camera's run.", max_duration_seconds,
+                )
+                break
+
+            if progress is not None and progress.should_stop():
+                # Cooperative cancellation: the dashboard's STOP button sets
+                # this. Breaking here (rather than killing the thread) means
+                # the finally-block below still runs, so buffered plates are
+                # flushed and stored instead of silently lost.
+                log.info("Stop requested — ending this camera's run early.")
+                break
+
             success, frame = frame_capture.read_frame()
             if not success or frame is None:
                 if frame_capture.is_live:
@@ -318,6 +563,29 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
                 break
 
             frame_start = time.perf_counter()
+            frames_processed += 1
+
+            if (
+                progress is not None
+                and frames_processed - _last_progress_frame >= _PROGRESS_EVERY_N_FRAMES
+            ):
+                _last_progress_frame = frames_processed
+                elapsed = time.perf_counter() - run_started
+                try:
+                    progress.on_frame(
+                        frames_processed=frames_processed,
+                        fps=frames_processed / elapsed if elapsed > 0 else 0.0,
+                        avg_ocr_ms=(
+                            sum(ocr_inference_times) / len(ocr_inference_times)
+                            if ocr_inference_times else 0.0
+                        ),
+                        avg_detection_ms=(
+                            sum(plate_detection_times) / len(plate_detection_times)
+                            if plate_detection_times else 0.0
+                        ),
+                    )
+                except Exception as exc:
+                    log.debug("Progress reporter raised on_frame: %s", exc)
 
             _now_monotonic = time.monotonic()
             if _now_monotonic - _last_dup_cleanup >= _DUP_CLEANUP_INTERVAL_S:
@@ -504,8 +772,19 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
                                 camera_meta=camera_meta,
                                 database=database,
                                 log=log,
+                                # color_crop is this track's saved whole-vehicle
+                                # image (see track_plate_crops above) -- what the
+                                # map popup shows, since a plate crop alone is
+                                # not recognisable as a vehicle.
+                                vehicle_crop=color_crop,
+                                confidence=fused_conf,
+                                ocr_text=fused_plate,
+                                session_context=session_context,
+                                vehicle_image_save_path=vehicle_image_save_path,
+                                progress=progress,
                             )
                             if stored:
+                                events_stored += 1
                                 # Enforce strict once-per-track emission.
                                 # After this point, no further flush/store attempts for this tid.
                                 stored_tracks.add(tid)
@@ -548,7 +827,7 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
             # Use the saved plate crop for storage (not the full vehicle image).
             plate_image_to_save = best_crop
             centroid  = track_centroids.get(tid, (0.0, 0.0))
-            _store_event(
+            if _store_event(
                 plate_number=plate_val,
                 series_type=s_type,
                 plate_crop=plate_image_to_save,
@@ -562,9 +841,41 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
                 camera_meta=camera_meta,
                 database=database,
                 log=log,
-            )
+                vehicle_crop=track_plate_crops.get(f"{tid}_vehicle"),
+                confidence=confidence,
+                ocr_text=plate_number,
+                session_context=session_context,
+                vehicle_image_save_path=vehicle_image_save_path,
+                progress=progress,
+            ):
+                events_stored += 1
 
         frame_capture.release()
+
+        # Release the OCR backend's GPU resources. Matters because the
+        # multi-camera manager runs one pipeline per camera inside a single
+        # process: without this, a four-camera queue would build four
+        # TensorRT engines and free none of them until the process exited.
+        # Duck-typed and swallowed -- close() is optional on the OCREngine
+        # interface, and a cleanup failure must never mask a real error or
+        # stop the next camera from starting.
+        # Release the GPU models only if this run built them. When the
+        # multi-camera manager supplied them, the next camera in the queue
+        # still needs them and the manager closes them once the queue ends.
+        if owns_models:
+            for name, component in (
+                ("OCR engine", ocr_engine),
+                ("vehicle detector", vehicle_detector),
+                ("plate detector", plate_detector),
+            ):
+                try:
+                    close = getattr(component, "close", None)
+                    if callable(close):
+                        close()
+                        log.info("%s released.", name.capitalize())
+                except Exception as exc:
+                    log.warning("Failed to release the %s: %s", name, exc)
+
         if benchmark_recorder is not None:
             summary = benchmark_recorder.summary()
             log.info(
@@ -624,6 +935,19 @@ def run_pipeline(config: dict, benchmark: bool = False) -> None:
         )
         log.info("Pipeline shut down cleanly.")
 
+    # Returned (not just logged) so the multi-camera manager can record what
+    # each camera actually achieved on that camera's progress entry. Built
+    # after the finally-block so it includes plates stored by the final
+    # fusion flush.
+    return {
+        "frames_processed": frames_processed,
+        "events_stored": events_stored,
+        "elapsed_seconds": time.perf_counter() - run_started,
+        "avg_ocr_ms": inf_avg,
+        "avg_plate_detection_ms": plate_avg,
+        "camera_id": camera_meta.get("camera_id"),
+    }
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ALPR University Gate — Main Pipeline")
@@ -636,7 +960,13 @@ def main() -> None:
     if args.source:
         config["video"]["source"] = args.source
 
-    run_pipeline(config, benchmark=args.benchmark)
+    try:
+        run_pipeline(config, benchmark=args.benchmark)
+    except VideoSourceUnavailable:
+        # Already logged as critical by run_pipeline. Exit status 1 here
+        # keeps the CLI contract the same as when this was a sys.exit(1)
+        # inside the pipeline itself.
+        sys.exit(1)
 
 
 if __name__ == "__main__":

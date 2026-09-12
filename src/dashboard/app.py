@@ -146,6 +146,40 @@ def prepare_dataframe(events: list[dict]) -> pd.DataFrame:
     return df
 
 
+def _html_table(df) -> None:
+    """Render a DataFrame as plain HTML instead of st.dataframe.
+
+    st.dataframe serialises through Apache Arrow, and this deployment pairs
+    pyarrow 25 with numpy 1.26 -- an ABI mismatch (pyarrow 25 is built
+    against numpy 2.x) whose conversion SEGFAULTS under some conditions.
+    That is not a catchable exception: it kills the Streamlit server, so the
+    user sees "Connection error" rather than an error message.
+
+    numpy cannot simply be upgraded here -- requirements.txt pins 1.26.4 and
+    torch, ultralytics and OpenCV are built against it -- so the tables avoid
+    Arrow instead. Same approach as the multi-camera dashboard's _table().
+    """
+    from html import escape
+
+    if df is None or len(df) == 0:
+        st.caption("Nothing to show.")
+        return
+
+    head = "".join(f"<th>{escape(str(c))}</th>" for c in df.columns)
+    body = "".join(
+        "<tr>" + "".join(
+            f"<td>{escape('--' if pd.isna(v) else str(v))}</td>" for v in row
+        ) + "</tr>"
+        for row in df.itertuples(index=False, name=None)
+    )
+    st.markdown(
+        '<div style="overflow-x:auto"><table style="border-collapse:collapse;'
+        'width:100%;font-size:.85rem">'
+        f'<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>',
+        unsafe_allow_html=True,
+    )
+
+
 # ── Dashboard Main ────────────────────────────────────────────────────
 def main():
     # Initialize
@@ -162,7 +196,9 @@ def main():
         st.header("⚙️ Controls")
 
         # Refresh settings
-        auto_refresh = st.checkbox("Auto-refresh (5 sec)", value=True)
+        auto_refresh = st.checkbox(
+            "Auto-refresh (5 sec)", value=True, key="auto_refresh"
+        )
         refresh_interval = st.slider("Refresh interval (sec)", 2, 30, 5)
 
         st.divider()
@@ -228,7 +264,7 @@ def main():
                     with col_img:
                         img_path = event.get("image_path", "")
                         if img_path and Path(img_path).exists():
-                            st.image(img_path, width=120, use_container_width=False)
+                            st.image(img_path, width=120)
                         else:
                             st.markdown("📷 *No image*")
 
@@ -328,7 +364,7 @@ def main():
                 display_cols = ["plate_number", "direction", "vehicle_type", "plate_color",
                                 "camera_id", "camera_name", "latitude", "longitude", "timestamp"]
                 df_display = df_results[[col for col in display_cols if col in df_results.columns]]
-                st.dataframe(df_display, use_container_width=True)
+                _html_table(df_display)
             else:
                 st.warning(f"No events found for plate `{search_plate}`")
         else:
@@ -453,7 +489,7 @@ def main():
                                 "latitude", "longitude", "timestamp"]
                 present_cols = [col for col in display_cols if col in df_history.columns]
                 if present_cols:
-                    st.dataframe(df_history[present_cols], use_container_width=True)
+                    _html_table(df_history[present_cols])
             else:
                 st.warning(f"No history found for {plate_input}")
         else:

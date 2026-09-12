@@ -52,6 +52,29 @@ _ADDED_COLUMNS = (
     ("camera_name", "VARCHAR"),
     ("latitude",    "DOUBLE PRECISION"),
     ("longitude",   "DOUBLE PRECISION"),
+    # Multi-camera trajectory reconstruction. Appended to the same tuple
+    # rather than given their own migration pass so a database at ANY prior
+    # version -- the original eight columns, or the four-camera-column one --
+    # converges on the current schema in a single init_db(). Order matters
+    # only cosmetically (it is the order columns get appended in); the
+    # inspector below adds whichever subset is actually missing.
+    ("vehicle_image_path", "VARCHAR"),
+    ("trajectory_order",   "INTEGER"),
+    ("processing_session", "VARCHAR"),
+    ("video_source",       "VARCHAR"),
+    ("confidence",         "DOUBLE PRECISION"),
+    ("ocr_text",           "VARCHAR"),
+)
+
+
+# Indexes that create_all() builds for a fresh database and that an altered
+# one therefore needs created alongside the columns they cover. Kept as data
+# next to _ADDED_COLUMNS so adding a column + its index is one edit in one
+# place. IF NOT EXISTS works on both backends, and _apply_additive_ddl()
+# tolerates the concurrent-startup race on top of that.
+_ADDED_INDEXES = (
+    ("idx_camera_id",          "vehicle_events (camera_id)"),
+    ("idx_processing_session", "vehicle_events (processing_session)"),
 )
 
 
@@ -122,14 +145,13 @@ def _migrate_schema(engine) -> None:
                 f"added vehicle_events.{name}",
             )
 
-    # create_all() builds this index for a fresh database; an altered one
-    # needs it created alongside the column it covers.
-    with engine.begin() as conn:
-        _apply_additive_ddl(
-            conn,
-            "CREATE INDEX IF NOT EXISTS idx_camera_id ON vehicle_events (camera_id)",
-            "created index idx_camera_id",
-        )
+    for index_name, target in _ADDED_INDEXES:
+        with engine.begin() as conn:
+            _apply_additive_ddl(
+                conn,
+                f"CREATE INDEX IF NOT EXISTS {index_name} ON {target}",
+                f"created index {index_name}",
+            )
 
 
 def init_db(db_url: str = None) -> None:
@@ -246,6 +268,23 @@ def _as_optional_float(value) -> Optional[float]:
         return None
 
 
+def _as_optional_int(value) -> Optional[int]:
+    """Coerce a queue position to int, or None if it isn't a usable number.
+
+    Same tolerance as _as_optional_float above, and for the same reason: a
+    trajectory_order that arrives as "2" from a YAML edit or as None from
+    the single-gate pipeline must not cost the gate an event. A bad value
+    degrades to None, which the trajectory engine reads as "not part of a
+    multi-camera run" and falls back to timestamp ordering for.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def insert_event(session: Session, event_data: dict) -> Optional[VehicleEvent]:
     """Insert a vehicle event record with one retry on failure.
 
@@ -276,6 +315,15 @@ def insert_event(session: Session, event_data: dict) -> Optional[VehicleEvent]:
                 camera_name=event_data.get("camera_name"),
                 latitude=_as_optional_float(event_data.get("latitude")),
                 longitude=_as_optional_float(event_data.get("longitude")),
+                # Multi-camera fields. All optional for the same reason the
+                # camera block is: the single-gate pipeline never sets them,
+                # and must keep inserting successfully without them.
+                vehicle_image_path=event_data.get("vehicle_image_path"),
+                trajectory_order=_as_optional_int(event_data.get("trajectory_order")),
+                processing_session=event_data.get("processing_session"),
+                video_source=event_data.get("video_source"),
+                confidence=_as_optional_float(event_data.get("confidence")),
+                ocr_text=event_data.get("ocr_text"),
             )
             session.add(event)
             session.flush()
@@ -405,3 +453,219 @@ def save_plate_image(
     except Exception as exc:
         _logger.warning("Failed to save plate image: %s", exc)
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Multi-camera trajectory queries
+# ---------------------------------------------------------------------------
+#
+# The trajectory engine needs three shapes of read that the single-gate
+# queries above do not provide: one plate's detections across every camera,
+# the set of plates that were seen at more than one camera, and per-session
+# aggregates. They live here rather than in the engine so that all SQL stays
+# in the database layer -- the engine works on dicts and never imports
+# SQLAlchemy, which is what makes it unit-testable without a database.
+
+
+def get_plate_detections(
+    session: Session,
+    plate_number: str,
+    processing_session: Optional[str] = None,
+) -> list[dict]:
+    """Return every detection of *plate_number*, oldest first.
+
+    Ascending timestamp (the opposite of search_events(), which is
+    newest-first for a log view) because a trajectory is read forwards: the
+    first row is where the vehicle started.
+
+    Args:
+        session:            Active SQLAlchemy session.
+        plate_number:       Exact plate to look up; matched case-insensitively
+                            since plates are stored upper-cased but a search
+                            box is not.
+        processing_session: Restrict to one run of the camera queue. None
+                            searches every run -- correct for live cameras,
+                            where there is no run boundary; the dashboard
+                            passes a session id when the operator wants a
+                            single demo run rather than the union of all of
+                            them.
+
+    Returns:
+        List of event dicts, ascending by (trajectory_order, timestamp).
+    """
+    query = session.query(VehicleEvent).filter(
+        VehicleEvent.plate_number == plate_number.strip().upper()
+    )
+    if processing_session:
+        query = query.filter(VehicleEvent.processing_session == processing_session)
+
+    # Order in SQL by timestamp only. The composite (trajectory_order,
+    # timestamp) ordering the engine actually applies is decided in Python
+    # -- NULL ordering differs between SQLite and PostgreSQL, and the engine
+    # has to re-sort anyway once it knows whether every point carries an
+    # order. Sorting here is just to give a stable, useful default.
+    events = query.order_by(VehicleEvent.timestamp.asc()).all()
+    return [event.to_dict() for event in events]
+
+
+def get_multi_camera_plates(
+    session: Session,
+    min_cameras: int = 2,
+    processing_session: Optional[str] = None,
+    limit: int = 200,
+) -> list[dict]:
+    """Return plates seen at *min_cameras* or more distinct cameras.
+
+    This is the "which vehicles actually have a trajectory worth drawing?"
+    query -- a plate seen at exactly one camera is a sighting, not a path.
+    The dashboard uses it to offer real suggestions instead of making the
+    operator guess a plate number.
+
+    Args:
+        min_cameras:        Minimum distinct cameras a plate must appear at.
+        processing_session: Restrict to one run of the camera queue.
+        limit:              Cap on returned plates, most-travelled first.
+
+    Returns:
+        List of {plate_number, camera_count, detection_count, first_seen,
+        last_seen}, ordered by camera_count then detection_count descending.
+    """
+    from sqlalchemy import func
+
+    query = session.query(
+        VehicleEvent.plate_number,
+        func.count(func.distinct(VehicleEvent.camera_id)).label("camera_count"),
+        func.count(VehicleEvent.id).label("detection_count"),
+        func.min(VehicleEvent.timestamp).label("first_seen"),
+        func.max(VehicleEvent.timestamp).label("last_seen"),
+    )
+    if processing_session:
+        query = query.filter(VehicleEvent.processing_session == processing_session)
+
+    rows = (
+        query.group_by(VehicleEvent.plate_number)
+        .having(func.count(func.distinct(VehicleEvent.camera_id)) >= min_cameras)
+        .order_by(
+            func.count(func.distinct(VehicleEvent.camera_id)).desc(),
+            func.count(VehicleEvent.id).desc(),
+        )
+        .limit(limit)
+        .all()
+    )
+
+    return [
+        {
+            "plate_number": row.plate_number,
+            "camera_count": int(row.camera_count or 0),
+            "detection_count": int(row.detection_count or 0),
+            "first_seen": row.first_seen,
+            "last_seen": row.last_seen,
+        }
+        for row in rows
+    ]
+
+
+def get_session_stats(
+    session: Session,
+    processing_session: Optional[str] = None,
+) -> dict:
+    """Return aggregate counts for one processing session (or all events).
+
+    One grouped query rather than a scan-and-count in Python: the dashboard
+    polls this every couple of seconds while a run is in progress, and the
+    events table grows without bound across runs.
+    """
+    from sqlalchemy import func
+
+    query = session.query(
+        VehicleEvent.camera_id,
+        VehicleEvent.camera_name,
+        func.count(VehicleEvent.id).label("detections"),
+        func.count(func.distinct(VehicleEvent.plate_number)).label("unique_plates"),
+        func.avg(VehicleEvent.confidence).label("avg_confidence"),
+    )
+    if processing_session:
+        query = query.filter(VehicleEvent.processing_session == processing_session)
+
+    rows = query.group_by(VehicleEvent.camera_id, VehicleEvent.camera_name).all()
+
+    per_camera = [
+        {
+            "camera_id": row.camera_id,
+            "camera_name": row.camera_name,
+            "detections": int(row.detections or 0),
+            "unique_plates": int(row.unique_plates or 0),
+            "avg_confidence": float(row.avg_confidence) if row.avg_confidence is not None else None,
+        }
+        for row in rows
+    ]
+
+    # Total unique plates is deliberately a second query, not a sum of the
+    # per-camera counts: one vehicle seen at all four cameras contributes 1
+    # to the total but 4 to the sum, and the total is the number a dashboard
+    # labelled "unique plates" has to show.
+    total_query = session.query(
+        func.count(VehicleEvent.id),
+        func.count(func.distinct(VehicleEvent.plate_number)),
+    )
+    if processing_session:
+        total_query = total_query.filter(
+            VehicleEvent.processing_session == processing_session
+        )
+    total_detections, total_unique = total_query.one()
+
+    return {
+        "processing_session": processing_session,
+        "total_detections": int(total_detections or 0),
+        "unique_plates": int(total_unique or 0),
+        "cameras_reporting": len(per_camera),
+        "per_camera": sorted(per_camera, key=lambda item: item["camera_id"] or ""),
+    }
+
+
+def get_processing_sessions(session: Session, limit: int = 20) -> list[dict]:
+    """Return recent processing sessions, newest first.
+
+    Lets the dashboard offer "which run?" as a picker rather than requiring
+    the operator to remember a generated session id.
+    """
+    from sqlalchemy import func
+
+    rows = (
+        session.query(
+            VehicleEvent.processing_session,
+            func.count(VehicleEvent.id).label("detections"),
+            func.min(VehicleEvent.timestamp).label("started"),
+            func.max(VehicleEvent.timestamp).label("ended"),
+        )
+        .filter(VehicleEvent.processing_session.isnot(None))
+        .group_by(VehicleEvent.processing_session)
+        .order_by(func.max(VehicleEvent.timestamp).desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "processing_session": row.processing_session,
+            "detections": int(row.detections or 0),
+            "started": row.started,
+            "ended": row.ended,
+        }
+        for row in rows
+    ]
+
+
+def save_vehicle_image(
+    vehicle_crop: np.ndarray,
+    plate_number: str,
+    save_dir: str = "data/vehicle_crops/",
+) -> str:
+    """Save a whole-vehicle crop and return its relative path.
+
+    Separate from save_plate_image() and writing to a different directory on
+    purpose: the API mounts the plate-crop directory as a static route, and
+    the two kinds of image have different lifetimes and sizes. Same
+    failure posture though -- an unwritable image costs a thumbnail, never
+    the event itself, so this returns "" instead of raising.
+    """
+    return save_plate_image(vehicle_crop, plate_number, save_dir)

@@ -16,6 +16,7 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,12 +35,50 @@ _logger = get_logger("api.server")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _load_app_config() -> dict:
+    try:
+        return load_config(str(_REPO_ROOT / "config" / "config.yaml"))
+    except Exception as exc:
+        _logger.warning("Could not load config.yaml (%s); using defaults", exc)
+        return {}
+
+
+# Loaded at import time: lifespan() needs it to choose the database, and the
+# module-level paths below need it too.
+_config = _load_app_config()
+
+
+def _resolve_db_url() -> str | None:
+    """Pick the database this API should serve, matching the rest of the system.
+
+    Order of precedence:
+      1. $DB_URL   -- the explicit override, and the only way to point at
+                      PostgreSQL. Passed through untouched by returning None,
+                      which lets init_db() read it itself.
+      2. config.yaml's `database.path` (which honours $ALPR_DB_PATH).
+      3. init_db()'s own default.
+
+    Step 2 is the fix for a real inconsistency: this used to call init_db()
+    with no argument at all, so the API always opened sqlite:///data/alpr.db
+    while the pipeline and both dashboards opened whatever `database.path`
+    named. With the default config the two happen to coincide, which is why
+    it went unnoticed -- but point the pipeline anywhere else and the API
+    silently serves a different database, reporting "no detections" for
+    plates that were definitely recorded.
+    """
+    if os.getenv("DB_URL"):
+        return None
+    return (_config.get("database") or {}).get("path") or None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize resources on startup, clean up on shutdown."""
     try:
-        database.init_db()
-        _logger.info("Database initialized at startup")
+        database.init_db(_resolve_db_url())
+        _logger.info(
+            "Database initialized at startup: %s", database.get_engine().url
+        )
     except Exception as exc:
         _logger.error("Failed to initialize database: %s", exc)
     yield
@@ -54,15 +93,6 @@ app = FastAPI(
 )
 
 
-def _load_app_config() -> dict:
-    try:
-        return load_config(str(_REPO_ROOT / "config" / "config.yaml"))
-    except Exception as exc:
-        _logger.warning("Could not load config.yaml (%s); using defaults", exc)
-        return {}
-
-
-_config = _load_app_config()
 _live_frame_path = _REPO_ROOT / _config.get("api", {}).get("live_frame_path", "data/live_frame.jpg")
 _plate_crops_dir = _REPO_ROOT / _config.get("database", {}).get("image_save_path", "data/plate_crops/")
 _plate_crops_dir.mkdir(parents=True, exist_ok=True)
@@ -369,6 +399,14 @@ async def get_stream():
         frame_generator(),
         media_type=f"multipart/x-mixed-replace; boundary={boundary}",
     )
+
+
+# Multi-camera trajectory routes, all under /trajectory-api. Registered
+# before the "/" static mount below, since Starlette matches routes in
+# registration order and that mount is the catch-all.
+from src.api.trajectory_routes import router as trajectory_router  # noqa: E402
+
+app.include_router(trajectory_router)
 
 
 # Serves the dashboard's HTML/CSS/JS. Mounted last and at the root path so

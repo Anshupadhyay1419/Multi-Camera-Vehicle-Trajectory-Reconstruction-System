@@ -50,6 +50,12 @@ class ConfigError(Exception):
 # values need to move out of the tracked config.yaml.
 _ENV_OVERRIDES = {
     ("video", "source"): "ALPR_VIDEO_SOURCE",
+    # Point the whole system at a different database without editing the
+    # tracked config.yaml -- a copy of production for a demo, a scratch file
+    # for a test run, or a PostgreSQL URL in production. Everything that
+    # reads config (pipeline, API, both dashboards) honours it, so they all
+    # stay pointed at the same place.
+    ("database", "path"): "ALPR_DB_PATH",
 }
 
 

@@ -211,6 +211,13 @@ motion_filter:
 database:
   path: "data/alpr.db"
   image_save_path: "data/plate_crops/"
+  # Whole-vehicle crops, kept apart from the plate crops above: the two have
+  # different sizes and lifetimes, and the API mounts only the plate-crop
+  # directory as a static route. Written only by the multi-camera pipeline
+  # (the single-gate path stores no vehicle image), and shown in map popups
+  # and on the trajectory search page -- a plate crop alone is not
+  # recognisable as a vehicle.
+  vehicle_image_save_path: "data/vehicle_crops/"
 
 api:
   host: "0.0.0.0"
@@ -220,11 +227,27 @@ api:
   # reads and serves whatever's currently on disk.
   live_stream_enabled: true
   live_frame_path: "data/live_frame.jpg"
+  # Multi-camera runs publish ONE annotated frame per camera in here
+  # (<camera_id>.jpg), which is what the dashboard's camera wall shows.
+  # Cameras run one at a time, so a single shared file would leave three of
+  # the four panels showing the active camera's video under someone else's
+  # label.
+  live_frames_dir: "data/live_frames"
   live_frame_fps: 8.0
 
 dashboard:
   enabled: true
   refresh_interval_seconds: 3
+
+# ── Multi-camera trajectory reconstruction ──────────────────────────────────
+# The camera network itself (ids, names, coordinates, video/RTSP sources) is
+# declared in a file of its own, config/camera_config.yaml, because it is
+# per-deployment data that grows with the number of sites -- while this file
+# is per-device tuning. The `camera:` block at the top of THIS file still
+# describes the single-gate pipeline and is unchanged; it is what
+# scripts/run_pipeline.py uses when run on its own.
+multi_camera:
+  config_path: "config/camera_config.yaml"
 
 logging:
   log_file: "logs/alpr.log"
