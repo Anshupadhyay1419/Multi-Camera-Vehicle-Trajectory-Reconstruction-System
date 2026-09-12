@@ -762,4 +762,4 @@ This project is for educational and research purposes.
 
 ##  Author
 
-Developed as part of a  project for automated gate access monitoring using computer vision and deep learning.
+Ansh Upadhyay
