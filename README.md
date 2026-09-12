@@ -709,7 +709,7 @@ pytest tests/ --cov=src --cov-report=term-missing
 | Plate detection | YOLOv8m (custom trained) | ultralytics 8.2.0 |
 | Tracking | ByteTrack | supervision 0.20.0 |
 | Super resolution | Real-ESRGAN ×4 | realesrgan 0.3.0 |
-| OCR (default) | PaddleOCR | paddleocr 2.9.1 |
+| OCR (default) | ParSeq Model|
 | OCR (optional) | TrOCR | transformers 4.40.0 |
 | Database | SQLite + SQLAlchemy | sqlalchemy 2.0.30 |
 | REST API | FastAPI | fastapi 0.111.0 |
