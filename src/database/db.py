@@ -467,6 +467,25 @@ def save_plate_image(
 # SQLAlchemy, which is what makes it unit-testable without a database.
 
 
+def _scope_to_sessions(query, processing_session: Optional[str]):
+    """Restrict a trajectory query to multi-camera session events.
+
+    With a session id: that one run. Without one: EVERY run -- but only
+    events that belong to some run.
+
+    The second half is the point. "All sessions" used to mean "no filter at
+    all", which swept in every event the single-gate pipeline had ever
+    recorded (no session, and often no camera). Those rows are not part of
+    the camera network, cannot be placed on a trajectory, and made the
+    multi-camera dashboard show detections and a "Main Gate" camera even
+    after every session had been deleted. They remain in the database and in
+    the original single-gate dashboard; they just are not multi-camera data.
+    """
+    if processing_session:
+        return query.filter(VehicleEvent.processing_session == processing_session)
+    return query.filter(VehicleEvent.processing_session.isnot(None))
+
+
 def get_plate_detections(
     session: Session,
     plate_number: str,
@@ -484,11 +503,9 @@ def get_plate_detections(
                             since plates are stored upper-cased but a search
                             box is not.
         processing_session: Restrict to one run of the camera queue. None
-                            searches every run -- correct for live cameras,
-                            where there is no run boundary; the dashboard
-                            passes a session id when the operator wants a
-                            single demo run rather than the union of all of
-                            them.
+                            searches every run (events recorded outside any
+                            run -- the single-gate pipeline -- are excluded;
+                            see _scope_to_sessions).
 
     Returns:
         List of event dicts, ascending by (trajectory_order, timestamp).
@@ -496,8 +513,7 @@ def get_plate_detections(
     query = session.query(VehicleEvent).filter(
         VehicleEvent.plate_number == plate_number.strip().upper()
     )
-    if processing_session:
-        query = query.filter(VehicleEvent.processing_session == processing_session)
+    query = _scope_to_sessions(query, processing_session)
 
     # Order in SQL by timestamp only. The composite (trajectory_order,
     # timestamp) ordering the engine actually applies is decided in Python
@@ -539,8 +555,7 @@ def get_multi_camera_plates(
         func.min(VehicleEvent.timestamp).label("first_seen"),
         func.max(VehicleEvent.timestamp).label("last_seen"),
     )
-    if processing_session:
-        query = query.filter(VehicleEvent.processing_session == processing_session)
+    query = _scope_to_sessions(query, processing_session)
 
     rows = (
         query.group_by(VehicleEvent.plate_number)
@@ -569,7 +584,7 @@ def get_session_stats(
     session: Session,
     processing_session: Optional[str] = None,
 ) -> dict:
-    """Return aggregate counts for one processing session (or all events).
+    """Return aggregate counts for one processing session (or all sessions).
 
     One grouped query rather than a scan-and-count in Python: the dashboard
     polls this every couple of seconds while a run is in progress, and the
@@ -584,8 +599,7 @@ def get_session_stats(
         func.count(func.distinct(VehicleEvent.plate_number)).label("unique_plates"),
         func.avg(VehicleEvent.confidence).label("avg_confidence"),
     )
-    if processing_session:
-        query = query.filter(VehicleEvent.processing_session == processing_session)
+    query = _scope_to_sessions(query, processing_session)
 
     rows = query.group_by(VehicleEvent.camera_id, VehicleEvent.camera_name).all()
 
@@ -608,10 +622,7 @@ def get_session_stats(
         func.count(VehicleEvent.id),
         func.count(func.distinct(VehicleEvent.plate_number)),
     )
-    if processing_session:
-        total_query = total_query.filter(
-            VehicleEvent.processing_session == processing_session
-        )
+    total_query = _scope_to_sessions(total_query, processing_session)
     total_detections, total_unique = total_query.one()
 
     return {
@@ -653,6 +664,22 @@ def get_processing_sessions(session: Session, limit: int = 20) -> list[dict]:
         }
         for row in rows
     ]
+
+
+def count_events_without_session(session: Session) -> int:
+    """How many events were recorded outside any processing session.
+
+    These come from the single-gate pipeline (scripts/run_pipeline.py run on
+    its own) or predate multi-camera sessions. They are real data, which is
+    exactly why deleting sessions never removes them -- but the dashboard
+    needs the count to say so, or leftover totals look like a delete that
+    did not work.
+    """
+    return int(
+        session.query(VehicleEvent)
+        .filter(VehicleEvent.processing_session.is_(None))
+        .count()
+    )
 
 
 def delete_session(session, processing_session: str) -> dict:

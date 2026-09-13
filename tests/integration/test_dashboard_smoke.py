@@ -430,6 +430,79 @@ class TestSessionDeletion:
         assert self._events() == 0, "the session's events were not removed"
 
 
+class TestDeleteRefreshesThePage:
+    def test_the_status_panel_forgets_a_deleted_session(self, app, tmp_path, monkeypatch):
+        """Reported bug: after deleting every session the page still showed
+        the last run as complete with its detection counts."""
+        from src.cameras.manager import get_camera_manager, reset_camera_manager
+        from src.cameras.models import (
+            CameraProgress, CameraState, SessionState, SessionStatus,
+        )
+        from src.cameras.status_store import StatusStore
+        from src.utils.config import load_config
+
+        reset_camera_manager()
+        manager = get_camera_manager(load_config("config/config.yaml"),
+                                     "config/camera_config.yaml")
+        # Keep this test off the project's real status file.
+        monkeypatch.setattr(manager, "_status_store",
+                            StatusStore(str(tmp_path / "status.json")))
+        manager._status = SessionStatus(
+            session_id="SMOKE", state=SessionState.COMPLETED,
+            cameras=[CameraProgress(camera_id="CAM001", camera_name="India Gate",
+                                    order=1, state=CameraState.COMPLETED,
+                                    detections=8)],
+        )
+
+        at = app()
+        assert any("Queue:" in (p.text or "") for p in at.get("progress")) or at.metric
+        picker = next(
+            box for box in at.get("selectbox")
+            if box.options and box.options[0] == "—"
+            and any("SMOKE" in o for o in box.options)
+        )
+        picker.set_value(next(o for o in picker.options if "SMOKE" in o)).run()
+        next(b for b in at.button if b.label.startswith("Delete session")).click().run()
+        next(b for b in at.button if b.label == "Yes, delete").click().run()
+        at.run()
+        _assert_clean(at, "after deleting the session")
+
+        assert manager.get_status()["state"] == SessionState.IDLE.value
+        assert any("No processing session yet" in i.value for i in at.info), \
+            "the status panel is still describing the deleted run"
+        reset_camera_manager()
+
+    def test_leftover_non_session_events_are_explained(self, app, seeded_db):
+        """Events from the single-gate pipeline survive a session delete by
+        design; the page must say so instead of looking like a failed delete."""
+        with database.get_session() as session:
+            database.insert_event(session, {
+                "plate_number": "UP32AB1234", "vehicle_type": "Car",
+                "plate_color": "White", "series_type": "normal",
+                "direction": "IN", "image_path": "", "camera_name": "Main Gate",
+            })
+        at = app()
+        assert any("not counted here" in c.value for c in at.caption)
+
+    def test_statistics_exclude_events_that_belong_to_no_session(self, app, seeded_db):
+        """Reported bug: with every session deleted, Statistics still showed
+        19 detections and a "Main Gate" row from the single-gate pipeline."""
+        with database.get_session() as session:
+            database.delete_session(session, "SMOKE")
+            database.insert_event(session, {
+                "plate_number": "UP32AB1234", "vehicle_type": "Car",
+                "plate_color": "White", "series_type": "normal",
+                "direction": "IN", "image_path": "", "camera_name": "Main Gate",
+            })
+        at = app()
+        _assert_clean(at, "statistics with only non-session events")
+        metrics = {m.label: m.value for m in at.metric}
+        assert metrics["Vehicles detected"] == "0"
+        assert metrics["Unique plates"] == "0"
+        page = "\n".join(m.value for m in at.markdown)
+        assert "Main Gate" not in page, "a non-network camera is still listed"
+
+
 class TestSearch:
     def test_searching_a_plate_selects_it(self, app):
         at = app()

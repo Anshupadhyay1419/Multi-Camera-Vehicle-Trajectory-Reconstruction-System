@@ -850,6 +850,41 @@ class CameraManager:
         if self._status is not None:
             self._status_store.write(self._status.to_dict())
 
+    def forget_session(self, session_id: str) -> bool:
+        """Drop the live status of a session whose events have been deleted.
+
+        The status panel, the header and the camera wall all read the
+        manager's status (in memory, and the status file for other
+        processes). Deleting a session's events from the database does not
+        touch either, so without this the page went on describing a run that
+        no longer exists -- "4/4 complete, 88 detections" -- after its data
+        was gone.
+
+        Only forgets the status if it describes THIS session: deleting an
+        older run must leave the most recent run's status alone. Refuses
+        while a session is running, since that status is still live.
+
+        Returns True if anything was cleared.
+        """
+        if self.is_running():
+            return False
+
+        cleared = False
+        with self._lock:
+            if self._status is not None and self._status.session_id == session_id:
+                self._status = None
+                cleared = True
+            stored = self._status_store.read()
+            if stored is not None and stored.get("session_id") == session_id:
+                self._status_store.clear()
+                cleared = True
+
+        if cleared:
+            # The preview frames on the camera wall belong to that run too.
+            self._clear_live_frames()
+            _logger.info("Forgot the status of deleted session %s", session_id)
+        return cleared
+
     def release_models(self) -> None:
         """Free the shared models. For a process that is about to exit.
 

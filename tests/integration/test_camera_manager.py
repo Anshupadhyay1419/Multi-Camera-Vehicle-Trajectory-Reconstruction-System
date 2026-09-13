@@ -624,6 +624,59 @@ class TestPreflightChecks:
         assert manager.has_usable_source(manager.registry.require("CAM002")) is False
 
 
+class TestForgetSession:
+    """After a session's events are deleted, nothing may keep describing it."""
+
+    def _finished(self, registry, store):
+        manager = CameraManager({"video": {}}, registry, RecordingRunner(), store)
+        session_id = manager.start(camera_ids=["CAM001"])
+        assert manager.wait(timeout=30)
+        return manager, session_id
+
+    def test_forgetting_the_last_session_returns_the_page_to_idle(self, registry, store):
+        """The reported bug: every session deleted, yet the status panel still
+        showed "4/4 complete, 88 detections" for a run that no longer existed."""
+        manager, session_id = self._finished(registry, store)
+        assert manager.get_status()["state"] == SessionState.COMPLETED.value
+
+        assert manager.forget_session(session_id) is True
+
+        status = manager.get_status()
+        assert status["state"] == SessionState.IDLE.value
+        assert status["cameras"] == []
+        assert store.read() is None, "the status file still describes the deleted run"
+
+    def test_another_process_stops_seeing_the_deleted_session_too(self, registry, store):
+        """The API and the dashboard are different processes; both read the
+        status file, so clearing only the in-memory copy is not enough."""
+        manager, session_id = self._finished(registry, store)
+        manager.forget_session(session_id)
+
+        fresh = CameraManager({"video": {}}, registry, RecordingRunner(), store)
+        assert fresh.get_status()["state"] == SessionState.IDLE.value
+
+    def test_deleting_an_older_session_keeps_the_latest_status(self, registry, store):
+        manager, session_id = self._finished(registry, store)
+
+        assert manager.forget_session("SOME-OLDER-RUN") is False
+        assert manager.get_status()["session_id"] == session_id
+        assert store.read()["session_id"] == session_id
+
+    def test_a_running_session_cannot_be_forgotten(self, registry, store):
+        def slow(**kwargs):
+            time.sleep(0.5)
+            return {}
+
+        manager = CameraManager({"video": {}}, registry, slow, store)
+        session_id = manager.start(camera_ids=["CAM001"])
+        try:
+            assert manager.forget_session(session_id) is False
+            assert manager.get_status()["session_id"] == session_id
+        finally:
+            manager.stop()
+            manager.wait(timeout=30)
+
+
 class TestLiveDwellTime:
     """A live stream never ends, so the queue must bound how long it samples
     one -- otherwise camera 1 runs forever and camera 2 never starts."""

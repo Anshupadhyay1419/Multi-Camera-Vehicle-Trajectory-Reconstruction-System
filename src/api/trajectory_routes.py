@@ -435,6 +435,10 @@ def delete_processing_session_route(session_id: str):
         _logger.error("Failed to delete session %s: %s", session_id, exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
+    # Clear the live status whether or not rows were found: a status file
+    # can outlive its events (deleted elsewhere, or a cleared database).
+    manager.forget_session(session_id)
+
     if counts["events"] == 0:
         raise HTTPException(
             status_code=404, detail=f"No events found for session {session_id!r}"

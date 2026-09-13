@@ -783,6 +783,19 @@ def render_statistics(status: dict, session_filter: Optional[str]) -> None:
         f"{sum(reported_det) / len(reported_det):.1f} ms" if reported_det else "—",
     )
 
+    if not session_filter:
+        try:
+            with database.get_session() as db_session:
+                outside = database.count_events_without_session(db_session)
+        except Exception:
+            outside = 0
+        if outside:
+            st.caption(
+                f"{outside} older single-gate event(s) are not counted here — "
+                "they are not part of any multi-camera session. They are "
+                "still shown in the original dashboard."
+            )
+
     st.divider()
     st.markdown("**Detections per camera**")
     if session_filter:
@@ -1094,6 +1107,10 @@ def main() -> None:
                             counts = delete_processing_session(
                                 _bootstrap()["config"], target
                             )
+                            # The database is done; now the live status,
+                            # header and camera wall must stop describing
+                            # the run that was just deleted.
+                            manager.forget_session(target)
                             st.session_state.pop(confirm_key, None)
                             # A trajectory on screen may have just lost its
                             # underlying events.

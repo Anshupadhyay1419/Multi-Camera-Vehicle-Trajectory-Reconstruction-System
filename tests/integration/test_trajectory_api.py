@@ -277,6 +277,23 @@ class TestInsertAndRead:
         assert [p["plate_number"] for p in plates] == ["DL8CA1234"]
         assert plates[0]["camera_count"] == 3
 
+    def test_all_sessions_excludes_events_recorded_outside_any_session(self, fresh):
+        """Single-gate events have no session and no place in the camera
+        network; "all sessions" must not sweep them in."""
+        with database.get_session() as session:
+            database.insert_event(session, _event())                  # SESS1
+            database.insert_event(session, _event(processing_session=None,
+                                                  camera_id=None,
+                                                  camera_name="Main Gate"))
+        with database.get_session() as session:
+            stats = database.get_session_stats(session)
+            assert stats["total_detections"] == 1
+            assert [c["camera_name"] for c in stats["per_camera"]] == ["India Gate"]
+            assert len(database.get_plate_detections(session, "DL8CA1234")) == 1
+            assert database.count_events_without_session(session) == 1
+            # ...and they are still in the database, untouched.
+            assert len(database.get_all_events(session)) == 2
+
     def test_unique_plate_count_is_not_the_sum_of_per_camera_counts(self, fresh):
         """One vehicle at four cameras is 1 unique plate, not 4."""
         with database.get_session() as session:
