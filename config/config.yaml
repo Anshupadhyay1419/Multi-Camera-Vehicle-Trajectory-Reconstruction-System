@@ -181,6 +181,20 @@ deduplication:
   # becomes a real collision case.
   max_edit_distance: 2
 
+# Vehicle BODY colour for vehicle profiles (classification/vehicle_color.py).
+# Not to be confused with color_classifier below, which reads the PLATE.
+# Every key is optional; these are the defaults. OpenCV HSV: H 0-179, S/V 0-255.
+vehicle_color:
+  region_top: 0.35       # skip the top of the box: windscreen and roof reflect sky
+  min_saturation: 55     # a pixel carries hue above this saturation...
+  min_value: 50          # ...and this brightness
+  chromatic_share: 0.25  # share of such pixels for a vehicle to count as coloured
+  white_min_value: 180   # achromatic vehicles by typical brightness:
+  silver_min_value: 130  #   >=180 White, >=130 Silver, >=70 Gray, else Black
+  gray_min_value: 70
+  brightness_percentile: 50  # typical panel brightness (upper percentiles follow chrome/glare)
+  brown_max_value: 150   # dark orange below this brightness is Brown
+
 color_classifier:
   hsv_ranges:
     White: [[0, 180], [0, 30], [200, 255]]
@@ -218,6 +232,9 @@ database:
   # and on the trajectory search page -- a plate crop alone is not
   # recognisable as a vehicle.
   vehicle_image_save_path: "data/vehicle_crops/"
+  # Vehicle profile thumbnails (vehicles/ and plates/ underneath): small JPEGs
+  # for dashboard cards, alongside the full-size crops above.
+  thumbnail_dir: "data/thumbnails"
 
 api:
   host: "0.0.0.0"

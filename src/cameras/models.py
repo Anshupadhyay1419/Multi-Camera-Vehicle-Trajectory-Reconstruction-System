@@ -136,6 +136,8 @@ class CameraProgress:
     last_plate: Optional[str] = None
     last_plate_image: Optional[str] = None
     last_vehicle_image: Optional[str] = None
+    last_vehicle_class: Optional[str] = None
+    last_vehicle_color: Optional[str] = None
     avg_ocr_ms: float = 0.0
     avg_detection_ms: float = 0.0
 

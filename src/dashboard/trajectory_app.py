@@ -50,6 +50,8 @@ from src.cameras.registry import CameraConfigError, load_camera_registry
 from src.cameras.sources import VideoSourceError
 from src.cameras.stream_probe import grab_preview_frame, mask_credentials, probe_stream
 from src.database import db as database
+from src.database.vehicle_profiles import get_profile, search_profiles
+from src.search.nl_query import parse_query
 from src.mapping import render_trajectory_map
 from src.trajectory import TrajectoryEngine, trajectory_to_geojson
 from src.utils.config import load_config
@@ -851,6 +853,14 @@ def render_processing_status(status: dict) -> None:
         )
         if image:
             _image(str(image))
+            details = [
+                value for value in (
+                    ((current or {}).get("last_vehicle_class") or "").title(),
+                    (current or {}).get("last_vehicle_color"),
+                ) if value
+            ]
+            if details:
+                st.caption(" · ".join(details))
         else:
             st.caption("No image yet")
     with detail[2]:
@@ -978,19 +988,39 @@ def render_trajectory_view(plate: str, session_filter: Optional[str]) -> None:
         return
 
     # ── summary ───────────────────────────────────────────────────────────
+    try:
+        with database.get_session() as db_session:
+            profile = get_profile(db_session, trajectory.plate_number) or {}
+    except Exception:
+        profile = {}
+
     head = st.columns([1, 3])
     with head[0]:
         best = max(
             trajectory.points,
             key=lambda p: p.confidence if p.confidence is not None else -1.0,
         )
-        image = _resolve_image(best.vehicle_image_path) or _resolve_image(best.plate_image_path)
-        if image:
-            _image(str(image), caption=f"Best read — {best.camera_name}")
-        else:
+        # Profile thumbnails first (the clearest read across all detections),
+        # then the full-size crops this card always used.
+        vehicle_image = (_resolve_image(profile.get("vehicle_thumbnail_path"))
+                         or _resolve_image(best.vehicle_image_path))
+        plate_image = (_resolve_image(profile.get("plate_thumbnail_path"))
+                       or _resolve_image(best.plate_image_path))
+        if vehicle_image:
+            _image(str(vehicle_image), caption=f"Best read — {best.camera_name}")
+        if plate_image:
+            _image(str(plate_image), caption="Plate")
+        if not vehicle_image and not plate_image:
             st.info("No vehicle image stored for this plate.")
     with head[1]:
         st.markdown(f'<span class="tj-plate">{trajectory.plate_number}</span>', unsafe_allow_html=True)
+        attributes = []
+        if profile.get("vehicle_class"):
+            attributes.append(f"**Vehicle type:** {profile['vehicle_class'].title()}")
+        if profile.get("vehicle_color"):
+            attributes.append(f"**Vehicle color:** {profile['vehicle_color']}")
+        if attributes:
+            st.markdown(" &nbsp;·&nbsp; ".join(attributes), unsafe_allow_html=True)
         st.write("")
         row = st.columns(3)
         row[0].metric("Cameras visited", trajectory.cameras_visited)
@@ -1152,7 +1182,79 @@ def render_search_panel() -> Optional[str]:
     if submitted and typed.strip():
         st.session_state["active_plate"] = typed.strip().upper()
 
+    render_vehicle_search()
     return st.session_state.get("active_plate")
+
+
+def render_vehicle_search() -> None:
+    """Describe a vehicle in words; see every matching vehicle's picture.
+
+    "white cars", "red truck after 9am today", "blue car at India Gate last 2
+    hours". The sentence is parsed on this device (search/nl_query.py) into
+    colour, type, time window, camera and plate, and run against the vehicle
+    profiles. What was understood is shown above the results, so a surprising
+    match is explainable.
+    """
+    st.markdown("**Search vehicles by description**")
+    form = st.columns([4, 1])
+    with form[0]:
+        text = st.text_input(
+            "Describe the vehicle",
+            placeholder="e.g. white cars after 9am today at India Gate",
+            label_visibility="collapsed",
+            key="vehicle_search_input",
+        )
+    with form[1]:
+        if st.button("Find vehicles", use_container_width=True, key="vehicle_search_go"):
+            st.session_state["vehicle_search_text"] = text.strip()
+
+    asked = st.session_state.get("vehicle_search_text")
+    if not asked:
+        return
+
+    registry = _bootstrap()["registry"]
+    cameras = [(c.camera_id, c.camera_name) for c in registry]
+    query = parse_query(asked, cameras=cameras)
+    if query.is_empty:
+        st.warning(
+            "Couldn't find a colour, vehicle type, time, camera or plate in that. "
+            "Try something like “white cars today” or “red truck at India Gate”."
+        )
+        return
+
+    try:
+        with database.get_session() as db_session:
+            results = search_profiles(db_session, query, limit=60)
+    except Exception as exc:
+        st.error(f"Search failed: {exc}")
+        return
+
+    st.caption(f"Understood: {query.describe(dict(cameras))} — {len(results)} vehicle(s)")
+    if not results:
+        st.info("No stored vehicles match.")
+        return
+
+    for row_start in range(0, len(results), 4):
+        columns = st.columns(4)
+        for column, vehicle in zip(columns, results[row_start:row_start + 4]):
+            with column:
+                image = (_resolve_image(vehicle.get("vehicle_thumbnail_path"))
+                         or _resolve_image(vehicle.get("vehicle_image_path"))
+                         or _resolve_image(vehicle.get("plate_thumbnail_path")))
+                if image:
+                    _image(str(image))
+                else:
+                    st.caption("No image stored")
+                visit = vehicle.get("matched_visit") or {}
+                label = " ".join(v for v in (vehicle.get("vehicle_color"),
+                                             (vehicle.get("vehicle_class") or "").title()) if v)
+                st.markdown(f"**{html_escape(vehicle['plate_number'])}**  \n"
+                            f"{html_escape(label or 'Unknown')}")
+                st.caption(f"{visit.get('camera_name') or '—'} · {_fmt_time(visit.get('last_seen'))}")
+                if st.button("View trajectory", key=f"nl_pick_{vehicle['plate_number']}",
+                             use_container_width=True):
+                    st.session_state["active_plate"] = vehicle["plate_number"]
+                    st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════

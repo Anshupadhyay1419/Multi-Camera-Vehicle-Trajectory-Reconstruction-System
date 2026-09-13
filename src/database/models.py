@@ -4,7 +4,7 @@ SQLAlchemy ORM models for the ALPR University Gate database.
 
 from __future__ import annotations
 
-from sqlalchemy import Column, Float, Index, Integer, String
+from sqlalchemy import Column, Float, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase
 
 
@@ -79,6 +79,22 @@ class VehicleEvent(Base):
     confidence         = Column(Float,   nullable=True)
     ocr_text           = Column(String,  nullable=True)
 
+    # ── Vehicle profile attributes ────────────────────────────────────────
+    # Deliberately NEW columns rather than new meanings for old ones:
+    # vehicle_type is the registration category inferred from the PLATE
+    # colour ("Private", "Commercial"...) and plate_color is the plate's
+    # background -- both keep meaning exactly what they always have.
+    #
+    # vehicle_class           YOLO detector class: car / truck / bus / motorcycle.
+    # vehicle_color           Dominant BODY colour (classification.vehicle_color).
+    # vehicle_thumbnail_path  Small JPEG of the vehicle, for cards and lists --
+    # plate_thumbnail_path    and of the raw plate. The full-size crops
+    #                         (vehicle_image_path, image_path) are unchanged.
+    vehicle_class          = Column(String, nullable=True)
+    vehicle_color          = Column(String, nullable=True)
+    vehicle_thumbnail_path = Column(String, nullable=True)
+    plate_thumbnail_path   = Column(String, nullable=True)
+
     __table_args__ = (
         Index("idx_plate_number", "plate_number"),
         Index("idx_timestamp",    "timestamp"),
@@ -110,4 +126,102 @@ class VehicleEvent(Base):
             "video_source":       self.video_source,
             "confidence":         self.confidence,
             "ocr_text":           self.ocr_text,
+            "vehicle_class":          self.vehicle_class,
+            "vehicle_color":          self.vehicle_color,
+            "vehicle_thumbnail_path": self.vehicle_thumbnail_path,
+            "plate_thumbnail_path":   self.plate_thumbnail_path,
+        }
+
+
+class VehicleProfile(Base):
+    """Everything known about one vehicle, keyed by plate number.
+
+    One row per plate, maintained incrementally as detections are stored
+    (database.vehicle_profiles) and rebuildable from vehicle_events at any
+    time -- the events table stays the source of truth, this is a
+    summary of it. Created by create_all() on first start, so an existing
+    database gains it without any migration step.
+
+    Nullable wherever a detection may not supply the value: events from
+    before this table existed have no class, colour or thumbnails.
+    """
+
+    __tablename__ = "vehicle_profiles"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    plate_number = Column(String, nullable=False, unique=True)
+
+    # Attributes -- the most frequent value across all detections (see
+    # attribute_votes), so one misread camera cannot flip them.
+    vehicle_class = Column(String, nullable=True)   # YOLO class
+    vehicle_color = Column(String, nullable=True)   # body colour
+    vehicle_type  = Column(String, nullable=True)   # registration category
+    plate_color   = Column(String, nullable=True)
+
+    # Images from the highest-confidence detection -- the clearest read.
+    vehicle_image_path     = Column(String, nullable=True)
+    plate_image_path       = Column(String, nullable=True)
+    vehicle_thumbnail_path = Column(String, nullable=True)
+    plate_thumbnail_path   = Column(String, nullable=True)
+
+    # Where and when it was last seen.
+    camera_id          = Column(String, nullable=True)
+    camera_name        = Column(String, nullable=True)
+    latitude           = Column(Float,  nullable=True)
+    longitude          = Column(Float,  nullable=True)
+    processing_session = Column(String, nullable=True)
+    ocr_confidence     = Column(Float,  nullable=True)   # of the latest detection
+    best_confidence    = Column(Float,  nullable=True)
+
+    first_seen = Column(String, nullable=False)          # ISO 8601
+    last_seen  = Column(String, nullable=False)
+
+    total_detections    = Column(Integer, nullable=False, default=0)
+    total_camera_visits = Column(Integer, nullable=False, default=0)
+    unique_cameras      = Column(Integer, nullable=False, default=0)
+
+    # JSON: ordered camera visits, oldest first. One entry per visit --
+    # consecutive detections at the same camera in the same session close
+    # together in time are one visit, not several.
+    trajectory_history = Column(Text, nullable=False, default="[]")
+    # JSON: {"vehicle_class": {"car": 3}, "vehicle_color": {...}, ...}
+    attribute_votes    = Column(Text, nullable=False, default="{}")
+
+    updated_at = Column(String, nullable=False)
+
+    __table_args__ = (
+        Index("idx_profile_last_seen", "last_seen"),
+    )
+
+    def to_dict(self) -> dict:
+        import json
+
+        try:
+            history = json.loads(self.trajectory_history or "[]")
+        except ValueError:
+            history = []
+        return {
+            "plate_number":           self.plate_number,
+            "vehicle_class":          self.vehicle_class,
+            "vehicle_color":          self.vehicle_color,
+            "vehicle_type":           self.vehicle_type,
+            "plate_color":            self.plate_color,
+            "vehicle_image_path":     self.vehicle_image_path,
+            "plate_image_path":       self.plate_image_path,
+            "vehicle_thumbnail_path": self.vehicle_thumbnail_path,
+            "plate_thumbnail_path":   self.plate_thumbnail_path,
+            "camera_id":              self.camera_id,
+            "camera_name":            self.camera_name,
+            "latitude":               self.latitude,
+            "longitude":              self.longitude,
+            "processing_session":     self.processing_session,
+            "ocr_confidence":         self.ocr_confidence,
+            "best_confidence":        self.best_confidence,
+            "first_seen":             self.first_seen,
+            "last_seen":              self.last_seen,
+            "total_detections":       self.total_detections,
+            "total_camera_visits":    self.total_camera_visits,
+            "unique_cameras":         self.unique_cameras,
+            "trajectory_history":     history,
+            "updated_at":             self.updated_at,
         }

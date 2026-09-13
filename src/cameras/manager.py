@@ -99,7 +99,15 @@ class ProgressReporter:
         confidence: Optional[float] = None,
         plate_image: Optional[str] = None,
         vehicle_image: Optional[str] = None,
+        vehicle_class: Optional[str] = None,
+        vehicle_color: Optional[str] = None,
+        **_ignored,
     ) -> None:
+        # **_ignored: the pipeline calls this with keyword arguments, and a
+        # new field it starts sending must never turn into a TypeError that
+        # silently drops the detection from the live panel.
+        self._progress.last_vehicle_class = vehicle_class
+        self._progress.last_vehicle_color = vehicle_color
         self._progress.detections += 1
         self._plates.add(plate_number)
         self._progress.unique_plates = len(self._plates)

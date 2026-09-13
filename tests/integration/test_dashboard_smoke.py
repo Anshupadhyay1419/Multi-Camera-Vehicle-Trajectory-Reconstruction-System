@@ -641,10 +641,62 @@ class TestDeleteRefreshesThePage:
         assert "Main Gate" not in page, "a non-network camera is still listed"
 
 
+class TestVehicleProfileCards:
+    """Existing cards also show vehicle image, plate image, colour and type."""
+
+    def _with_profile_images(self, tmp_path):
+        import cv2
+        import numpy as np
+
+        vehicle = tmp_path / "vehicle_thumb.jpg"
+        plate = tmp_path / "plate_thumb.jpg"
+        cv2.imwrite(str(vehicle), np.full((120, 160, 3), (170, 70, 20), np.uint8))
+        cv2.imwrite(str(plate), np.full((40, 120, 3), 230, np.uint8))
+        with database.get_session() as session:
+            database.insert_event(session, {
+                "plate_number": "DL8CA1234", "vehicle_type": "Private",
+                "plate_color": "White", "series_type": "normal", "direction": "IN",
+                "image_path": "", "camera_id": "CAM001", "camera_name": "India Gate",
+                "latitude": 28.6129, "longitude": 77.2295,
+                "timestamp": "2026-09-12T09:59:00+00:00", "processing_session": "SMOKE",
+                "confidence": 0.99, "vehicle_class": "car", "vehicle_color": "Blue",
+                "vehicle_thumbnail_path": str(vehicle), "plate_thumbnail_path": str(plate),
+            })
+
+    def test_trajectory_card_shows_type_colour_and_both_images(self, app, tmp_path):
+        self._with_profile_images(tmp_path)
+        at = app(active_plate="DL8CA1234")
+        _assert_clean(at, "trajectory card with a profile")
+        page = "\n".join(m.value for m in at.markdown)
+        assert "**Vehicle type:** Car" in page
+        assert "**Vehicle color:** Blue" in page
+        assert len(at.get("imgs") or []) >= 1
+
+    def test_a_plate_without_profile_attributes_still_renders(self, app):
+        """Detections stored before profiles existed have no class or colour."""
+        at = app(active_plate="HR26DK8337")
+        _assert_clean(at, "trajectory card without profile attributes")
+
+    def test_the_original_dashboard_cards_show_class_and_colour(self, seeded_db, monkeypatch, tmp_path):
+        self._with_profile_images(tmp_path)
+        monkeypatch.setenv("ALPR_DB_PATH", seeded_db)
+        streamlit.cache_resource.clear()
+        streamlit.cache_data.clear()
+
+        at = AppTest.from_file(LEGACY_APP, default_timeout=90)
+        at.session_state["auto_refresh"] = False
+        at.run()
+        assert not at.exception, at.exception[0].value
+        written = [m.value for m in at.markdown] + [c.value for c in at.caption]
+        text = " ".join(str(w) for w in written)
+        assert "Car (Private)" in text
+        assert "Blue" in text
+
+
 class TestSearch:
     def test_searching_a_plate_selects_it(self, app):
         at = app()
-        at.get("text_input")[-1].set_value("DL8CA1234").run()
+        next(t for t in at.get("text_input") if t.key == "search_input").set_value("DL8CA1234").run()
         next(b for b in at.button if b.label == "Search").click().run()
         _assert_clean(at, "after searching")
         assert at.session_state["active_plate"] == "DL8CA1234"

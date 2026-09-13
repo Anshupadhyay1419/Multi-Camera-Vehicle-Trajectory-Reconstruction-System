@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.database import db as database
-from src.database.models import VehicleEvent
+from src.database.models import VehicleEvent, VehicleProfile
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -42,6 +42,8 @@ def clear_all_data(config: dict) -> dict[str, int]:
     db_cfg = config["database"]
     _ensure_database(config)
     with database.get_session() as session:
+        # Profiles summarise the events being deleted; clear them together.
+        session.query(VehicleProfile).delete()
         deleted_events = session.query(VehicleEvent).delete()
         session.commit()
 
@@ -49,11 +51,13 @@ def clear_all_data(config: dict) -> dict[str, int]:
     # crops (multi-camera runs only). Leaving the vehicle crops behind would
     # orphan them -- the rows referencing them have just been deleted.
     deleted_images = 0
-    for setting, default in (
-        ("image_save_path", "data/plate_crops/"),
-        ("vehicle_image_save_path", "data/vehicle_crops/"),
+    thumbnail_root = db_cfg.get("thumbnail_dir", "data/thumbnails")
+    for crops_dir in (
+        REPO_ROOT / db_cfg.get("image_save_path", "data/plate_crops/"),
+        REPO_ROOT / db_cfg.get("vehicle_image_save_path", "data/vehicle_crops/"),
+        REPO_ROOT / thumbnail_root / "vehicles",
+        REPO_ROOT / thumbnail_root / "plates",
     ):
-        crops_dir = REPO_ROOT / db_cfg.get(setting, default)
         if crops_dir.is_dir():
             for image_path in crops_dir.glob("*.jpg"):
                 image_path.unlink()

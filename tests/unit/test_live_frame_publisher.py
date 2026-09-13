@@ -22,46 +22,81 @@ import pytest
 from src.utils.live_frame import LiveFramePublisher
 
 
-def _accepted_rate(publisher: LiveFramePublisher, source_fps: float, seconds: float) -> float:
-    """Drive publish() at source_fps and count how many frames it accepted."""
+class _FakeClock:
+    """A controllable stand-in for time.monotonic.
+
+    The rate control is pure arithmetic over the clock, so it is tested on a
+    simulated one. Real sleeps made these tests fail on a busy machine
+    (a browser and an IDE open on the Jetson were enough), which says
+    nothing about the code.
+    """
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.fixture()
+def clock(monkeypatch):
+    import src.utils.live_frame as module
+
+    fake = _FakeClock()
+    monkeypatch.setattr(module, "time", fake)
+    return fake
+
+
+def _accepted(publisher: LiveFramePublisher, clock: _FakeClock,
+              source_fps: float, seconds: float) -> int:
+    """Feed frames at source_fps on the simulated clock; count acceptances."""
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
     accepted = 0
-    interval = 1.0 / source_fps
-    started = time.monotonic()
-    next_frame = started
-    frame = np.zeros((48, 64, 3), dtype=np.uint8)
-    while time.monotonic() - started < seconds:
+    for _ in range(int(round(source_fps * seconds))):
         if publisher.is_due():
             accepted += 1
         publisher.publish(frame)
-        next_frame += interval
-        time.sleep(max(0.0, next_frame - time.monotonic()))
-    return accepted / seconds
+        clock.now += 1.0 / source_fps
+    return accepted
 
 
 class TestRateControl:
-    def test_the_average_rate_meets_the_target_against_a_faster_source(self, tmp_path):
+    def test_the_average_rate_meets_the_target_against_a_faster_source(self, tmp_path, clock):
         """Measured regression: 15fps target + 23fps camera used to give 11fps."""
         publisher = LiveFramePublisher(str(tmp_path / "f.jpg"), max_fps=15)
-        rate = _accepted_rate(publisher, source_fps=23, seconds=3.0)
-        assert 13.5 <= rate <= 16.0, f"published at {rate:.1f}fps"
+        accepted = _accepted(publisher, clock, source_fps=23, seconds=10)
+        assert 148 <= accepted <= 151, f"{accepted / 10:.1f} fps over 10 simulated seconds"
 
-    def test_a_slower_source_publishes_every_frame(self, tmp_path):
+    def test_a_slower_source_publishes_every_frame(self, tmp_path, clock):
         publisher = LiveFramePublisher(str(tmp_path / "f.jpg"), max_fps=15)
-        rate = _accepted_rate(publisher, source_fps=10, seconds=2.0)
-        assert rate >= 9.0
+        assert _accepted(publisher, clock, source_fps=10, seconds=5) == 50
 
-    def test_after_a_long_pause_it_does_not_burst(self, tmp_path):
+    def test_after_a_long_pause_it_does_not_burst(self, tmp_path, clock):
         """A stall must not be 'made up' with a burst of back-to-back frames."""
         publisher = LiveFramePublisher(str(tmp_path / "f.jpg"), max_fps=10)
-        frame = np.zeros((48, 64, 3), dtype=np.uint8)
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
         publisher.publish(frame)
-        time.sleep(1.0)                        # the source stalls
+        clock.now += 5.0                       # the source stalls
         accepted = 0
-        for _ in range(20):                    # then fires frames back to back
+        for _ in range(20):                    # then 20 frames 1ms apart
             if publisher.is_due():
                 accepted += 1
             publisher.publish(frame)
+            clock.now += 0.001
         assert accepted <= 2
+
+    def test_the_old_rule_would_have_failed_this(self, tmp_path, clock):
+        """Pin the specific failure: a limiter that waits a full interval
+        after each write gets ~11.5fps from a 23fps source at a 15fps cap."""
+        interval = 1 / 15
+        last_write, naive = -1.0, 0
+        for i in range(230):
+            now = i / 23
+            if now - last_write >= interval:
+                naive += 1
+                last_write = now
+        publisher = LiveFramePublisher(str(tmp_path / "f.jpg"), max_fps=15)
+        assert naive < 120 < _accepted(publisher, clock, source_fps=23, seconds=10)
 
 
 class TestWriting:

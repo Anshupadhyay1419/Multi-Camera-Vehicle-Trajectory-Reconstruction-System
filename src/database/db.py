@@ -64,6 +64,11 @@ _ADDED_COLUMNS = (
     ("video_source",       "VARCHAR"),
     ("confidence",         "DOUBLE PRECISION"),
     ("ocr_text",           "VARCHAR"),
+    # Vehicle profile attributes (see models.VehicleEvent).
+    ("vehicle_class",          "VARCHAR"),
+    ("vehicle_color",          "VARCHAR"),
+    ("vehicle_thumbnail_path", "VARCHAR"),
+    ("plate_thumbnail_path",   "VARCHAR"),
 )
 
 
@@ -212,13 +217,35 @@ def init_db(db_url: str = None) -> None:
     # Create all tables (SQLite) or verify they exist (PostgreSQL), then
     # bring an older table up to the current model's column set.
     try:
+        had_profiles_table = "vehicle_profiles" in inspect(_engine).get_table_names()
         Base.metadata.create_all(_engine)
         _migrate_schema(_engine)
         _SessionFactory = sessionmaker(bind=_engine)
+        if not had_profiles_table:
+            _backfill_vehicle_profiles()
         _logger.info("✓ Database connection established")
     except Exception as exc:
         _logger.error("Failed to initialize database: %s", exc)
         raise
+
+
+def _backfill_vehicle_profiles() -> None:
+    """Build profiles for detections recorded before the table existed.
+
+    Runs once, on the start that creates vehicle_profiles, so an existing
+    deployment's history gains profiles without a manual step. Never fails
+    init_db(): profiles are a derived summary and can be rebuilt any time
+    (database.vehicle_profiles.rebuild_all_profiles).
+    """
+    from src.database.vehicle_profiles import rebuild_all_profiles
+
+    try:
+        with get_session() as session:
+            count = rebuild_all_profiles(session)
+        if count:
+            _logger.info("Backfilled vehicle profiles for %d plate(s)", count)
+    except Exception as exc:
+        _logger.warning("Could not backfill vehicle profiles: %s", exc)
 
 
 def get_engine():
@@ -324,9 +351,19 @@ def insert_event(session: Session, event_data: dict) -> Optional[VehicleEvent]:
                 video_source=event_data.get("video_source"),
                 confidence=_as_optional_float(event_data.get("confidence")),
                 ocr_text=event_data.get("ocr_text"),
+                vehicle_class=event_data.get("vehicle_class"),
+                vehicle_color=event_data.get("vehicle_color"),
+                vehicle_thumbnail_path=event_data.get("vehicle_thumbnail_path"),
+                plate_thumbnail_path=event_data.get("plate_thumbnail_path"),
             )
             session.add(event)
             session.flush()
+            # Keep this plate's vehicle profile current, in the same
+            # transaction. Isolated in a savepoint and never raising: a
+            # profile problem must not cost the detection itself.
+            from src.database.vehicle_profiles import update_profile_for_event
+
+            update_profile_for_event(session, event)
             return event
         except Exception as exc:
             if attempt == 0:
@@ -423,6 +460,58 @@ def get_daily_stats(session: Session) -> dict:
         "unique_vehicles": unique_vehicles,
         "total_events": len(events),
     }
+
+
+def save_thumbnail(
+    image: np.ndarray,
+    plate_number: str,
+    save_dir: str,
+    max_side: int = 320,
+    quality: int = 85,
+    min_width: int = 0,
+) -> str:
+    """Save a small JPEG of *image* and return its path, or "" on failure.
+
+    For cards and lists: the full-size crops already stored are often several
+    hundred kilobytes, far more than a 200px card needs, and loading dozens of
+    them makes a page slow. The longest side is scaled down to *max_side*
+    (never up) with area averaging, which is the cheap and clean way to
+    shrink an image.
+
+    Never raises -- a failed thumbnail costs a picture, not the detection.
+    """
+    try:
+        import cv2
+
+        if image is None or getattr(image, "size", 0) == 0:
+            return ""
+        height, width = image.shape[:2]
+        scale = min(1.0, float(max_side) / max(height, width))
+        if scale < 1.0:
+            image = cv2.resize(
+                image,
+                (max(1, int(width * scale)), max(1, int(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        elif min_width and width < min_width:
+            # Enlarge an image too small to read on a card. Plate crops are
+            # often only ~40px wide at source (measured: 38x11); scaling for
+            # display adds no detail, but it turns an unreadable speck into
+            # something a person can actually look at.
+            grow = float(min_width) / width
+            image = cv2.resize(
+                image, (int(min_width), max(1, int(round(height * grow)))),
+                interpolation=cv2.INTER_CUBIC,
+            )
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        path = Path(save_dir) / f"{plate_number}_{stamp}.jpg"
+        if not cv2.imwrite(str(path), image, [cv2.IMWRITE_JPEG_QUALITY, int(quality)]):
+            return ""
+        return str(path)
+    except Exception as exc:
+        _logger.warning("Failed to save thumbnail: %s", exc)
+        return ""
 
 
 def save_plate_image(
@@ -720,9 +809,11 @@ def delete_session(session, processing_session: str) -> dict:
     image_paths = [
         path
         for event in rows
-        for path in (event.image_path, event.vehicle_image_path)
+        for path in (event.image_path, event.vehicle_image_path,
+                     event.vehicle_thumbnail_path, event.plate_thumbnail_path)
         if path
     ]
+    affected_plates = {event.plate_number for event in rows}
 
     deleted = (
         session.query(VehicleEvent)
@@ -730,6 +821,14 @@ def delete_session(session, processing_session: str) -> dict:
         .delete(synchronize_session=False)
     )
     _logger.info("Deleted %d event(s) from session %s", deleted, processing_session)
+
+    # Those plates' profiles summarised events that no longer exist. Rebuild
+    # them from what remains (which deletes a profile left with no events).
+    if affected_plates:
+        from src.database.vehicle_profiles import rebuild_profiles
+
+        session.flush()
+        rebuild_profiles(session, affected_plates)
     return {"events": int(deleted or 0), "image_paths": image_paths}
 
 

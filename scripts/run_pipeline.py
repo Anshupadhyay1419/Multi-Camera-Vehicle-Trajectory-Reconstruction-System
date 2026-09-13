@@ -82,6 +82,10 @@ def _store_event(
     session_context: dict | None = None,
     vehicle_image_save_path: str = "data/vehicle_crops/",
     progress=None,
+    vehicle_class: str | None = None,
+    vehicle_color_detector=None,
+    plate_thumbnail_source: np.ndarray | None = None,
+    thumbnail_dir: str = "data/thumbnails",
 ) -> bool:
     """Classify, deduplicate, and store a confirmed plate event.
 
@@ -105,6 +109,21 @@ def _store_event(
                        dashboard can show detections as they happen. Any
                        exception it raises is swallowed -- reporting must
                        never cost the pipeline an event.
+      vehicle_class    The tracker's YOLO class for this vehicle (car/truck/
+                       bus/motorcycle). Stored as vehicle_class; the existing
+                       vehicle_type (a registration category from the plate
+                       colour) is unchanged.
+      vehicle_color_detector
+                       Detects the dominant BODY colour from vehicle_crop.
+      plate_thumbnail_source
+                       The raw colour plate crop for the plate thumbnail.
+                       plate_crop itself is often the preprocessed/enhanced
+                       image used for OCR, which is not what a person wants
+                       to look at on a card.
+
+    Profile work (colour, two small thumbnails, the profile update inside
+    insert_event) happens only here -- once per stored vehicle, never per
+    frame -- so it does not touch the per-frame inference path.
     """
     if dup_filter.is_duplicate(plate_number, track_id):
         log.info("DUPLICATE skipped: %s (track %d)", plate_number, track_id)
@@ -118,10 +137,24 @@ def _store_event(
     # Only written when a crop was actually passed in, so the single-gate
     # path does no extra disk I/O and the column stays NULL for it.
     vehicle_image_path = ""
-    if vehicle_crop is not None and getattr(vehicle_crop, "size", 0):
+    vehicle_color = None
+    vehicle_thumbnail_path = ""
+    has_vehicle_crop = vehicle_crop is not None and getattr(vehicle_crop, "size", 0)
+    if has_vehicle_crop:
         vehicle_image_path = database.save_vehicle_image(
             vehicle_crop, plate_number, vehicle_image_save_path
         )
+        vehicle_thumbnail_path = database.save_thumbnail(
+            vehicle_crop, plate_number, str(Path(thumbnail_dir) / "vehicles"), max_side=320
+        )
+        if vehicle_color_detector is not None:
+            vehicle_color = vehicle_color_detector.detect(vehicle_crop)
+
+    plate_source = plate_thumbnail_source if plate_thumbnail_source is not None else plate_crop
+    plate_thumbnail_path = database.save_thumbnail(
+        plate_source, plate_number, str(Path(thumbnail_dir) / "plates"),
+        max_side=240, min_width=176,
+    )
 
     event_data = {
         "plate_number": plate_number,
@@ -136,6 +169,10 @@ def _store_event(
         "vehicle_image_path": vehicle_image_path or None,
         "confidence": confidence,
         "ocr_text":   ocr_text,
+        "vehicle_class":          vehicle_class,
+        "vehicle_color":          vehicle_color,
+        "vehicle_thumbnail_path": vehicle_thumbnail_path or None,
+        "plate_thumbnail_path":   plate_thumbnail_path or None,
         # processing_session / trajectory_order / video_source
         **(session_context or {}),
     }
@@ -145,8 +182,8 @@ def _store_event(
             database.insert_event(session, event_data)
         dup_filter.record(plate_number, track_id)
         log.info(
-            "✅ STORED: plate=%s type=%s color=%s dir=%s camera=%s conf=%s",
-            plate_number, vehicle_type, color, direction,
+            "✅ STORED: plate=%s type=%s color=%s class=%s body=%s dir=%s camera=%s conf=%s",
+            plate_number, vehicle_type, color, vehicle_class, vehicle_color, direction,
             camera_meta.get("camera_id"),
             f"{confidence:.2f}" if confidence is not None else "n/a",
         )
@@ -155,8 +192,10 @@ def _store_event(
                 progress.on_detection(
                     plate_number=plate_number,
                     confidence=confidence,
-                    plate_image=image_path,
-                    vehicle_image=vehicle_image_path,
+                    plate_image=plate_thumbnail_path or image_path,
+                    vehicle_image=vehicle_thumbnail_path or vehicle_image_path,
+                    vehicle_class=vehicle_class,
+                    vehicle_color=vehicle_color,
                 )
             except Exception as exc:
                 log.debug("Progress reporter raised on_detection: %s", exc)
@@ -384,10 +423,16 @@ def run_pipeline(
     dup_filter         = DuplicateFilter.from_config(config)
     direction_detector = DirectionDetector.from_config(config)
     motion_filter      = MotionFilter.from_config(config)
+    # Body colour for vehicle profiles. Pure NumPy/OpenCV with no model to
+    # load; it runs once per stored vehicle, not per frame.
+    from src.classification.vehicle_color import VehicleColorDetector
+
+    vehicle_color_detector = VehicleColorDetector.from_config(config)
 
     database.init_db(db_cfg["path"])
     image_save_path = db_cfg.get("image_save_path", "data/plate_crops/")
     vehicle_image_save_path = db_cfg.get("vehicle_image_save_path", "data/vehicle_crops/")
+    thumbnail_dir = db_cfg.get("thumbnail_dir", "data/thumbnails")
     # Static for the life of this run. For the single-gate path that means
     # one Jetson watching one gate (read once from config.yaml); for a
     # multi-camera run the manager supplies the current camera's block.
@@ -492,6 +537,8 @@ def run_pipeline(
     # per-track state
     track_plate_crops: dict[int, np.ndarray] = {}   # best raw plate crop
     track_centroids:   dict[int, tuple]      = {}
+    track_classes:     dict[int, str]        = {}   # YOLO class, for profiles
+    track_vehicle_areas: dict[int, int]      = {}   # largest vehicle crop so far
     stored_tracks:     set[int]              = set()
 
     # dup_filter._plate_times / _track_times otherwise grow for the life of
@@ -636,6 +683,7 @@ def run_pipeline(
                 # Motion filter — skip for first 5 frames to build history
                 motion_filter.update(tid, track.centroid)
                 track_centroids[tid] = track.centroid
+                track_classes[tid] = track.class_label
 
                 # Only apply motion filter after enough history (5 frames)
                 buf_size = len(motion_filter._history.get(tid, []))
@@ -691,6 +739,19 @@ def run_pipeline(
                 # at fusion time (potentially with SR enhancement).
                 if tid not in track_plate_crops:
                     track_plate_crops[tid] = plate_crop
+                    track_plate_crops[f"{tid}_vehicle"] = vehicle_crop
+
+                # For the vehicle profile, keep the LARGEST view of the vehicle
+                # seen with a readable plate, not the first. A vehicle is
+                # usually distant when its plate is first found and fills more
+                # of the frame as it approaches; measured on this site's video,
+                # the first crop of a dark navy car was mostly background and
+                # watermark and read as silver, while its closer crop read blue.
+                # One area comparison per plate detection. The plate crop used
+                # for OCR above is untouched.
+                vehicle_area = vehicle_crop.shape[0] * vehicle_crop.shape[1]
+                if vehicle_area > track_vehicle_areas.get(tid, 0):
+                    track_vehicle_areas[tid] = vehicle_area
                     track_plate_crops[f"{tid}_vehicle"] = vehicle_crop
 
                 # Preprocessing, including super-resolution on every attempt
@@ -797,6 +858,10 @@ def run_pipeline(
                                 session_context=session_context,
                                 vehicle_image_save_path=vehicle_image_save_path,
                                 progress=progress,
+                                vehicle_class=track.class_label,
+                                vehicle_color_detector=vehicle_color_detector,
+                                plate_thumbnail_source=best_crop,
+                                thumbnail_dir=thumbnail_dir,
                             )
                             if stored:
                                 events_stored += 1
@@ -865,6 +930,10 @@ def run_pipeline(
                 session_context=session_context,
                 vehicle_image_save_path=vehicle_image_save_path,
                 progress=progress,
+                vehicle_class=track_classes.get(tid),
+                vehicle_color_detector=vehicle_color_detector,
+                plate_thumbnail_source=best_crop,
+                thumbnail_dir=thumbnail_dir,
             ):
                 events_stored += 1
 

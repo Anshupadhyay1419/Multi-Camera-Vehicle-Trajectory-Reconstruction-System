@@ -580,6 +580,76 @@ and progress is read back from the status file.
 
 ---
 
+## Vehicle profiles
+
+Every stored detection now also records the vehicle's **YOLO class**, its
+**body colour**, and two small **thumbnails** (vehicle, plate). Each plate
+has one **vehicle profile** summarising all of its detections.
+
+### What is stored
+
+| Where | Field | Meaning |
+|---|---|---|
+| `vehicle_events` (new, nullable) | `vehicle_class` | YOLO class from the tracker: car / truck / bus / motorcycle |
+| | `vehicle_color` | Dominant body colour (below) |
+| | `vehicle_thumbnail_path` | ≤320 px JPEG of the vehicle, `data/thumbnails/vehicles/` |
+| | `plate_thumbnail_path` | Raw colour plate crop, at least 176 px wide, `data/thumbnails/plates/` |
+| `vehicle_profiles` (new table) | one row per plate | class, colour, registration category, plate colour, best images, last camera and location, session, latest and best OCR confidence, first/last seen, total detections, **total camera visits**, unique cameras, **trajectory history** (JSON camera-visit sequence) |
+
+`vehicle_type` and `plate_color` keep their existing meaning — the
+registration category and the plate's background colour, both inferred from
+the plate. The YOLO class and the body colour are new fields beside them.
+
+### How profiles are maintained
+
+`src/database/vehicle_profiles.py`. `insert_event()` folds each detection into
+its plate's profile inside the same transaction, in a savepoint — a profile
+problem can never lose the detection. A profile can also be rebuilt from
+`vehicle_events` at any time, through the same fold, so the two always agree.
+Rebuilds happen when a session is deleted, when a detection arrives out of
+time order, and once to backfill an existing database the first time the
+table appears.
+
+- **Class and colour** are the majority across detections, ignoring
+  "Unknown", so one poor view cannot flip them.
+- **Images** come from the highest-confidence detection.
+- **A visit** is consecutive detections at one camera, in one session, no
+  more than 300 s apart; a return to a camera later is a new visit.
+
+### Body colour
+
+`src/classification/vehicle_color.py` — White, Black, Silver, Gray, Blue, Red,
+Green, Yellow, Brown, Orange. A fast HSV heuristic with no model to load:
+it skips the top of the vehicle box (windscreen, roof), decides coloured vs
+achromatic by the share of saturated pixels, then votes on hue or reads the
+median panel brightness. Thresholds are in `config.yaml` → `vehicle_color:`.
+
+Measured on 36 hand-labelled vehicle crops extracted from this site's two
+videos by the real detector and tracker: **30/36 correct**. The misses are
+mostly crops no colour heuristic can fix: a black car behind the video's
+semi-transparent watermark, and crops containing more than one vehicle.
+On the three plates stored from `ALPR.mp4`, the light-blue Honda reads Blue and
+the dark Volvo reads Gray, but the dark-navy BMW reads **Silver**: its plate is
+only readable in a distant, watermark-covered view. Treat colour as a
+helpful description, not ground truth.
+
+### Cost
+
+Measured per stored vehicle (not per frame) on the Orin: colour 0.5 ms,
+both thumbnails 1.3 ms, profile update +14 ms on the database insert. With a
+handful of stored vehicles per clip this is well under 0.1% of a run;
+pipeline speed was unchanged within run-to-run noise (19.5 fps).
+
+### APIs
+
+- Event responses (`/logs`, `/search`, `/live`, `/direction`, `/entry`) gain
+  `vehicle_class`, `vehicle_color`, `vehicle_thumbnail_path`,
+  `plate_thumbnail_path` (null for older detections).
+- `/vehicles/{plate}` gains `profile`; `/trajectory-api/trajectory/{plate}`
+  gains `profile`. Existing keys are unchanged.
+- New: `GET /trajectory-api/vehicles`, `GET /trajectory-api/vehicles/{plate}`.
+- Thumbnails are served at `/thumbnails/{vehicles,plates}/<file>`.
+
 ## 9. API
 
 New routes, all under `/trajectory-api` so they cannot collide with the

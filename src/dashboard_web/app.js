@@ -67,6 +67,14 @@
     return `/media/${encodeURIComponent(name)}`;
   }
 
+  // Vehicle-profile thumbnails live under data/thumbnails/{vehicles,plates}/
+  // and are served from /thumbnails/{vehicles,plates}/<file>.
+  function profileThumbUrl(path) {
+    if (!path) return null;
+    const match = String(path).match(/thumbnails\/(vehicles|plates)\/([^/]+)$/);
+    return match ? `/thumbnails/${match[1]}/${encodeURIComponent(match[2])}` : null;
+  }
+
   function renderTable(events) {
     lastEvents = events;
     if (!events.length) {
@@ -115,7 +123,9 @@
   function openDetail(idx) {
     const ev = lastEvents[idx];
     if (!ev) return;
-    const thumb = thumbUrl(ev.image_path);
+    // Vehicle thumbnail when the detection has one; the plate crop otherwise.
+    const thumb = profileThumbUrl(ev.vehicle_thumbnail_path) || thumbUrl(ev.image_path);
+    const plateThumb = profileThumbUrl(ev.plate_thumbnail_path);
     detailImg.onerror = () => { detailImg.style.display = "none"; };
     detailImg.onload = () => { detailImg.style.display = ""; };
     detailImg.src = thumb || "";
@@ -123,8 +133,16 @@
     detailFields.innerHTML = `
       <dt>Plate</dt><dd class="plate-text">${escapeHtml(ev.plate_number)}</dd>
       <dt>Direction</dt><dd>${escapeHtml(ev.direction)}</dd>
-      <dt>Vehicle type</dt><dd>${escapeHtml(ev.vehicle_type || "—")}</dd>
-      <dt>Color</dt><dd>${escapeHtml(ev.plate_color || "—")}</dd>
+      ${plateThumb
+        ? `<dt>Plate image</dt><dd><img class="thumb" src="${plateThumb}" alt="Plate" onerror="this.remove()"></dd>`
+        : ""}
+      <dt>Vehicle type</dt><dd>${escapeHtml(ev.vehicle_class
+        ? `${ev.vehicle_class} (${ev.vehicle_type || "—"})`
+        : (ev.vehicle_type || "—"))}</dd>
+      ${ev.vehicle_color
+        ? `<dt>Vehicle color</dt><dd>${escapeHtml(ev.vehicle_color)}</dd>`
+        : ""}
+      <dt>Plate color</dt><dd>${escapeHtml(ev.plate_color || "—")}</dd>
       <dt>Series</dt><dd>${escapeHtml(ev.series_type || "—")}</dd>
       <dt>Camera ID</dt><dd>${escapeHtml(ev.camera_id || "—")}</dd>
       <dt>Camera name</dt><dd>${escapeHtml(ev.camera_name || "—")}</dd>

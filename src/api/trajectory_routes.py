@@ -16,6 +16,8 @@ behaviour; this module only adds.
   GET  /trajectory-api/trajectory/{plate}     reconstructed path
   GET  /trajectory-api/map/{plate}            path as GeoJSON
   GET  /trajectory-api/map/{plate}/html       path as a Leaflet page
+  GET  /trajectory-api/vehicles               vehicle profiles, newest first
+  GET  /trajectory-api/vehicles/{plate}       one vehicle's profile
   GET  /trajectory-api/statistics             session/camera aggregates
   GET  /trajectory-api/plates                 plates worth plotting
   GET  /trajectory-api/sessions               recent processing sessions
@@ -36,10 +38,12 @@ from src.api.schemas import (
     StartProcessingRequest,
     StartProcessingResponse,
     TrajectoryResponse,
+    VehicleProfileResponse,
 )
 from src.cameras.registry import CameraConfigError, load_camera_registry
 from src.cameras.status_store import StatusStore
 from src.database import db as database
+from src.database.vehicle_profiles import get_profile, list_profiles
 from src.trajectory import TrajectoryEngine, trajectory_to_geojson
 from src.utils.logger import get_logger
 
@@ -335,7 +339,13 @@ def get_trajectory(
         raise HTTPException(
             status_code=404, detail=f"No detections for plate {plate.upper()}"
         )
-    return TrajectoryResponse(**trajectory.to_dict())
+    body = trajectory.to_dict()
+    try:
+        with database.get_session() as db_session:
+            body["profile"] = get_profile(db_session, plate)
+    except RuntimeError:
+        body["profile"] = None
+    return TrajectoryResponse(**body)
 
 
 @router.get("/map/{plate}")
@@ -369,6 +379,31 @@ def get_map_html(
 
 
 # ── statistics ────────────────────────────────────────────────────────────
+
+
+@router.get("/vehicles", response_model=list[VehicleProfileResponse])
+def list_vehicle_profiles(limit: int = Query(100, ge=1, le=1000)):
+    """Vehicle profiles, most recently seen first."""
+    try:
+        with database.get_session() as db_session:
+            return [VehicleProfileResponse(**p) for p in list_profiles(db_session, limit=limit)]
+    except RuntimeError as exc:
+        _logger.error("Database unavailable on /vehicles: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+
+@router.get("/vehicles/{plate}", response_model=VehicleProfileResponse)
+def get_vehicle_profile(plate: str):
+    """One vehicle's profile: attributes, best images, camera visits."""
+    try:
+        with database.get_session() as db_session:
+            profile = get_profile(db_session, plate)
+    except RuntimeError as exc:
+        _logger.error("Database unavailable on /vehicles/{plate}: %s", exc)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"No vehicle profile for {plate.upper()}")
+    return VehicleProfileResponse(**profile)
 
 
 @router.get("/statistics")
