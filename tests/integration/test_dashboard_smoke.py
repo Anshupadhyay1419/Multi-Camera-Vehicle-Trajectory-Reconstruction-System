@@ -168,7 +168,7 @@ class TestOperationsTab:
     def test_every_configured_camera_is_offered_a_source(self, app):
         at = app()
         # One radio per camera, each with both source kinds.
-        radios = at.get("radio")
+        radios = [r for r in at.get("radio") if r.label.startswith("Source for")]
         assert len(radios) == 4
         for radio in radios:
             assert len(radio.options) == 2
@@ -402,7 +402,8 @@ class TestSmoothCameraFeeds:
     def test_every_camera_gets_a_live_stream_player(self, app, real_server):
         at = app()
         _assert_clean(at, "camera wall with streaming")
-        players = at.get("iframe")
+        # Only the camera players; the page also embeds the traffic heatmap.
+        players = [f for f in at.get("iframe") if "/stream/" in f.proto.srcdoc]
         assert len(players) == 4
         for player, camera_id in zip(players, ("CAM001", "CAM002", "CAM003", "CAM004")):
             assert f":{real_server.port}/stream/" in player.proto.srcdoc
@@ -414,17 +415,24 @@ class TestSmoothCameraFeeds:
         during processing; an iframe whose content changes is reloaded,
         restarting the video. Identical content keeps it playing."""
         at = app()
-        first = [p.proto.srcdoc for p in at.get("iframe")]
+        players = lambda: [f.proto.srcdoc for f in at.get("iframe") if "/stream/" in f.proto.srcdoc]
+        first = players()
         for _ in range(3):
             at.run()
-        assert [p.proto.srcdoc for p in at.get("iframe")] == first
+        assert players() == first
 
     def test_without_the_stream_server_the_wall_still_works_and_says_why(self, app):
         """A taken port costs smooth video, never the page."""
         at = app()
         _assert_clean(at, "camera wall without streaming")
-        assert not at.get("iframe")
+        assert not [f for f in at.get("iframe") if "/stream/" in f.proto.srcdoc]
         assert any("Smooth video is unavailable" in c.value for c in at.caption)
+
+    def test_the_traffic_heatmap_renders(self, app):
+        at = app()
+        _assert_clean(at, "traffic heatmap")
+        assert "Traffic heatmap" in {h.value for h in at.subheader}
+        assert any("heatLayer" in f.proto.srcdoc for f in at.get("iframe"))
 
 
 class TestTrajectoryTab:

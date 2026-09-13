@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 
 from src.api.schemas import EntryRequest, EventResponse
 from src.database import db as database
+from src.database.vehicle_profiles import get_profile
 from src.utils.config import get_camera_metadata, load_config
 from src.utils.data_reset import clear_all_data
 from src.utils.logger import get_logger
@@ -105,6 +106,13 @@ _camera_meta = get_camera_metadata(_config)
 # narrow mount (just this one directory) rather than all of data/, which
 # also holds the sqlite database file.
 app.mount("/media", StaticFiles(directory=str(_plate_crops_dir)), name="media")
+
+# Vehicle-profile thumbnails, served under /thumbnails/{vehicles,plates}/<file>.
+# Another narrow mount -- only the thumbnail tree, never the rest of data/.
+_thumbnail_dir = _REPO_ROOT / _config.get("database", {}).get("thumbnail_dir", "data/thumbnails")
+for _kind in ("vehicles", "plates"):
+    (_thumbnail_dir / _kind).mkdir(parents=True, exist_ok=True)
+app.mount("/thumbnails", StaticFiles(directory=str(_thumbnail_dir)), name="thumbnails")
 
 
 def _get_db_session():
@@ -261,6 +269,9 @@ def get_vehicle_history(plate: str):
                 "first_seen": events[-1]["timestamp"] if events else None,
                 "last_seen": events[0]["timestamp"] if events else None,
                 "events": events,
+                # Added: the vehicle profile (class, colour, thumbnails,
+                # camera visits). Every key above is unchanged.
+                "profile": get_profile(session, plate),
             }
     except HTTPException:
         raise

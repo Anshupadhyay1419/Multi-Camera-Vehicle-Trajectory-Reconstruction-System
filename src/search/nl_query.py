@@ -6,9 +6,13 @@ Natural-language vehicle search: turn a sentence into filters, run them.
     "blue car at India Gate last 2 hours"    -> + camera
     "silver vehicles yesterday"              -> colour only, whole day
 
+Understands every stored vehicle feature: body colour, vehicle type, plate,
+plate colour, registration category, BH series, direction, cameras visited,
+OCR confidence, time, and camera.
+
 Parsed locally with rules, not by a language model: this device has no
-model or API key configured, the vocabulary is small and fixed (ten colours,
-four classes, times, camera names), and a deterministic parser answers in
+model or API key configured, the vocabulary is small and fixed, and a
+deterministic parser answers in
 microseconds offline. Words it does not recognise are ignored rather than
 guessed at, and the dashboard shows what was understood so the operator can
 see why a result matched.
@@ -36,6 +40,14 @@ _CLASS_WORDS = {"car": "car", "cars": "car", "sedan": "car", "suv": "car", "hatc
 _PLATE = re.compile(r"\b([A-Z]{2}\d{1,2}[A-Z]{1,3}\d{4}|\d{2}BH\d{4}[A-Z]{1,2})\b", re.I)
 _PLATE_FRAGMENT = re.compile(r"\bplate\s+([A-Z0-9]{2,10})\b", re.I)
 _CLOCK = r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
+# Registration category (stored as vehicle_type, inferred from plate colour).
+_REGISTRATION_WORDS = {"private": "Private", "commercial": "Commercial", "taxi": "Commercial",
+                       "cab": "Commercial", "ev": "EV", "electric": "EV",
+                       "government": "Govt/Temp", "govt": "Govt/Temp", "temporary": "Govt/Temp",
+                       "diplomatic": "Diplomatic", "rental": "Rental", "military": "Military",
+                       "army": "Military"}
+_PLATE_COLOURS = {"white": "White", "yellow": "Yellow", "green": "Green", "red": "Red",
+                  "blue": "Blue", "black": "Black"}
 
 
 @dataclass
@@ -46,11 +58,19 @@ class VehicleQuery:
     end: Optional[datetime] = None
     camera_ids: list[str] = field(default_factory=list)
     plate_fragment: Optional[str] = None
+    vehicle_types: list[str] = field(default_factory=list)   # registration category
+    plate_colors: list[str] = field(default_factory=list)
+    directions: list[str] = field(default_factory=list)       # IN / OUT
+    min_cameras: Optional[int] = None
+    min_confidence: Optional[float] = None
+    series: Optional[str] = None                              # "BH"
 
     @property
     def is_empty(self) -> bool:
         return not (self.colors or self.classes or self.start or self.end
-                    or self.camera_ids or self.plate_fragment)
+                    or self.camera_ids or self.plate_fragment or self.vehicle_types
+                    or self.plate_colors or self.directions or self.min_cameras
+                    or self.min_confidence is not None or self.series)
 
     def describe(self, camera_names: Optional[dict] = None) -> str:
         parts = []
@@ -70,6 +90,18 @@ class VehicleQuery:
             parts.append("at " + " or ".join(names.get(c, c) for c in self.camera_ids))
         if self.plate_fragment:
             parts.append(f"plate containing {self.plate_fragment}")
+        if self.vehicle_types:
+            parts.append("registration " + " or ".join(self.vehicle_types))
+        if self.plate_colors:
+            parts.append(" or ".join(self.plate_colors) + " plate")
+        if self.series:
+            parts.append(f"{self.series} series")
+        if self.directions:
+            parts.append("direction " + " or ".join(self.directions))
+        if self.min_cameras:
+            parts.append(f"seen at {self.min_cameras}+ cameras")
+        if self.min_confidence is not None:
+            parts.append(f"OCR confidence ≥ {self.min_confidence:.0%}")
         return ", ".join(parts) if parts else "no filters (all vehicles)"
 
 
@@ -93,11 +125,45 @@ def parse_query(text: str, now: Optional[datetime] = None,
     words = re.findall(r"[a-z]+", lowered)
     query = VehicleQuery()
 
-    for word in words:
-        if word in _COLOR_WORDS and _COLOR_WORDS[word] not in query.colors:
-            query.colors.append(_COLOR_WORDS[word])
-        if word in _CLASS_WORDS and _CLASS_WORDS[word] not in query.classes:
-            query.classes.append(_CLASS_WORDS[word])
+    def add(bucket: list, value) -> None:
+        if value not in bucket:
+            bucket.append(value)
+
+    for index, word in enumerate(words):
+        following = words[index + 1] if index + 1 < len(words) else ""
+        # "yellow plate" is the PLATE's colour; "yellow car" is the body's.
+        if following in ("plate", "plates", "number") and word in _PLATE_COLOURS:
+            add(query.plate_colors, _PLATE_COLOURS[word])
+            continue
+        if word in _COLOR_WORDS:
+            add(query.colors, _COLOR_WORDS[word])
+        if word in _CLASS_WORDS:
+            add(query.classes, _CLASS_WORDS[word])
+        if word in _REGISTRATION_WORDS:
+            add(query.vehicle_types, _REGISTRATION_WORDS[word])
+        if word in ("entering", "entered", "entry", "incoming", "arriving"):
+            add(query.directions, "IN")
+        if word in ("exiting", "exited", "exit", "leaving", "outgoing", "departing"):
+            add(query.directions, "OUT")
+
+    if re.search(r"\bbh\b", lowered) and ("series" in words or "bharat" in words):
+        query.series = "BH"
+
+    cameras_count = re.search(
+        r"\b(?:at least|min(?:imum)?|more than|over|>=?)\s*(\d+)\s*(?:\+\s*)?cameras?\b|\b(\d+)\s*\+\s*cameras?\b",
+        lowered)
+    if cameras_count:
+        number = int(cameras_count.group(1) or cameras_count.group(2))
+        query.min_cameras = number + 1 if "more than" in cameras_count.group(0) or "over" in cameras_count.group(0) else number
+    elif re.search(r"\b(?:multiple|several|many|different)\s+cameras\b", lowered):
+        query.min_cameras = 2
+
+    confidence = re.search(r"\bconfidence\s*(?:above|over|>=?|at least)?\s*(\d+(?:\.\d+)?)\s*%?", lowered)
+    if confidence:
+        value = float(confidence.group(1))
+        query.min_confidence = value / 100 if value > 1 else value
+    elif re.search(r"\bhigh(?:ly)?\s+confiden", lowered):
+        query.min_confidence = 0.9
 
     for camera_id, name in cameras:
         if name and name.lower() in lowered or camera_id.lower() in lowered:

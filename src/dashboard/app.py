@@ -262,10 +262,20 @@ def main():
 
                     # Image preview
                     with col_img:
+                        # Vehicle and plate thumbnails when the detection has
+                        # them; otherwise the plate crop, as before.
+                        vehicle_thumb = event.get("vehicle_thumbnail_path") or ""
+                        plate_thumb = event.get("plate_thumbnail_path") or ""
                         img_path = event.get("image_path", "")
-                        if img_path and Path(img_path).exists():
-                            st.image(img_path, width=120)
-                        else:
+                        shown = False
+                        if vehicle_thumb and Path(vehicle_thumb).exists():
+                            st.image(vehicle_thumb, width=120)
+                            shown = True
+                        plate_img = plate_thumb if plate_thumb and Path(plate_thumb).exists() else img_path
+                        if plate_img and Path(plate_img).exists():
+                            st.image(plate_img, width=120)
+                            shown = True
+                        if not shown:
                             st.markdown("📷 *No image*")
 
                     # Event details
@@ -294,12 +304,17 @@ def main():
                         col_d1, col_d2, col_d3, col_d4 = st.columns(4)
                         with col_d1:
                             st.markdown(f'<span class="{direction_class}">{direction_emoji} {direction}</span>', unsafe_allow_html=True)
+                        vehicle_class = event.get("vehicle_class")
+                        vehicle_color = event.get("vehicle_color")
                         with col_d2:
-                            st.write(f"🚗 {vehicle_type}")
+                            # YOLO class when known, keeping the registration
+                            # category alongside; unchanged for older rows.
+                            st.write(f"🚗 {vehicle_class.title()} ({vehicle_type})"
+                                     if vehicle_class else f"🚗 {vehicle_type}")
                         with col_d3:
-                            st.write(f"🎨 {color}")
+                            st.write(f"🎨 {vehicle_color}" if vehicle_color else f"🎨 {color}")
                         with col_d4:
-                            st.write(f"📌 {series}")
+                            st.write(f"📌 {series} · plate {color}" if vehicle_color else f"📌 {series}")
 
                         # Coordinates are nullable (pre-camera-metadata rows,
                         # and gates that haven't been surveyed), so only
@@ -468,9 +483,17 @@ def main():
                 st.write("**Vehicle Information**")
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.write(f"**Type:** {vehicle_info.get('vehicle_type', 'N/A')}")
+                    if vehicle_info.get("vehicle_class"):
+                        st.write(f"**Type:** {vehicle_info['vehicle_class'].title()} "
+                                 f"({vehicle_info.get('vehicle_type', 'N/A')})")
+                    else:
+                        st.write(f"**Type:** {vehicle_info.get('vehicle_type', 'N/A')}")
                 with col2:
-                    st.write(f"**Plate Color:** {vehicle_info.get('plate_color', 'N/A')}")
+                    if vehicle_info.get("vehicle_color"):
+                        st.write(f"**Color:** {vehicle_info['vehicle_color']} "
+                                 f"(plate {vehicle_info.get('plate_color', 'N/A')})")
+                    else:
+                        st.write(f"**Plate Color:** {vehicle_info.get('plate_color', 'N/A')}")
                 with col3:
                     st.write(f"**Series:** {vehicle_info.get('series_type', 'N/A')}")
                 with col4:

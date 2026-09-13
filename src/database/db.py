@@ -846,3 +846,52 @@ def save_vehicle_image(
     the event itself, so this returns "" instead of raising.
     """
     return save_plate_image(vehicle_crop, plate_number, save_dir)
+
+
+def get_current_vehicle_locations(
+    session: Session,
+    processing_session: Optional[str] = None,
+) -> dict:
+    """{camera_id: vehicles whose MOST RECENT sighting was at that camera}.
+
+    For the "where are vehicles now" heatmap: a vehicle that passed cameras
+    1, 2 and 3 and was last seen at 4 counts once, at camera 4 -- unlike the
+    per-camera detection totals, which count it at every camera it passed.
+    Scoped like the other trajectory queries (one session, or all sessions).
+    """
+    rows = _scope_to_sessions(
+        session.query(VehicleEvent.plate_number, VehicleEvent.camera_id,
+                      VehicleEvent.timestamp, VehicleEvent.id),
+        processing_session,
+    ).all()
+    latest: dict = {}
+    for plate, camera_id, timestamp, row_id in rows:
+        key = (plate or "").upper()
+        if key not in latest or (timestamp or "", row_id) > latest[key][0]:
+            latest[key] = ((timestamp or "", row_id), camera_id)
+    counts: dict = {}
+    for _, camera_id in latest.values():
+        if camera_id:
+            counts[camera_id] = counts.get(camera_id, 0) + 1
+    return counts
+
+
+def get_blacklisted_detections(session: Session, plates, limit: int = 200) -> list[dict]:
+    """Every detection of a blacklisted plate, newest first, across all data.
+
+    Deliberately NOT session-scoped: a blacklist alert must surface a sighting
+    from any run, including the single-gate pipeline.
+    """
+    wanted = {p.upper() for p in plates if p}
+    if not wanted:
+        return []
+    from sqlalchemy import func
+
+    rows = (
+        session.query(VehicleEvent)
+        .filter(func.upper(func.replace(VehicleEvent.plate_number, " ", "")).in_(wanted))
+        .order_by(VehicleEvent.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+    return [row.to_dict() for row in rows]

@@ -141,3 +141,53 @@ class TestDashboard:
             })
         yield str(path)
         database._engine = database._SessionFactory = database._db_type = None
+
+
+class TestAllFeatures:
+    def test_every_feature_parses(self):
+        assert q("commercial trucks with yellow plate").plate_colors == ["Yellow"]
+        assert q("commercial trucks with yellow plate").colors == []      # plate, not body
+        assert q("commercial trucks").vehicle_types == ["Commercial"]
+        assert q("cars seen at 3+ cameras").min_cameras == 3
+        assert q("cars at more than 1 cameras").min_cameras == 2
+        assert q("vehicles leaving").directions == ["OUT"]
+        assert q("bh series cars").series == "BH"
+        assert q("high confidence").min_confidence == 0.9
+        assert q("confidence above 80%").min_confidence == 0.8
+
+    def test_feature_filters_search(self, tmp_path):
+        database.init_db(str(tmp_path / "features.db"))
+        rows = [("DL1AAA1111", "Private", "White", "IN", "normal", 0.95, ["CAM001", "CAM002"]),
+                ("DL2BBB2222", "Commercial", "Yellow", "OUT", "BH", 0.70, ["CAM001"])]
+        with database.get_session() as session:
+            for plate, reg, plate_colour, direction, series, conf, cams in rows:
+                for i, cam in enumerate(cams):
+                    database.insert_event(session, {
+                        "plate_number": plate, "vehicle_type": reg, "plate_color": plate_colour,
+                        "series_type": series, "direction": direction, "image_path": "",
+                        "camera_id": cam, "camera_name": cam,
+                        "timestamp": f"2026-09-13T0{i + 1}:00:00+00:00", "processing_session": "S",
+                        "confidence": conf, "vehicle_class": "car", "vehicle_color": "White"})
+        try:
+            assert plates("commercial vehicles") == ["DL2BBB2222"]
+            assert plates("yellow plate") == ["DL2BBB2222"]
+            assert plates("cars leaving") == ["DL2BBB2222"]
+            assert plates("bh series") == ["DL2BBB2222"]
+            assert plates("cars seen at 2+ cameras") == ["DL1AAA1111"]
+            assert plates("high confidence") == ["DL1AAA1111"]
+        finally:
+            database._engine = database._SessionFactory = database._db_type = None
+
+
+class TestHeatmap:
+    def test_sites_are_weighted_and_unmapped_ones_skipped(self):
+        from src.mapping.heatmap import render_traffic_heatmap
+
+        html = render_traffic_heatmap([
+            {"camera_id": "CAM001", "camera_name": "India Gate", "latitude": 28.6129, "longitude": 77.2295, "detections": 12},
+            {"camera_id": "CAM002", "camera_name": "Connaught Place", "latitude": 28.6315, "longitude": 77.2167, "detections": 0},
+            {"camera_id": "CAM009", "camera_name": "Unsurveyed", "latitude": None, "longitude": None, "detections": 5},
+        ])
+        assert '"count": 12' in html and '"count": 0' in html
+        assert "Unsurveyed" not in html
+        assert "leaflet-heat.js" in html and "heatLayer" in html

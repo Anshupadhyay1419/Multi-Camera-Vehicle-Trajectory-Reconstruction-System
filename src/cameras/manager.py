@@ -108,6 +108,19 @@ class ProgressReporter:
         # silently drops the detection from the live panel.
         self._progress.last_vehicle_class = vehicle_class
         self._progress.last_vehicle_color = vehicle_color
+        # Blacklist alert, raised the moment the plate is stored.
+        try:
+            from src.alerts.blacklist import get_blacklist
+
+            entry = get_blacklist().get(plate_number)
+        except Exception:
+            entry = None
+        if entry is not None:
+            reason = f" ({entry['reason']})" if entry.get("reason") else ""
+            message = (f"ALERT: BLACKLISTED vehicle {entry['plate']}{reason} detected at "
+                       f"{self._progress.camera_name}")
+            _logger.warning(message)
+            self._log(message)
         self._progress.detections += 1
         self._plates.add(plate_number)
         self._progress.unique_plates = len(self._plates)

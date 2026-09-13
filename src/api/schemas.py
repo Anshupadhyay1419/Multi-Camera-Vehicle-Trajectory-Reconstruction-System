@@ -65,6 +65,13 @@ class EventResponse(BaseModel):
     confidence:         Optional[float] = None
     ocr_text:           Optional[str]   = None
 
+    # Vehicle profile attributes. Null for detections stored before these
+    # existed. vehicle_type above keeps its meaning (registration category).
+    vehicle_class:          Optional[str] = None
+    vehicle_color:          Optional[str] = None
+    vehicle_thumbnail_path: Optional[str] = None
+    plate_thumbnail_path:   Optional[str] = None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Multi-camera trajectory reconstruction
@@ -164,3 +171,51 @@ class TrajectoryResponse(BaseModel):
     total_distance_km:  Optional[float] = None
     average_confidence: Optional[float] = None
     path_labels:        list[str] = []
+    # The plate's vehicle profile, when one exists. Added alongside the
+    # reconstruction; the reconstruction itself is unchanged.
+    profile:            Optional[VehicleProfileResponse] = None
+
+
+class CameraVisitResponse(BaseModel):
+    """One visit in a vehicle profile's camera sequence."""
+
+    camera_id:          Optional[str]   = None
+    camera_name:        Optional[str]   = None
+    latitude:           Optional[float] = None
+    longitude:          Optional[float] = None
+    processing_session: Optional[str]   = None
+    first_seen:         Optional[str]   = None
+    last_seen:          Optional[str]   = None
+    detections:         int = 1
+    confidence:         Optional[float] = None
+
+
+class VehicleProfileResponse(BaseModel):
+    """Everything known about one vehicle, across all its detections."""
+
+    plate_number:           str
+    vehicle_class:          Optional[str] = None
+    vehicle_color:          Optional[str] = None
+    vehicle_type:           Optional[str] = None
+    plate_color:            Optional[str] = None
+    vehicle_image_path:     Optional[str] = None
+    plate_image_path:       Optional[str] = None
+    vehicle_thumbnail_path: Optional[str] = None
+    plate_thumbnail_path:   Optional[str] = None
+    camera_id:              Optional[str]   = None
+    camera_name:            Optional[str]   = None
+    latitude:               Optional[float] = None
+    longitude:              Optional[float] = None
+    processing_session:     Optional[str]   = None
+    ocr_confidence:         Optional[float] = None
+    best_confidence:        Optional[float] = None
+    first_seen:             str
+    last_seen:              str
+    total_detections:       int = 0
+    total_camera_visits:    int = 0
+    unique_cameras:         int = 0
+    trajectory_history:     list[CameraVisitResponse] = []
+    updated_at:             Optional[str] = None
+
+
+TrajectoryResponse.model_rebuild()

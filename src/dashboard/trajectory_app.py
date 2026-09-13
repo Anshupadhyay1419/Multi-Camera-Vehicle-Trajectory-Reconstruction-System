@@ -52,7 +52,9 @@ from src.cameras.stream_probe import grab_preview_frame, mask_credentials, probe
 from src.database import db as database
 from src.database.vehicle_profiles import get_profile, search_profiles
 from src.search.nl_query import parse_query
+from src.alerts.blacklist import get_blacklist
 from src.mapping import render_trajectory_map
+from src.mapping.heatmap import render_traffic_heatmap as render_traffic_heatmap_html
 from src.trajectory import TrajectoryEngine, trajectory_to_geojson
 from src.utils.config import load_config
 from src.utils.data_reset import delete_processing_session
@@ -654,6 +656,133 @@ def _panel_status(camera, state: str, is_live: bool, progress) -> tuple[str, str
     return "Waiting for its turn in the queue", ""
 
 
+def _blacklisted_sightings() -> list[dict]:
+    try:
+        with database.get_session() as db_session:
+            return database.get_blacklisted_detections(db_session, get_blacklist().plates())
+    except Exception:
+        return []
+
+
+def render_blacklist_alert() -> None:
+    """Red banner at the top of the page while any blacklisted plate has been seen."""
+    sightings = _blacklisted_sightings()
+    if not sightings:
+        return
+    latest: dict = {}
+    for row in sightings:                      # newest first
+        plate = row["plate_number"].upper()
+        latest.setdefault(plate, {"row": row, "count": 0})["count"] += 1
+    lines = []
+    for plate, item in latest.items():
+        row = item["row"]
+        entry = get_blacklist().get(plate) or {}
+        reason = f" — {entry['reason']}" if entry.get("reason") else ""
+        lines.append(
+            f"**{plate}**{reason}: last seen at **{row.get('camera_name') or 'unknown camera'}**, "
+            f"{_fmt_time(row.get('timestamp'))} ({item['count']} sighting(s))"
+        )
+    st.error("**BLACKLISTED VEHICLE DETECTED**  \n" + "  \n".join(lines))
+
+
+def render_blacklist_panel() -> None:
+    """Manage the blacklist and see every sighting of a blacklisted vehicle."""
+    st.subheader("Blacklisted vehicles")
+    blacklist = get_blacklist()
+
+    form = st.columns([2, 3, 1])
+    plate_text = form[0].text_input("Plate", placeholder="DL7CD5017",
+                                    label_visibility="collapsed", key="blacklist_plate")
+    reason_text = form[1].text_input("Reason", placeholder="Reason (optional)",
+                                     label_visibility="collapsed", key="blacklist_reason")
+    if form[2].button("Add", use_container_width=True, key="blacklist_add"):
+        try:
+            blacklist.add(plate_text, reason_text)
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+    entries = blacklist.entries()
+    if not entries:
+        st.caption("No plates are blacklisted.")
+        return
+
+    sightings = _blacklisted_sightings()
+    by_plate: dict = {}
+    for row in sightings:
+        by_plate.setdefault(row["plate_number"].upper(), []).append(row)
+
+    for entry in entries:
+        rows = by_plate.get(entry["plate"], [])
+        cols = st.columns([1, 3, 1, 1])
+        latest = rows[0] if rows else {}
+        image = (_resolve_image(latest.get("vehicle_thumbnail_path"))
+                 or _resolve_image(latest.get("vehicle_image_path"))
+                 or _resolve_image(latest.get("image_path")))
+        with cols[0]:
+            if image:
+                _image(str(image))
+            else:
+                st.caption("No image")
+        with cols[1]:
+            st.markdown(f'{_badge("BLACKLISTED", "#dc2626")} <span class="tj-plate">{entry["plate"]}</span>',
+                        unsafe_allow_html=True)
+            detail = entry["reason"] or "No reason given"
+            if rows:
+                st.caption(f"{detail} · {len(rows)} sighting(s) · last at "
+                           f"{latest.get('camera_name') or 'unknown camera'}, {_fmt_time(latest.get('timestamp'))}")
+            else:
+                st.caption(f"{detail} · not detected yet")
+        with cols[2]:
+            if rows and st.button("Trajectory", key=f"bl_view_{entry['plate']}", use_container_width=True):
+                st.session_state["active_plate"] = entry["plate"]
+                st.rerun()
+        with cols[3]:
+            if st.button("Remove", key=f"bl_remove_{entry['plate']}", use_container_width=True):
+                blacklist.remove(entry["plate"])
+                st.rerun()
+
+
+def render_traffic_heatmap(session_filter: Optional[str]) -> None:
+    """Traffic heatmap across every camera site, for the selected scope."""
+    st.subheader("Traffic heatmap")
+    view = st.radio(
+        "Heatmap view",
+        ["Where vehicles are now", "Total traffic per camera"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="heatmap_view",
+    )
+    current = view.startswith("Where")
+    try:
+        with database.get_session() as db_session:
+            if current:
+                # Each vehicle counted once, at the camera it was LAST seen:
+                # vehicles that passed 1, 2 and 3 and are now at 4 heat up 4.
+                counts = database.get_current_vehicle_locations(
+                    db_session, processing_session=session_filter)
+            else:
+                stats = database.get_session_stats(db_session, processing_session=session_filter)
+                counts = {row["camera_id"]: row["detections"] for row in stats["per_camera"]}
+    except Exception as exc:
+        st.warning(f"Heatmap unavailable: {exc}")
+        return
+    sites = [
+        {"camera_id": c.camera_id, "camera_name": c.camera_name, "latitude": c.latitude,
+         "longitude": c.longitude, "detections": counts.get(c.camera_id, 0)}
+        for c in _bootstrap()["registry"]
+    ]
+    total = sum(site["detections"] for site in sites)
+    scope = f"session `{session_filter}`" if session_filter else "all sessions"
+    if current:
+        st.caption(f"Each vehicle shown at the camera where it was last seen ({scope}): "
+                   f"{total} vehicle(s). Hotter = more vehicles there now; grey = none.")
+    else:
+        st.caption(f"Every detection at each camera site ({scope}): {total} in total. "
+                   "Hotter = more traffic passed; grey = none.")
+    components.html(render_traffic_heatmap_html(sites), height=480)
+
+
 def render_camera_wall(status: dict) -> None:
     """All cameras' feeds in one view, two per row.
 
@@ -1013,7 +1142,8 @@ def render_trajectory_view(plate: str, session_filter: Optional[str]) -> None:
         if not vehicle_image and not plate_image:
             st.info("No vehicle image stored for this plate.")
     with head[1]:
-        st.markdown(f'<span class="tj-plate">{trajectory.plate_number}</span>', unsafe_allow_html=True)
+        badge = _badge("BLACKLISTED", "#dc2626") + " " if get_blacklist().contains(trajectory.plate_number) else ""
+        st.markdown(f'{badge}<span class="tj-plate">{trajectory.plate_number}</span>', unsafe_allow_html=True)
         attributes = []
         if profile.get("vehicle_class"):
             attributes.append(f"**Vehicle type:** {profile['vehicle_class'].title()}")
@@ -1200,7 +1330,7 @@ def render_vehicle_search() -> None:
     with form[0]:
         text = st.text_input(
             "Describe the vehicle",
-            placeholder="e.g. white cars after 9am today at India Gate",
+            placeholder="e.g. white cars after 9am today · commercial trucks with yellow plate · cars seen at 3+ cameras · leaving India Gate",
             label_visibility="collapsed",
             key="vehicle_search_input",
         )
@@ -1217,7 +1347,8 @@ def render_vehicle_search() -> None:
     query = parse_query(asked, cameras=cameras)
     if query.is_empty:
         st.warning(
-            "Couldn't find a colour, vehicle type, time, camera or plate in that. "
+            "Couldn't find a vehicle feature in that (colour, type, plate, plate colour, "
+            "registration, BH series, direction, cameras visited, confidence, time or camera). "
             "Try something like “white cars today” or “red truck at India Gate”."
         )
         return
@@ -1248,8 +1379,10 @@ def render_vehicle_search() -> None:
                 visit = vehicle.get("matched_visit") or {}
                 label = " ".join(v for v in (vehicle.get("vehicle_color"),
                                              (vehicle.get("vehicle_class") or "").title()) if v)
-                st.markdown(f"**{html_escape(vehicle['plate_number'])}**  \n"
-                            f"{html_escape(label or 'Unknown')}")
+                flag = (_badge("BLACKLISTED", "#dc2626") + " "
+                        if get_blacklist().contains(vehicle["plate_number"]) else "")
+                st.markdown(f"{flag}**{html_escape(vehicle['plate_number'])}**  \n"
+                            f"{html_escape(label or 'Unknown')}", unsafe_allow_html=True)
                 st.caption(f"{visit.get('camera_name') or '—'} · {_fmt_time(visit.get('last_seen'))}")
                 if st.button("View trajectory", key=f"nl_pick_{vehicle['plate_number']}",
                              use_container_width=True):
@@ -1275,6 +1408,7 @@ def main() -> None:
     manager = _manager()
     status = manager.get_status()
     render_header(status)
+    render_blacklist_alert()
 
     # ── sidebar ───────────────────────────────────────────────────────────
     with st.sidebar:
@@ -1419,6 +1553,12 @@ def main() -> None:
             render_processing_status(status)
         with right:
             render_statistics(status, session_filter)
+
+        st.divider()
+        render_blacklist_panel()
+
+        st.divider()
+        render_traffic_heatmap(session_filter)
 
         st.divider()
         render_camera_wall(status)

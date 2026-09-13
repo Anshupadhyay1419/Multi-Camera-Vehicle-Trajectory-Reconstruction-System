@@ -359,6 +359,22 @@ def search_profiles(session: Session, query, limit: int = 60) -> list[dict]:
         rows = rows.filter(VehicleProfile.vehicle_class.in_(query.classes))
     if query.plate_fragment:
         rows = rows.filter(VehicleProfile.plate_number.contains(query.plate_fragment))
+    if getattr(query, "vehicle_types", None):
+        rows = rows.filter(VehicleProfile.vehicle_type.in_(query.vehicle_types))
+    if getattr(query, "plate_colors", None):
+        rows = rows.filter(VehicleProfile.plate_color.in_(query.plate_colors))
+    if getattr(query, "min_cameras", None):
+        rows = rows.filter(VehicleProfile.unique_cameras >= query.min_cameras)
+    if getattr(query, "min_confidence", None) is not None:
+        rows = rows.filter(VehicleProfile.best_confidence >= query.min_confidence)
+    # Direction and series live on the detections, not the profile summary.
+    if getattr(query, "directions", None) or getattr(query, "series", None):
+        events = session.query(func.upper(VehicleEvent.plate_number))
+        if query.directions:
+            events = events.filter(VehicleEvent.direction.in_(query.directions))
+        if query.series:
+            events = events.filter(VehicleEvent.series_type == query.series)
+        rows = rows.filter(VehicleProfile.plate_number.in_(events.distinct()))
 
     results: list[dict] = []
     for row in rows.order_by(VehicleProfile.last_seen.desc()).all():
