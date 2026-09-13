@@ -79,6 +79,42 @@ def seeded_db(tmp_path):
     return str(path)
 
 
+@pytest.fixture(autouse=True)
+def _streams_are_reachable(monkeypatch, request):
+    """Treat every test stream URL as reachable unless a test opts out.
+
+    These tests use made-up URLs (rtsp://host/stream) to exercise scheduling
+    and source selection; the real network check would turn every one of
+    them into a DNS failure. Tests about reachability itself are marked
+    `real_probe` and get the genuine check.
+    """
+    if request.node.get_closest_marker("real_probe"):
+        return
+    from src.cameras import stream_probe
+
+    monkeypatch.setattr(
+        stream_probe, "probe_stream",
+        lambda url, timeout=3.0: stream_probe.ProbeResult(ok=True, message="stubbed"),
+    )
+
+
+class _NoPreviewServer:
+    """Stand-in for a preview server whose port was unavailable."""
+    running = False
+    port = 0
+    error = "disabled in tests"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_preview_server(monkeypatch, request):
+    if request.node.get_closest_marker("preview_server"):
+        return
+    from src.cameras import preview_server
+
+    monkeypatch.setattr(preview_server, "get_preview_server",
+                        lambda *args, **kwargs: _NoPreviewServer())
+
+
 @pytest.fixture()
 def app(seeded_db, monkeypatch):
     """An AppTest factory bound to the seeded database.
@@ -242,6 +278,57 @@ class TestSourceSelectionFlow:
         reset_camera_manager()
 
 
+class TestStreamChecks:
+    def test_a_stream_card_never_shows_the_password(self, app):
+        from src.cameras.manager import get_camera_manager, reset_camera_manager
+        from src.utils.config import load_config
+
+        reset_camera_manager()
+        at = app()
+        at.get("radio")[0].set_value("RTSP stream").run()
+        at.get("text_input")[0].set_value("rtsp://admin:hunter2@10.1.2.3:554/11").run()
+        next(b for b in at.button if b.label == "Set stream").click().run()
+        _assert_clean(at, "after setting a stream with credentials")
+
+        card = next(m.value for m in at.markdown if "CAM001" in m.value and "Stream:" in m.value)
+        assert "hunter2" not in card
+        assert "admin:***@10.1.2.3" in card
+        reset_camera_manager()
+
+    @pytest.mark.real_probe
+    def test_test_stream_reports_an_unreachable_camera(self, app):
+        import socket
+
+        from src.cameras.manager import reset_camera_manager
+
+        closed = socket.socket(); closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]; closed.close()
+
+        reset_camera_manager()
+        at = app()
+        at.get("radio")[0].set_value("RTSP stream").run()
+        at.get("text_input")[0].set_value(f"rtsp://127.0.0.1:{port}/11").run()
+        next(b for b in at.button if b.label == "Test stream").click().run()
+        _assert_clean(at, "after testing an unreachable stream")
+        assert any("refused" in e.value for e in at.error)
+        reset_camera_manager()
+
+    @pytest.mark.real_probe
+    def test_test_stream_shows_a_preview_frame_from_a_real_source(self, app):
+        """The success path renders the grabbed frame on the page."""
+        from src.cameras.manager import reset_camera_manager
+
+        reset_camera_manager()
+        at = app()
+        at.get("radio")[0].set_value("RTSP stream").run()
+        # A real, decodable source standing in for a camera.
+        at.get("text_input")[0].set_value("ALPR.mp4").run()
+        next(b for b in at.button if b.label == "Test stream").click().run()
+        _assert_clean(at, "after testing a working source")
+        assert any("live" in s.value.lower() for s in at.success)
+        reset_camera_manager()
+
+
 class TestCameraWall:
     """The multi-camera feed view."""
 
@@ -287,6 +374,57 @@ class TestCameraWall:
             _assert_clean(at, "camera wall with a partial frame")
         finally:
             partial.unlink(missing_ok=True)
+
+
+class TestSmoothCameraFeeds:
+    """The camera wall plays continuous video instead of refreshing a still.
+
+    Reported: the feed "is not running smoothly". Video could only change
+    when the whole Streamlit page re-ran, every two seconds.
+    """
+
+    @pytest.fixture()
+    def real_server(self, tmp_path, monkeypatch):
+        import socket
+
+        from src.cameras import preview_server
+
+        probe = socket.socket(); probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]; probe.close()
+        server = preview_server.PreviewServer(tmp_path, host="127.0.0.1", port=port)
+        assert server.start(), server.error
+        monkeypatch.setattr(preview_server, "get_preview_server",
+                            lambda *args, **kwargs: server)
+        yield server
+        server.stop()
+
+    @pytest.mark.preview_server
+    def test_every_camera_gets_a_live_stream_player(self, app, real_server):
+        at = app()
+        _assert_clean(at, "camera wall with streaming")
+        players = at.get("iframe")
+        assert len(players) == 4
+        for player, camera_id in zip(players, ("CAM001", "CAM002", "CAM003", "CAM004")):
+            assert f":{real_server.port}/stream/" in player.proto.srcdoc
+            assert camera_id in player.proto.srcdoc
+
+    @pytest.mark.preview_server
+    def test_players_do_not_change_between_page_reruns(self, app, real_server):
+        """The heart of the fix. The page re-runs every couple of seconds
+        during processing; an iframe whose content changes is reloaded,
+        restarting the video. Identical content keeps it playing."""
+        at = app()
+        first = [p.proto.srcdoc for p in at.get("iframe")]
+        for _ in range(3):
+            at.run()
+        assert [p.proto.srcdoc for p in at.get("iframe")] == first
+
+    def test_without_the_stream_server_the_wall_still_works_and_says_why(self, app):
+        """A taken port costs smooth video, never the page."""
+        at = app()
+        _assert_clean(at, "camera wall without streaming")
+        assert not at.get("iframe")
+        assert any("Smooth video is unavailable" in c.value for c in at.caption)
 
 
 class TestTrajectoryTab:

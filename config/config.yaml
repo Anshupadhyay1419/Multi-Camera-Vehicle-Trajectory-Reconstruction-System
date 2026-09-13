@@ -234,6 +234,17 @@ api:
   # label.
   live_frames_dir: "data/live_frames"
   live_frame_fps: 8.0
+  # Camera-wall previews (multi-camera runs). Published faster and smaller
+  # than the single-gate feed above because the dashboard plays them as
+  # continuous video rather than refreshing a still image. Note a recorded
+  # video's preview can never be smoother than the pipeline processes it.
+  live_frames_fps: 15.0
+  live_frames_max_width: 960
+  # The dashboard serves those previews as MJPEG streams on this port, so the
+  # browser can play them without re-running the Streamlit page. The browser
+  # must be able to reach it -- open it in the firewall alongside 8501.
+  preview_host: "0.0.0.0"
+  preview_port: 8765
 
 dashboard:
   enabled: true

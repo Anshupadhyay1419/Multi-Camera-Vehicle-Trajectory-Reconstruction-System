@@ -536,6 +536,38 @@ tables are a handful of rows, so `_table()` renders them as escaped HTML:
 no Arrow, nothing to crash. (The original single-gate dashboard still uses
 `st.dataframe` and remains exposed to this.)
 
+### Camera feeds
+
+The Operations tab shows every camera's annotated video in a 2×2 wall, played
+as continuous **MJPEG streams** rather than still images.
+
+Streamlit can only change the page by re-running it, so a still image updated
+at most once per re-run — every 2 s while processing, a slideshow. Instead the
+dashboard process runs a small stream server (`src/cameras/preview_server.py`,
+port `api.preview_port`, default **8765**) and each panel is a plain `<img>`
+the browser plays natively. Each player's HTML is identical on every re-run,
+so the browser never reloads it and the video keeps playing while the status
+text around it updates.
+
+The pipeline publishes previews on a background thread
+(`LiveFramePublisher(background=True)`), downscaled to
+`api.live_frames_max_width` (960 px) at up to `api.live_frames_fps` (15 fps),
+so smooth video costs ALPR little. Measured on the Orin:
+
+| | Browser video | ALPR speed |
+|---|---|---|
+| Before (still image per page re-run) | 0.5 fps | — |
+| Recorded clip, previews on | 14.1 fps | 19.6 fps (21.6 with previews off) |
+| RTSP camera, previews on | 13.6 fps | 23.6 fps |
+
+Notes:
+
+- A recorded video's preview can never be smoother than the pipeline
+  processes it — the frames shown are the annotated outputs.
+- Viewing the dashboard from another machine requires port 8765 to be
+  reachable as well as 8501.
+- If the port is unavailable the wall falls back to still frames and says so.
+
 The sidebar carries a **session scope** picker. Each run of the camera queue
 is one session; scoping to a single run keeps repeated demos of the same
 video from blending into one another.

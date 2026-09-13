@@ -76,6 +76,25 @@ def store(tmp_path):
     return StatusStore(str(tmp_path / "status.json"))
 
 
+@pytest.fixture(autouse=True)
+def _streams_are_reachable(monkeypatch, request):
+    """Treat every test stream URL as reachable unless a test opts out.
+
+    These tests use made-up URLs (rtsp://host/stream) to exercise scheduling
+    and source selection; the real network check would turn every one of
+    them into a DNS failure. Tests about reachability itself are marked
+    `real_probe` and get the genuine check.
+    """
+    if request.node.get_closest_marker("real_probe"):
+        return
+    from src.cameras import stream_probe
+
+    monkeypatch.setattr(
+        stream_probe, "probe_stream",
+        lambda url, timeout=3.0: stream_probe.ProbeResult(ok=True, message="stubbed"),
+    )
+
+
 class RecordingRunner:
     """Fake pipeline that records how it was called and when it overlapped."""
 
@@ -216,6 +235,32 @@ class TestFailureIsolation:
         states = {c["camera_id"]: c["state"] for c in manager.get_status()["cameras"]}
         assert states["CAM002"] == CameraState.FAILED.value
         assert states["CAM001"] == states["CAM003"] == CameraState.COMPLETED.value
+
+    @pytest.mark.real_probe
+    def test_an_unreachable_stream_fails_in_seconds_with_a_reason(self, registry, store):
+        """Reported bug: an offline RTSP camera froze the queue for ~3 minutes
+        (5 OpenCV opens x ~30s) while the dashboard showed "No frames yet"."""
+        import socket
+
+        closed = socket.socket(); closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]; closed.close()
+
+        runner = RecordingRunner()
+        manager = CameraManager({"video": {}}, registry, runner, store)
+        manager.set_rtsp_url("CAM001", f"rtsp://admin:pw123@127.0.0.1:{port}/11")
+
+        started = time.monotonic()
+        manager.start(camera_ids=["CAM001", "CAM002"])
+        assert manager.wait(timeout=30)
+
+        assert time.monotonic() - started < 10.0
+        assert "CAM001" not in runner.order, "the pipeline was started on a dead stream"
+        assert runner.order == ["CAM002"], "the queue did not move on"
+        camera = next(c for c in manager.get_status()["cameras"] if c["camera_id"] == "CAM001")
+        assert camera["state"] == CameraState.FAILED.value
+        assert "refused" in camera["error"]
+        logs = " ".join(manager.get_status()["logs"])
+        assert "pw123" not in logs, "the stream password leaked into the log"
 
     def test_a_pipeline_crash_fails_one_camera_and_the_queue_continues(self, registry, store):
         def runner(config, camera_meta, session_context, progress,

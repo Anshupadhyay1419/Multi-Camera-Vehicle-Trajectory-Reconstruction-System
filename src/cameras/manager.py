@@ -726,6 +726,23 @@ class CameraManager:
             # with a message naming the camera.
             source = create_video_source(camera, self._config)
             source.validate()
+
+            # An unreachable live camera used to freeze the queue for about
+            # three minutes: OpenCV blocks ~30s per open attempt and
+            # FrameCapture retries five times, while the dashboard showed
+            # nothing but "Connecting". A TCP check answers the same question
+            # in seconds and names the actual problem.
+            if source.is_live:
+                from src.cameras.stream_probe import mask_credentials, probe_stream
+
+                self._append_log(
+                    f"Checking {camera.camera_name} stream "
+                    f"{mask_credentials(source.uri)}…"
+                )
+                self._publish()
+                reachable = probe_stream(source.uri)
+                if not reachable.ok:
+                    raise VideoSourceError(reachable.message)
             progress.total_frames = source.total_frames()
 
             reporter = ProgressReporter(

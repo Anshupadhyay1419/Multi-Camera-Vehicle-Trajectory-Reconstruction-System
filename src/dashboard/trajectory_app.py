@@ -44,9 +44,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from src.cameras.manager import get_camera_manager, reset_camera_manager
+from src.cameras.preview_server import get_preview_server
 from src.cameras.models import CameraState, SessionState
 from src.cameras.registry import CameraConfigError, load_camera_registry
 from src.cameras.sources import VideoSourceError
+from src.cameras.stream_probe import grab_preview_frame, mask_credentials, probe_stream
 from src.database import db as database
 from src.mapping import render_trajectory_map
 from src.trajectory import TrajectoryEngine, trajectory_to_geojson
@@ -296,7 +298,7 @@ def _describe_source(camera) -> tuple[bool, str]:
     if not source:
         return False, "No source set"
     if camera.source_type.value == "rtsp":
-        return True, f"Stream: {source}"
+        return True, f"Stream: {mask_credentials(source)}"
     return (True, f"Video: {Path(source).name}") if Path(source).is_file() else (
         False, f"Missing file: {Path(source).name}"
     )
@@ -358,18 +360,28 @@ def _render_camera_source(camera, manager, running: bool) -> None:
             label_visibility="collapsed",
             disabled=running,
         )
-        if st.button(
+        check_key = f"stream_check_{camera_id}"
+        buttons = st.columns(2)
+        if buttons[0].button(
             "Set stream",
             key=f"set_rtsp_{camera_id}",
             use_container_width=True,
             disabled=running,
         ):
             try:
-                manager.set_rtsp_url(camera_id, st.session_state[url_key])
+                updated = manager.set_rtsp_url(camera_id, st.session_state[url_key])
                 # The uploaded-file marker is deliberately NOT cleared: the
                 # file_uploader keeps holding the previous file, so clearing
                 # it meant that merely switching the radio back to "Upload
                 # video" re-saved that file and silently replaced the stream.
+                #
+                # Check reachability now. Saving is still allowed -- a camera
+                # can be offline for a moment -- but the operator should find
+                # out here, not three minutes into a run.
+                result = probe_stream(updated.rtsp_url)
+                st.session_state[check_key] = {
+                    "ok": result.ok, "message": result.message, "frame": None,
+                }
                 st.rerun()
             except VideoSourceError as exc:
                 # Validated up front, so a typo is caught here rather than
@@ -377,6 +389,35 @@ def _render_camera_source(camera, manager, running: bool) -> None:
                 st.error(str(exc))
             except KeyError as exc:
                 st.error(f"Unknown camera: {exc}")
+
+        if buttons[1].button(
+            "Test stream",
+            key=f"test_rtsp_{camera_id}",
+            use_container_width=True,
+            disabled=running or not st.session_state.get(url_key),
+            help="Connect to the stream and grab one frame, without running ALPR.",
+        ):
+            with st.spinner("Connecting to the stream…"):
+                result, frame = grab_preview_frame(st.session_state[url_key])
+            preview = None
+            if frame is not None:
+                import cv2
+
+                ok, encoded = cv2.imencode(".jpg", frame)
+                preview = encoded.tobytes() if ok else None
+            st.session_state[check_key] = {
+                "ok": result.ok, "message": result.message, "frame": preview,
+            }
+
+        check = st.session_state.get(check_key)
+        if check:
+            if check["ok"]:
+                st.success(check["message"])
+            else:
+                st.error(check["message"])
+            if check.get("frame"):
+                st.image(check["frame"], caption="Preview frame from the stream",
+                         **{_IMAGE_FIT_KWARG: True})
 
 
 def render_camera_panel(status: dict) -> None:
@@ -544,6 +585,73 @@ def _live_frame_bytes(camera_id: str) -> Optional[bytes]:
         return None
 
 
+# Height of each camera's video panel on the wall, in CSS pixels.
+FEED_PANEL_HEIGHT = 300
+
+
+def _preview_server():
+    """The MJPEG preview server for the camera wall, started on first use."""
+    api_cfg = _bootstrap()["config"].get("api") or {}
+    frames_dir = Path(api_cfg.get("live_frames_dir", "data/live_frames"))
+    if not frames_dir.is_absolute():
+        frames_dir = REPO_ROOT / frames_dir
+    return get_preview_server(
+        frames_dir,
+        host=str(api_cfg.get("preview_host", "0.0.0.0")),
+        port=int(api_cfg.get("preview_port", 8765)),
+    )
+
+
+def _stream_player_html(camera_id: str, port: int) -> str:
+    """A self-contained player for one camera's MJPEG preview stream.
+
+    Depends ONLY on the camera id and the port. That is deliberate: Streamlit
+    re-runs this page every couple of seconds during processing, and an
+    iframe whose content changes between runs is reloaded -- restarting the
+    video each time, which is the choppiness this replaces. Identical content
+    lets the browser keep the same player and the same open stream, so the
+    video plays continuously while the status text around it updates.
+
+    The stream is served on its own port, so its address is built in the
+    browser from the hostname the operator actually used to open the
+    dashboard (localhost on the Jetson, its LAN IP from another machine).
+    """
+    camera_json = json.dumps(camera_id)
+    return f"""
+<div style="width:100%;height:{FEED_PANEL_HEIGHT}px;background:#111;border-radius:8px;overflow:hidden">
+  <img id="feed" alt="Live preview"
+       style="width:100%;height:100%;object-fit:contain;display:block">
+</div>
+<script>
+(function () {{
+  var img = document.getElementById("feed");
+  var host = "localhost";
+  try {{ host = window.parent.location.hostname || host; }}
+  catch (e) {{ try {{ host = new URL(document.referrer).hostname || host; }} catch (e2) {{}} }}
+  var url = "http://" + host + ":{int(port)}/stream/" + encodeURIComponent({camera_json});
+  // Reconnect if the stream cannot be reached yet, instead of leaving a
+  // broken-image icon in the panel.
+  img.onerror = function () {{ setTimeout(connect, 2000); }};
+  function connect() {{ img.src = url + "?t=" + Date.now(); }}
+  connect();
+}})();
+</script>
+"""
+
+
+def _panel_status(camera, state: str, is_live: bool, progress) -> tuple[str, str]:
+    """(message, css) explaining an empty panel, or ("", "") when there is none."""
+    if state == CameraState.FAILED.value and progress and progress.get("error"):
+        return f"Could not start: {progress['error']}", "color:#dc2626"
+    if is_live and camera.source_type.value == "rtsp":
+        return "Connecting to the stream…", ""
+    if is_live:
+        return "Starting…", ""
+    if state == CameraState.SKIPPED.value:
+        return "Skipped — no source set", ""
+    return "Waiting for its turn in the queue", ""
+
+
 def render_camera_wall(status: dict) -> None:
     """All cameras' feeds in one view, two per row.
 
@@ -559,8 +667,16 @@ def render_camera_wall(status: dict) -> None:
         return
 
     progress_by_id = {c["camera_id"]: c for c in status.get("cameras", [])}
+    server = _preview_server()
+    streaming = server.running
 
     st.subheader("Camera feeds")
+    if not streaming:
+        st.caption(
+            f"Smooth video is unavailable ({server.error}); showing still frames "
+            "that refresh every few seconds instead. Free the port or change "
+            "`api.preview_port` in config.yaml, then restart the dashboard."
+        )
     st.caption(
         "Annotated frames from the ALPR pipeline — boxes are tracked "
         "vehicles, green once a plate has been stored. Cameras run one at a "
@@ -587,13 +703,31 @@ def render_camera_wall(status: dict) -> None:
                 frame = _live_frame_bytes(camera.camera_id)
                 if frame:
                     any_frame = True
+
+                if streaming:
+                    # Continuous video, independent of page re-runs.
+                    components.html(
+                        _stream_player_html(camera.camera_id, server.port),
+                        height=FEED_PANEL_HEIGHT + 8,
+                    )
+                    if not frame:
+                        message, css = _panel_status(camera, state, is_live, progress)
+                        st.markdown(
+                            f'<div style="font-size:.8rem;opacity:.8;{css}">'
+                            f"{html_escape(message)}</div>",
+                            unsafe_allow_html=True,
+                        )
+                elif frame:
+                    # Fallback when the stream server could not start: a still
+                    # frame refreshed on each page re-run.
                     st.image(frame, **{_IMAGE_FIT_KWARG: True})
                 else:
+                    message, css = _panel_status(camera, state, is_live, progress)
                     st.markdown(
-                        '<div style="height:150px;border:1px dashed rgba(128,128,128,.4);'
+                        '<div style="min-height:150px;border:1px dashed rgba(128,128,128,.4);'
                         'border-radius:8px;display:flex;align-items:center;'
-                        'justify-content:center;opacity:.55;font-size:.82rem">'
-                        'No frames yet</div>',
+                        'justify-content:center;text-align:center;padding:12px;'
+                        f'font-size:.82rem;opacity:.75;{css}">{html_escape(message)}</div>',
                         unsafe_allow_html=True,
                     )
 

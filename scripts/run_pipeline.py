@@ -446,10 +446,25 @@ def run_pipeline(
     else:
         live_frame_target = api_cfg.get("live_frame_path", "data/live_frame.jpg")
 
+    # Multi-camera runs feed the dashboard's continuous preview streams, which
+    # play every frame they are given -- so they publish faster than the
+    # single-gate snapshot feed, and downscaled, since a preview panel is far
+    # smaller than the source video.
+    if session_context and camera_meta.get("camera_id"):
+        preview_fps = float(api_cfg.get("live_frames_fps", 15.0))
+        preview_width = api_cfg.get("live_frames_max_width", 960)
+    else:
+        preview_fps = float(api_cfg.get("live_frame_fps", 8.0))
+        preview_width = None
+
     live_frame_publisher = (
         LiveFramePublisher(
             path=live_frame_target,
-            max_fps=float(api_cfg.get("live_frame_fps", 8.0)),
+            max_fps=preview_fps,
+            max_width=preview_width,
+            # Encode previews off the pipeline thread for camera-wall runs,
+            # so showing smooth video does not slow ALPR down.
+            background=preview_width is not None,
         )
         if api_cfg.get("live_stream_enabled", True) else None
     )
@@ -791,7 +806,10 @@ def run_pipeline(
                                 track_display_labels[tid] = (plate_val, True)
                                 continue
 
-            if live_frame_publisher is not None:
+            # Only draw the overlay when the publisher will actually write
+            # this frame -- drawing copies the whole frame, and at a capped
+            # preview rate most frames would be discarded right after.
+            if live_frame_publisher is not None and live_frame_publisher.is_due():
                 live_frame_publisher.publish(
                     _draw_live_overlay(frame, tracks, track_display_labels)
                 )
@@ -851,6 +869,8 @@ def run_pipeline(
                 events_stored += 1
 
         frame_capture.release()
+        if live_frame_publisher is not None:
+            live_frame_publisher.close()
 
         # Release the OCR backend's GPU resources. Matters because the
         # multi-camera manager runs one pipeline per camera inside a single
