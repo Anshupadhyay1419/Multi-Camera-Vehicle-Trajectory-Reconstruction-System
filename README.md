@@ -708,7 +708,7 @@ pytest tests/ --cov=src --cov-report=term-missing
 
 ##  Model Performance
 
-### Training (100 epochs, 1398 images, NVIDIA RTX 3050)
+### Training (100 epochs, 5480 images, NVIDIA RTX 3050)
 
 | Metric | Value |
 |---|---|
@@ -719,7 +719,7 @@ pytest tests/ --cov=src --cov-report=term-missing
 | Training time | 6.29 hours |
 | Inference speed | 26.4 ms/image |
 
-### Test set (300 held-out images)
+### Test set (500 held-out images)
 
 | Metric | Value |
 |---|---|
