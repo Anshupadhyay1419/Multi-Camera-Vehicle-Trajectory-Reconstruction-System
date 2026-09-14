@@ -116,14 +116,20 @@ def _no_real_preview_server(monkeypatch, request):
 
 
 @pytest.fixture()
-def app(seeded_db, monkeypatch):
-    """An AppTest factory bound to the seeded database.
+def app(seeded_db, camera_config_file, monkeypatch):
+    """An AppTest factory bound to the seeded database and test cameras.
 
-    ALPR_DB_PATH is the documented override that load_config() honours, so
-    this points every layer the page touches at the test database without
-    editing config.yaml.
+    ALPR_DB_PATH and ALPR_CAMERA_CONFIG are the documented overrides that the
+    page honours, so this points every layer it touches at the test database
+    and this suite's own four cameras -- without editing config.yaml, and
+    without depending on (or rewriting) the cameras the operator has
+    configured on this device.
     """
+    from src.cameras.manager import reset_camera_manager
+
     monkeypatch.setenv("ALPR_DB_PATH", seeded_db)
+    monkeypatch.setenv("ALPR_CAMERA_CONFIG", str(camera_config_file))
+    reset_camera_manager()
     streamlit.cache_resource.clear()
     streamlit.cache_data.clear()
 
@@ -135,8 +141,23 @@ def app(seeded_db, monkeypatch):
         return at
 
     yield build
+    reset_camera_manager()
     streamlit.cache_resource.clear()
     streamlit.cache_data.clear()
+
+
+def _source_picker(at: AppTest, camera_id: str = "CAM001"):
+    """One camera's Upload/RTSP picker, found by its key.
+
+    By key, never by index: the page renders other radios too (the heatmap
+    view on the Home tab), and which one comes first is a layout detail.
+    """
+    return next(r for r in at.get("radio") if r.key == f"kind_{camera_id}")
+
+
+def _stream_url_box(at: AppTest, camera_id: str = "CAM001"):
+    """One camera's RTSP URL box, found by its key rather than by index."""
+    return next(t for t in at.get("text_input") if t.key == f"rtsp_url_{camera_id}")
 
 
 def _assert_clean(at: AppTest, what: str) -> None:
@@ -154,6 +175,61 @@ def _session_scope_box(at: AppTest):
         if box.options and box.options[0] == "All sessions":
             return box
     raise AssertionError("no session-scope selectbox on the page")
+
+
+class TestPageLayout:
+    """Three pages, each with one job.
+
+    Home is the watch page: what is happening and how to look something up.
+    Operations is the control page: sources, the run, and what it produced.
+    Trajectory is one vehicle's route. A section on the wrong page is a
+    regression -- the point of the split is that the page somebody leaves
+    open all day does not scroll past controls they touch once a run.
+    """
+
+    HOME_SECTIONS = ["Blacklisted vehicles", "Camera feeds",
+                     "Search vehicle by plate number", "Search vehicles by description",
+                     "Traffic heatmap"]
+    OPERATIONS_SECTIONS = ["Cameras", "Live Processing Status", "Statistics"]
+
+    def test_the_page_offers_home_operations_and_trajectory(self, app):
+        at = app()
+        _assert_clean(at, "initial render")
+        tabs = [tab.label for tab in at.get("tab")]
+        assert tabs[:3] == ["Home", "Operations", "Trajectory"]
+
+    def test_every_section_is_rendered_exactly_once(self, app):
+        at = app()
+        headings = [h.value for h in at.subheader]
+        for section in self.HOME_SECTIONS + self.OPERATIONS_SECTIONS:
+            assert headings.count(section) == 1, f"{section}: {headings}"
+
+    def test_home_shows_the_five_watch_sections_in_order(self, app):
+        at = app()
+        headings = [h.value for h in at.subheader]
+        positions = [headings.index(section) for section in self.HOME_SECTIONS]
+        assert positions == sorted(positions), (
+            f"Home sections are out of order: {headings}"
+        )
+        # And they come before the Operations controls.
+        assert max(positions) < min(headings.index(s) for s in self.OPERATIONS_SECTIONS)
+
+    def test_the_operations_page_keeps_only_the_control_sections(self, app):
+        """Nothing from Home is duplicated there -- checked by the
+        exactly-once test above -- and the run controls are all present."""
+        at = app()
+        headings = [h.value for h in at.subheader]
+        for section in self.OPERATIONS_SECTIONS:
+            assert section in headings
+        assert any(b.label == "START PROCESSING" for b in at.button)
+
+    def test_a_plate_search_on_home_opens_the_trajectory_page(self, app):
+        at = app()
+        next(t for t in at.text_input if t.key == "search_input").set_value("DL8CA1234")
+        at = next(b for b in at.button if b.label == "Search").click().run()
+        _assert_clean(at, "searching from Home")
+        assert at.session_state["active_plate"] == "DL8CA1234"
+        assert any("Trajectory" in i.value for i in at.info)
 
 
 class TestOperationsTab:
@@ -183,20 +259,20 @@ class TestOperationsTab:
     def test_switching_a_camera_to_rtsp_does_not_crash_the_page(self, app):
         """The exact interaction that used to segfault the server."""
         at = app()
-        at.get("radio")[0].set_value("RTSP stream").run()
+        _source_picker(at).set_value("RTSP stream").run()
         _assert_clean(at, "after switching to RTSP")
         assert len(at.get("file_uploader")) == 3, "camera 1 should now show a URL box"
         assert any("RTSP URL" in t.label for t in at.get("text_input"))
 
     def test_switching_every_camera_back_and_forth(self, app):
         at = app()
-        for index in range(4):
-            at.get("radio")[index].set_value("RTSP stream").run()
-            _assert_clean(at, f"camera {index} -> RTSP")
+        for index in range(1, 5):
+            _source_picker(at, f"CAM00{index}").set_value("RTSP stream").run()
+            _assert_clean(at, f"camera CAM00{index} -> RTSP")
         assert len(at.get("file_uploader")) == 0
-        for index in range(4):
-            at.get("radio")[index].set_value("Upload video").run()
-            _assert_clean(at, f"camera {index} -> upload")
+        for index in range(1, 5):
+            _source_picker(at, f"CAM00{index}").set_value("Upload video").run()
+            _assert_clean(at, f"camera CAM00{index} -> upload")
         assert len(at.get("file_uploader")) == 4
 
     def test_repeated_reruns_stay_stable(self, app):
@@ -218,19 +294,30 @@ class TestSourceSelectionFlow:
     """
 
     def _manager(self):
+        """The page's own manager.
+
+        Built from the SAME camera config the page is pointed at (see the
+        `app` fixture): get_camera_manager is a process singleton, so naming
+        the deployment's real config here would hand the page the operator's
+        cameras instead of this suite's.
+        """
+        import os
+
         from src.cameras.manager import get_camera_manager
         from src.utils.config import load_config
 
-        return get_camera_manager(load_config("config/config.yaml"),
-                                  "config/camera_config.yaml")
+        return get_camera_manager(
+            load_config("config/config.yaml"),
+            os.environ["ALPR_CAMERA_CONFIG"],
+        )
 
     def test_setting_an_rtsp_url_actually_changes_the_source(self, app):
         from src.cameras.manager import reset_camera_manager
 
         reset_camera_manager()
         at = app()
-        at.get("radio")[0].set_value("RTSP stream").run()
-        at.get("text_input")[0].set_value("rtsp://192.168.1.50:554/stream1").run()
+        _source_picker(at).set_value("RTSP stream").run()
+        _stream_url_box(at).set_value("rtsp://192.168.1.50:554/stream1").run()
         next(b for b in at.button if b.label == "Set stream").click().run()
         _assert_clean(at, "after setting an RTSP URL")
 
@@ -247,14 +334,14 @@ class TestSourceSelectionFlow:
 
         reset_camera_manager()
         at = app()
-        at.get("radio")[0].set_value("RTSP stream").run()
-        at.get("text_input")[0].set_value("rtsp://host/stream").run()
+        _source_picker(at).set_value("RTSP stream").run()
+        _stream_url_box(at).set_value("rtsp://host/stream").run()
         next(b for b in at.button if b.label == "Set stream").click().run()
 
         for _ in range(3):
             at.run()
-        at.get("radio")[0].set_value("Upload video").run()
-        at.get("radio")[0].set_value("RTSP stream").run()
+        _source_picker(at).set_value("Upload video").run()
+        _source_picker(at).set_value("RTSP stream").run()
         _assert_clean(at, "after toggling the source kind")
 
         camera = self._manager().registry.require("CAM001")
@@ -268,8 +355,8 @@ class TestSourceSelectionFlow:
         reset_camera_manager()
         at = app()
         before = self._manager().registry.require("CAM001").source_type.value
-        at.get("radio")[0].set_value("RTSP stream").run()
-        at.get("text_input")[0].set_value("192.168.1.50/not-a-url").run()
+        _source_picker(at).set_value("RTSP stream").run()
+        _stream_url_box(at).set_value("192.168.1.50/not-a-url").run()
         next(b for b in at.button if b.label == "Set stream").click().run()
 
         _assert_clean(at, "after a bad URL")
@@ -285,8 +372,8 @@ class TestStreamChecks:
 
         reset_camera_manager()
         at = app()
-        at.get("radio")[0].set_value("RTSP stream").run()
-        at.get("text_input")[0].set_value("rtsp://admin:hunter2@10.1.2.3:554/11").run()
+        _source_picker(at).set_value("RTSP stream").run()
+        _stream_url_box(at).set_value("rtsp://admin:hunter2@10.1.2.3:554/11").run()
         next(b for b in at.button if b.label == "Set stream").click().run()
         _assert_clean(at, "after setting a stream with credentials")
 
@@ -306,8 +393,8 @@ class TestStreamChecks:
 
         reset_camera_manager()
         at = app()
-        at.get("radio")[0].set_value("RTSP stream").run()
-        at.get("text_input")[0].set_value(f"rtsp://127.0.0.1:{port}/11").run()
+        _source_picker(at).set_value("RTSP stream").run()
+        _stream_url_box(at).set_value(f"rtsp://127.0.0.1:{port}/11").run()
         next(b for b in at.button if b.label == "Test stream").click().run()
         _assert_clean(at, "after testing an unreachable stream")
         assert any("refused" in e.value for e in at.error)
@@ -320,9 +407,9 @@ class TestStreamChecks:
 
         reset_camera_manager()
         at = app()
-        at.get("radio")[0].set_value("RTSP stream").run()
+        _source_picker(at).set_value("RTSP stream").run()
         # A real, decodable source standing in for a camera.
-        at.get("text_input")[0].set_value("ALPR.mp4").run()
+        _stream_url_box(at).set_value("ALPR.mp4").run()
         next(b for b in at.button if b.label == "Test stream").click().run()
         _assert_clean(at, "after testing a working source")
         assert any("live" in s.value.lower() for s in at.success)
@@ -338,6 +425,33 @@ class TestCameraWall:
         captions = " ".join(c.value for c in at.caption)
         for camera_id in ("CAM001", "CAM002", "CAM003", "CAM004"):
             assert camera_id in captions
+
+    def test_four_feeds_share_a_row_and_a_fifth_starts_the_next(self, app):
+        """One glance at the whole deployment, not four big screens: four
+        panels across, and a newly added camera wraps onto the next row
+        instead of shrinking the first four."""
+        from src.dashboard.trajectory_app import CAMERAS_PER_ROW, wall_rows
+
+        assert CAMERAS_PER_ROW == 4
+        assert [len(row) for row in wall_rows(list(range(4)))] == [4]
+        assert [len(row) for row in wall_rows(list(range(5)))] == [4, 1]
+        assert [len(row) for row in wall_rows(list(range(9)))] == [4, 4, 1]
+        assert wall_rows([]) == []
+        # Order is preserved, so panel 5 is the camera that was added last.
+        assert wall_rows(["a", "b", "c", "d", "e"])[1] == ["e"]
+
+    def test_every_camera_keeps_a_panel_when_one_is_added(self, app):
+        at = self._add_camera(app())
+        _assert_clean(at, "camera wall with a fifth camera")
+        captions = " ".join(c.value for c in at.caption)
+        for camera_id in ("CAM001", "CAM002", "CAM003", "CAM004", "CAM005"):
+            assert camera_id in captions, f"{camera_id} lost its feed panel"
+
+    def _add_camera(self, at):
+        next(t for t in at.text_input if t.key == "new_camera_place").set_value("Rajiv Chowk")
+        next(t for t in at.text_input if t.key == "new_camera_lat").set_value("28.6328")
+        next(t for t in at.text_input if t.key == "new_camera_lon").set_value("77.2197")
+        return next(b for b in at.button if b.key == "add_camera_go").click().run()
 
     def test_frames_appear_when_the_pipeline_publishes_them(self, app, tmp_path):
         """Each camera shows its OWN frame -- one shared file would put the
@@ -374,6 +488,157 @@ class TestCameraWall:
             _assert_clean(at, "camera wall with a partial frame")
         finally:
             partial.unlink(missing_ok=True)
+
+
+class TestAddingAndRemovingCameras:
+    """Operators manage the camera list from this page: a camera added here
+    gets everything the shipped ones have -- source controls, a feed panel,
+    a queue position -- renaming one relabels it, and removing one takes its
+    panel away with it."""
+
+    def _manager(self):
+        import os
+
+        from src.cameras.manager import get_camera_manager
+        from src.utils.config import load_config
+
+        return get_camera_manager(
+            load_config("config/config.yaml"), os.environ["ALPR_CAMERA_CONFIG"]
+        )
+
+    @pytest.fixture()
+    def own_config(self, camera_config_file):
+        """The registry the page is pointed at (see the `app` fixture).
+
+        Named here so a test can reload it and check that a change was
+        actually persisted.
+        """
+        return camera_config_file
+
+    def _camera_ids(self, at: AppTest) -> set[str]:
+        """Camera ids named in the wall's panel captions and camera cards."""
+        text = " ".join(c.value for c in at.caption)
+        text += " ".join(m.value for m in at.markdown)
+        return {token for token in ("CAM001", "CAM002", "CAM003", "CAM004", "CAM005")
+                if token in text}
+
+    def _add(self, at: AppTest, place: str, latitude: str, longitude: str) -> AppTest:
+        next(t for t in at.text_input if t.key == "new_camera_place").set_value(place)
+        next(t for t in at.text_input if t.key == "new_camera_lat").set_value(latitude)
+        next(t for t in at.text_input if t.key == "new_camera_lon").set_value(longitude)
+        return next(b for b in at.button if b.key == "add_camera_go").click().run()
+
+    def test_adding_a_camera_gives_it_a_card_a_feed_and_the_same_controls(
+        self, app, own_config
+    ):
+        at = app()
+        assert "CAM005" not in self._camera_ids(at)
+
+        at = self._add(at, "Rajiv Chowk", "28.6328", "77.2197")
+        _assert_clean(at, "adding a camera")
+
+        assert "CAM005" in self._camera_ids(at), "the new camera has no card or feed"
+        page = " ".join(m.value for m in at.markdown) + " ".join(
+            c.value for c in at.caption
+        )
+        assert "Rajiv Chowk" in page
+        assert "28.6328" in page, "its coordinates are shown like the others"
+        # The same per-camera source controls as every shipped camera.
+        assert any(r.key == "kind_CAM005" for r in at.radio)
+        # One more source picker and one more uploader than the four shipped
+        # cameras: the new site is configured exactly like them.
+        assert len([r for r in at.radio if (r.key or "").startswith("kind_")]) == 5
+        assert len(at.get("file_uploader")) == 5
+        # And its own panel on the camera wall.
+        assert any(b.key == "remove_CAM005" for b in at.button)
+
+    def test_a_camera_without_usable_coordinates_is_refused(self, app, own_config):
+        at = self._add(app(), "Nowhere", "north", "77.2")
+        _assert_clean(at, "rejecting a bad coordinate")
+        assert any("must be a number" in e.value for e in at.error)
+        assert "CAM005" not in self._camera_ids(at)
+
+    def test_renaming_a_camera_relabels_it_everywhere_on_the_page(
+        self, app, own_config
+    ):
+        at = app()
+        assert "Connaught Place" in " ".join(m.value for m in at.markdown)
+
+        next(t for t in at.text_input if t.key == "rename_CAM002").set_value("Rajiv Chowk")
+        at = next(b for b in at.button if b.key == "rename_go_CAM002").click().run()
+        _assert_clean(at, "renaming a camera")
+
+        # The camera card and its feed panel carry the new name...
+        cards = [m.value for m in at.markdown if "CAM002" in m.value or "2." in m.value]
+        assert any("Rajiv Chowk" in card for card in cards)
+        assert not any("Connaught Place" in card and "kind_" not in card
+                       for card in cards if card.strip().startswith("**2."))
+        # ...while detections already recorded keep the name they were
+        # stored with: the statistics table still reads Connaught Place,
+        # because that is what the site was called when they were captured.
+        statistics = " ".join(m.value for m in at.markdown if "<table" in m.value)
+        assert "Connaught Place" in statistics
+
+        # Only the label changed: same id, same queue position, same controls.
+        camera = self._manager().registry.require("CAM002")
+        assert camera.camera_name == "Rajiv Chowk" and camera.order == 2
+        assert any(r.key == "kind_CAM002" for r in at.radio)
+
+    def test_a_blank_rename_is_refused(self, app, own_config):
+        at = app()
+        next(t for t in at.text_input if t.key == "rename_CAM002").set_value("   ")
+        at = next(b for b in at.button if b.key == "rename_go_CAM002").click().run()
+        _assert_clean(at, "rejecting a blank rename")
+        assert any("place name" in e.value for e in at.error)
+        assert self._manager().registry.require("CAM002").camera_name == "Connaught Place"
+
+    def test_a_rename_survives_a_reload_of_the_page(self, app, own_config):
+        at = app()
+        next(t for t in at.text_input if t.key == "rename_CAM002").set_value("Rajiv Chowk")
+        at = next(b for b in at.button if b.key == "rename_go_CAM002").click().run()
+        _assert_clean(at, "renaming a camera")
+
+        from src.cameras.manager import reset_camera_manager
+        from src.cameras.registry import load_camera_registry
+
+        reset_camera_manager()
+        assert load_camera_registry(str(own_config)).require("CAM002").camera_name == (
+            "Rajiv Chowk"
+        )
+
+    def test_removing_a_camera_takes_its_feed_panel_with_it(self, app, own_config):
+        at = app()
+        assert "CAM002" in self._camera_ids(at)
+
+        at = next(b for b in at.button if b.key == "remove_CAM002").click().run()
+        _assert_clean(at, "asking to remove a camera")
+        # Two steps: one stray click must not delete a site.
+        assert "CAM002" in self._camera_ids(at)
+        assert any("Remove" in w.value for w in at.warning)
+
+        at = next(b for b in at.button if b.key == "remove_yes_CAM002").click().run()
+        _assert_clean(at, "removing a camera")
+        assert "CAM002" not in self._camera_ids(at)
+        assert not [b for b in at.button if (b.key or "").endswith("_CAM002")]
+
+    def test_cancelling_keeps_the_camera(self, app, own_config):
+        at = app()
+        at = next(b for b in at.button if b.key == "remove_CAM002").click().run()
+        at = next(b for b in at.button if b.key == "remove_no_CAM002").click().run()
+        _assert_clean(at, "cancelling a removal")
+        assert "CAM002" in self._camera_ids(at)
+
+    def test_the_change_survives_a_reload_of_the_page(self, app, own_config):
+        at = self._add(app(), "Rajiv Chowk", "28.6328", "77.2197")
+        _assert_clean(at, "adding a camera")
+
+        from src.cameras.manager import reset_camera_manager
+        from src.cameras.registry import load_camera_registry
+
+        reset_camera_manager()
+        reloaded = load_camera_registry(str(own_config))
+        assert reloaded.require("CAM005").camera_name == "Rajiv Chowk"
+        assert "CAM005" in self._camera_ids(app())
 
 
 class TestSmoothCameraFeeds:
@@ -426,7 +691,7 @@ class TestSmoothCameraFeeds:
         at = app()
         _assert_clean(at, "camera wall without streaming")
         assert not [f for f in at.get("iframe") if "/stream/" in f.proto.srcdoc]
-        assert any("Smooth video is unavailable" in c.value for c in at.caption)
+        assert any("Live video unavailable" in w.value for w in at.warning)
 
     def test_the_traffic_heatmap_renders(self, app):
         at = app()

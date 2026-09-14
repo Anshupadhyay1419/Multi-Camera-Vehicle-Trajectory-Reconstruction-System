@@ -1,16 +1,31 @@
 """
-CameraManager -- runs the camera queue, strictly one camera at a time.
+CameraManager -- runs the camera queue: recorded files in turn, live
+streams together.
 
-    load registry -> accept uploads -> build queue -> run each in turn
+    load registry -> accept uploads -> build queue -> recorded, one by one
+                                                   -> live, all at once
 
-Sequential by design, not by accident. The Jetson has one GPU and the ALPR
-pipeline already saturates it; four concurrent cameras would contend for the
-same TensorRT execution context and finish later than four run in turn,
-while making every per-camera latency figure meaningless. It is also what
-the demo needs: each camera's pass completes before the next opens its
-source, so the timestamps ordering a reconstructed trajectory are
+RECORDED cameras are sequential by design, not by accident. The Jetson has
+one GPU and the ALPR pipeline already saturates it; four concurrent files
+would contend for the same TensorRT execution context and finish later than
+four run in turn, while making every per-camera latency figure meaningless.
+It is also what the demo needs: each camera's pass completes before the next
+opens its source, so the timestamps ordering a reconstructed trajectory are
 monotonically increasing across the queue even though all four cameras may
 be replaying the same footage.
+
+LIVE (RTSP) cameras cannot work that way. A stream carries what is happening
+NOW: sampling camera 1 for a minute while cameras 2-4 are not even connected
+does not delay their footage, it discards it, and a vehicle that passes
+camera 2 during camera 1's turn is simply never seen. So every live camera
+starts at once, on its own thread, and keeps running until the operator
+presses STOP -- which is also what a surveillance wall is expected to do.
+They share one set of GPU models through a lock (see
+PipelineModels.shared()), so the GPU still does one inference at a time while
+four streams are decoded and tracked in parallel.
+
+A queue may mix the two: the recorded files run through first, then the live
+cameras start together and stay up.
 
 The ALPR pipeline itself is untouched. This module calls the existing
 `run_pipeline()` once per camera, handing it that camera's metadata, a
@@ -173,12 +188,6 @@ class CameraManager:
             processing.get("status_file", "data/processing_status.json")
         )
         self._continue_on_error = bool(processing.get("continue_on_error", True))
-        # How long each LIVE camera is sampled before the queue moves on. A
-        # recorded file ends by itself and ignores this; an RTSP stream never
-        # does, so without a bound the queue would stop dead on its first
-        # live camera. 0 or None means "run until stopped", which is only
-        # sensible for a single-camera queue.
-        self._live_duration_seconds = processing.get("live_duration_seconds", 60)
         self._upload_dir = Path(processing.get("upload_dir", "data/uploads"))
 
         # Loaded on the first session and KEPT for the life of this
@@ -200,6 +209,11 @@ class CameraManager:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        # Live cameras run on their own threads and all report into the one
+        # status document, so appending a log line and writing the file have
+        # to be serialised -- otherwise two cameras detecting a plate in the
+        # same instant interleave inside StatusStore.write().
+        self._status_lock = threading.RLock()
         self._status: Optional[SessionStatus] = None
 
     # ── registry access ───────────────────────────────────────────────────
@@ -212,20 +226,23 @@ class CameraManager:
     def cameras(self) -> list[CameraConfig]:
         return self._registry.all
 
-    @property
-    def live_duration_seconds(self) -> float:
-        """Seconds each live camera is sampled before the queue moves on.
+    @staticmethod
+    def is_live_camera(camera: CameraConfig) -> bool:
+        """True if this camera is a live stream rather than a recorded file.
 
-        0.0 means unbounded -- see the `live_duration_seconds` note in
-        camera_config.yaml. Exposed so the dashboard can tell the operator
-        what a live run will actually do, rather than letting a queue that
-        is waiting on an endless stream look stuck.
+        The one place the split between the two schedules is decided, so the
+        manager, the API and the dashboard cannot disagree about which
+        cameras will run together.
         """
-        try:
-            value = float(self._live_duration_seconds or 0)
-        except (TypeError, ValueError):
-            return 60.0
-        return max(0.0, value)
+        return camera.source_type is SourceType.RTSP
+
+    def split_queue(
+        self, queue: Sequence[CameraConfig]
+    ) -> tuple[list[CameraConfig], list[CameraConfig]]:
+        """Split a queue into (recorded, live), each keeping queue order."""
+        recorded = [c for c in queue if not self.is_live_camera(c)]
+        live = [c for c in queue if self.is_live_camera(c)]
+        return recorded, live
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -405,6 +422,156 @@ class CameraManager:
         self._registry.replace(updated)
         _logger.info("Camera %s: switched to RTSP source %r", camera_id, updated.rtsp_url)
         return updated
+
+    # ── adding and removing camera sites ──────────────────────────────────
+
+    def add_camera(
+        self,
+        camera_name: str,
+        latitude: float,
+        longitude: float,
+        camera_id: Optional[str] = None,
+    ) -> CameraConfig:
+        """Register a new camera site and persist it.
+
+        The new camera is complete from the moment it exists: it appears in
+        the camera list with its own upload and RTSP controls, gets its own
+        panel on the camera wall, its own marker on the map and heatmap, and
+        its own place at the end of the processing queue. It simply has no
+        source yet, which is the same state a shipped camera is in before
+        anyone gives it one.
+
+        Args:
+            camera_name: The place, as it should read on the dashboard and on
+                         every event this camera records.
+            latitude:    Degrees north, -90..90. Required, because a camera
+                         with no position cannot be plotted and silently
+                         drops out of every map and heatmap.
+            longitude:   Degrees east, -180..180.
+            camera_id:   Override the generated id (CAM005, CAM006, ...).
+
+        Raises:
+            RuntimeError: A session is running.
+            ValueError:   Blank name, coordinates out of range, or the id is
+                          taken.
+        """
+        if self.is_running():
+            raise RuntimeError(
+                "A processing session is running; stop it before changing the cameras"
+            )
+
+        name = (camera_name or "").strip()
+        if not name:
+            raise ValueError("The camera needs a place name")
+
+        latitude = self._coordinate(latitude, "Latitude", 90.0)
+        longitude = self._coordinate(longitude, "Longitude", 180.0)
+
+        camera_id = (camera_id or "").strip().upper() or self._registry.next_camera_id()
+        camera = CameraConfig(
+            camera_id=camera_id,
+            camera_name=name,
+            latitude=latitude,
+            longitude=longitude,
+            order=self._registry.next_order(),
+            source_type=SourceType.UPLOAD,
+            enabled=True,
+        )
+        self._registry.add(camera)
+        self._registry.save()
+        _logger.info(
+            "Added camera %s (%s) at %.6f, %.6f",
+            camera.camera_id, camera.camera_name, latitude, longitude,
+        )
+        return camera
+
+    def rename_camera(self, camera_id: str, camera_name: str) -> CameraConfig:
+        """Rename a camera site and persist the new name.
+
+        Sites get renamed: a road is renamed, a gate becomes "North Gate", a
+        typo is spotted after four hours of footage. Only the label changes --
+        the camera keeps its id, its coordinates, its queue position and its
+        source, so nothing that references it breaks.
+
+        Events already recorded keep the name they were stamped with. That is
+        deliberate: they are a record of what the operator called the site at
+        the time, and rewriting history to match a later label would quietly
+        change what a stored trajectory says. New events carry the new name.
+
+        Raises:
+            RuntimeError: A session is running.
+            KeyError:     No such camera.
+            ValueError:   Blank name.
+        """
+        if self.is_running():
+            raise RuntimeError(
+                "A processing session is running; stop it before renaming a camera"
+            )
+
+        import dataclasses
+
+        camera = self._registry.require(camera_id)
+        name = (camera_name or "").strip()
+        if not name:
+            raise ValueError("The camera needs a place name")
+        if name == camera.camera_name:
+            return camera
+
+        updated = dataclasses.replace(camera, camera_name=name)
+        self._registry.replace(updated)
+        self._registry.save()
+        _logger.info(
+            "Renamed camera %s: %r -> %r", camera_id, camera.camera_name, name
+        )
+        return updated
+
+    def remove_camera(self, camera_id: str) -> CameraConfig:
+        """Remove a camera site and persist the change.
+
+        Takes its feed off the camera wall with it: the wall is drawn from
+        the registry, and this also deletes the camera's last preview frame
+        so a removed camera cannot leave a still image behind. Its uploaded
+        video is deleted too -- it was stored for this camera alone.
+
+        Detections it already recorded are KEPT. They are history, they carry
+        their own camera_id and coordinates, and trajectories that passed
+        this site still plot correctly. Delete the session if the events
+        should go as well.
+
+        Raises:
+            RuntimeError: A session is running.
+            KeyError:     No such camera.
+            ValueError:   It is the last camera.
+        """
+        if self.is_running():
+            raise RuntimeError(
+                "A processing session is running; stop it before changing the cameras"
+            )
+
+        camera = self._registry.remove(camera_id)
+        self._registry.save()
+
+        # Its own upload, named after the camera by save_upload().
+        try:
+            for upload in self._upload_dir.glob(f"{camera_id}.*"):
+                upload.unlink(missing_ok=True)
+        except OSError as exc:
+            _logger.debug("Could not delete uploads for %s: %s", camera_id, exc)
+
+        self._clear_live_frames(camera_id)
+        _logger.info("Removed camera %s (%s)", camera.camera_id, camera.camera_name)
+        return camera
+
+    @staticmethod
+    def _coordinate(value: Any, label: str, limit: float) -> float:
+        """Validate one coordinate, or say exactly what is wrong with it."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{label} must be a number, got {value!r}") from None
+        if number != number or abs(number) > limit:      # NaN, or out of range
+            raise ValueError(f"{label} must be between -{limit:g} and {limit:g}")
+        return number
 
     def clear_source(self, camera_id: str) -> CameraConfig:
         """Detach whatever source a camera is currently using.
@@ -646,13 +813,16 @@ class CameraManager:
                     )
                     self._publish()
 
-            for position, camera in enumerate(queue, start=1):
+            positions = {camera.camera_id: index
+                         for index, camera in enumerate(queue, start=1)}
+            recorded, live = self.split_queue(queue)
+            cancelled = False
+
+            # ── recorded files: one at a time, in queue order ──────────────
+            for camera in recorded:
                 if self._stop_event.is_set():
                     self._append_log("Session cancelled before " + camera.camera_name)
-                    for remaining in status.cameras:
-                        if remaining.state is CameraState.PENDING:
-                            remaining.state = CameraState.SKIPPED
-                    status.state = SessionState.CANCELLED
+                    cancelled = True
                     break
 
                 progress = self._progress_for(camera.camera_id)
@@ -660,7 +830,9 @@ class CameraManager:
                     continue
 
                 status.current_camera_id = camera.camera_id
-                if not self._process_camera(camera, position, session_id, progress, models):
+                if not self._process_camera(
+                    camera, positions[camera.camera_id], session_id, progress, models
+                ):
                     failures += 1
                     if not self._continue_on_error:
                         status.state = SessionState.FAILED
@@ -668,9 +840,21 @@ class CameraManager:
                         self._append_log(
                             "Stopping the session: continue_on_error is false"
                         )
-                        break
+                        return
+            status.current_camera_id = None
+
+            # ── live streams: all together, until STOP ─────────────────────
+            if live and not cancelled and not self._stop_event.is_set():
+                failures += self._run_live_cameras(live, positions, session_id, models)
+            elif live:
+                cancelled = True
+
+            if cancelled:
+                for remaining in status.cameras:
+                    if remaining.state is CameraState.PENDING:
+                        remaining.state = CameraState.SKIPPED
+                status.state = SessionState.CANCELLED
             else:
-                # Loop completed without break -- every camera was attempted.
                 status.state = (
                     SessionState.COMPLETED if failures == 0 else SessionState.FAILED
                 )
@@ -707,6 +891,79 @@ class CameraManager:
             # the pop; the next session's worker pushes it again.
             cuda_context.drain_contexts()
 
+    def _run_live_cameras(
+        self,
+        live: list[CameraConfig],
+        positions: dict[str, int],
+        session_id: str,
+        models,
+    ) -> int:
+        """Run every live camera at once, until STOP. Returns the failures.
+
+        One thread per stream. The threads do the decoding, tracking, fusion
+        and database work in parallel; the GPU models underneath them are
+        shared behind a lock, so inference itself stays serialised -- which
+        is what the single TensorRT context requires anyway.
+
+        Blocks until they all finish, which for a live camera means until
+        somebody stops the session (or the stream drops and the pipeline
+        gives up reconnecting).
+        """
+        self._append_log(
+            f"Starting {len(live)} live stream(s) together — "
+            + ", ".join(camera.camera_name for camera in live)
+            + " — they run continuously until STOP."
+        )
+        self._publish()
+
+        failures = 0
+        failure_lock = threading.Lock()
+        threads: list[threading.Thread] = []
+
+        def worker(camera: CameraConfig) -> None:
+            nonlocal failures
+            # Every worker thread needs the CUDA primary context current, and
+            # must leave the stack empty again -- the same rule the session
+            # thread follows, for the same reason (see cameras.cuda_context).
+            from src.cameras import cuda_context
+
+            cuda_context.push_primary_context()
+            try:
+                progress = self._progress_for(camera.camera_id)
+                if progress is None:      # cannot happen; queue built the list
+                    return
+                ok = self._process_camera(
+                    camera,
+                    positions[camera.camera_id],
+                    session_id,
+                    progress,
+                    # Each stream gets its own view of the shared models, so
+                    # two cameras cannot be inside the same TensorRT context
+                    # at once.
+                    models.shared() if models is not None else None,
+                    continuous=True,
+                )
+                if not ok:
+                    with failure_lock:
+                        failures += 1
+            finally:
+                cuda_context.drain_contexts()
+
+        for camera in live:
+            thread = threading.Thread(
+                target=worker,
+                args=(camera,),
+                name=f"camera-live-{camera.camera_id}",
+                daemon=True,
+            )
+            threads.append(thread)
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
+        return failures
+
     def _process_camera(
         self,
         camera: CameraConfig,
@@ -714,6 +971,7 @@ class CameraManager:
         session_id: str,
         progress: CameraProgress,
         models=None,
+        continuous: bool = False,
     ) -> bool:
         """Run the ALPR pipeline over one camera. Returns True on success.
 
@@ -773,20 +1031,16 @@ class CameraManager:
                 log=self._append_log,
             )
 
-            # Only a live source gets a time limit; a recorded file runs to
-            # its natural end however long that takes.
+            # Nothing is ever cut short by a clock: a recorded file runs to
+            # its natural end, and a live stream runs until STOP. The queue
+            # no longer has to take turns on a live camera, so the dwell time
+            # that used to bound one has nothing left to protect.
             duration_limit = None
             if source.is_live:
-                try:
-                    limit = float(self._live_duration_seconds or 0)
-                except (TypeError, ValueError):
-                    limit = 60.0
-                duration_limit = limit if limit > 0 else None
-                if duration_limit is not None:
-                    self._append_log(
-                        f"{camera.camera_name} is a live stream — sampling for "
-                        f"{duration_limit:.0f}s, then moving to the next camera."
-                    )
+                self._append_log(
+                    f"{camera.camera_name} is a live stream — running "
+                    "continuously until STOP."
+                )
 
             summary = self._resolve_runner()(
                 config=self._config,
@@ -814,8 +1068,13 @@ class CameraManager:
                     float(summary.get("avg_plate_detection_ms", 0.0)), 2
                 )
 
+            # A recorded file that was cut short by STOP did not finish its
+            # clip, so it is SKIPPED. A live camera has no end to reach --
+            # being stopped IS how it finishes, so it counts as completed.
             progress.state = (
-                CameraState.SKIPPED if self._stop_event.is_set() else CameraState.COMPLETED
+                CameraState.SKIPPED
+                if self._stop_event.is_set() and not continuous
+                else CameraState.COMPLETED
             )
             progress.finished_at = time.time()
             self._append_log(
@@ -874,19 +1133,27 @@ class CameraManager:
         return None
 
     def _append_log(self, message: str) -> None:
-        if self._status is None:
-            return
-        stamped = f"{datetime.now().strftime('%H:%M:%S')}  {message}"
-        self._status.logs.append(stamped)
-        # Trim from the front so the newest lines always survive.
-        if len(self._status.logs) > _MAX_STATUS_LOGS:
-            del self._status.logs[:-_MAX_STATUS_LOGS]
+        # Locked: live cameras log from their own threads.
+        with self._status_lock:
+            if self._status is None:
+                return
+            stamped = f"{datetime.now().strftime('%H:%M:%S')}  {message}"
+            self._status.logs.append(stamped)
+            # Trim from the front so the newest lines always survive.
+            if len(self._status.logs) > _MAX_STATUS_LOGS:
+                del self._status.logs[:-_MAX_STATUS_LOGS]
         _logger.info(message)
 
     def _publish(self) -> None:
-        """Snapshot the status to the shared file for other processes."""
-        if self._status is not None:
-            self._status_store.write(self._status.to_dict())
+        """Snapshot the status to the shared file for other processes.
+
+        Serialised: four live cameras publish several times a second each,
+        and to_dict() must not run while another thread is mutating the same
+        document.
+        """
+        with self._status_lock:
+            if self._status is not None:
+                self._status_store.write(self._status.to_dict())
 
     def forget_session(self, session_id: str) -> bool:
         """Drop the live status of a session whose events have been deleted.
@@ -937,14 +1204,19 @@ class CameraManager:
             self._models.close()
             self._models = None
 
-    def _clear_live_frames(self) -> None:
-        """Delete the per-camera preview frames from the previous session."""
+    def _clear_live_frames(self, camera_id: Optional[str] = None) -> None:
+        """Delete preview frames: one camera's, or every camera's.
+
+        Per camera when a camera is removed (its panel goes with it), and for
+        all of them at the start of a session so the wall never shows the
+        previous run's video under a camera that has not started yet.
+        """
         directory = Path(
             (self._config.get("api") or {}).get("live_frames_dir", "data/live_frames")
         )
         try:
             if directory.is_dir():
-                for frame in directory.glob("*.jpg"):
+                for frame in directory.glob(f"{camera_id}.jpg" if camera_id else "*.jpg"):
                     frame.unlink(missing_ok=True)
         except OSError as exc:
             # Cosmetic cleanup only -- never worth failing a run over.

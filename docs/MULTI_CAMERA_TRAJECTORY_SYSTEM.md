@@ -18,7 +18,7 @@ downstream of it (reading what it stored).
 2. [Data flow](#2-data-flow)
 3. [Camera configuration](#3-camera-configuration)
 4. [Database](#4-database)
-5. [Camera manager and sequential processing](#5-camera-manager-and-sequential-processing)
+5. [Camera manager: files in turn, streams together](#5-camera-manager-files-in-turn-streams-together)
 6. [Trajectory engine](#6-trajectory-engine)
 7. [Map engine](#7-map-engine)
 8. [Dashboard](#8-dashboard)
@@ -99,7 +99,7 @@ downstream of it (reading what it stored).
 | `src/cameras/models.py` | `CameraConfig`, `CameraProgress`, `SessionStatus` — dependency-free value types |
 | `src/cameras/registry.py` | Parse and validate `camera_config.yaml`; cameras in processing order |
 | `src/cameras/sources.py` | `VideoSource` ABC → `UploadSource` / `RTSPSource`; the RTSP migration seam |
-| `src/cameras/manager.py` | Builds the queue, runs cameras **sequentially**, reports progress |
+| `src/cameras/manager.py` | Builds the queue, runs recorded cameras **in turn** and live ones **together**, reports progress |
 | `src/cameras/status_store.py` | Atomic JSON status file — cross-process progress handoff |
 | `src/trajectory/models.py` | `Trajectory`, `TrajectoryPoint`, `TrajectoryLeg` |
 | `src/trajectory/engine.py` | Group → order → measure. The reconstruction logic |
@@ -291,15 +291,20 @@ unique plate, not 4.
 
 ---
 
-## 5. Camera manager and sequential processing
+## 5. Camera manager: files in turn, streams together
 
-Cameras are processed **strictly one at a time**, in ascending `order`. Each
-camera's ALPR pass completes before the next opens its source.
+A run has two schedules, chosen per camera by its source type:
 
-This is deliberate, for three reasons:
+* **Recorded videos** are processed **strictly one at a time**, in ascending
+  `order`. Each camera's ALPR pass completes before the next opens its
+  source.
+* **Live RTSP streams** all start **together** and run **until the session is
+  stopped**.
+
+Sequential files are deliberate, for three reasons:
 
 1. **Hardware.** The Jetson has one GPU and the ALPR pipeline already
-   saturates it. Four concurrent cameras would contend for the same TensorRT
+   saturates it. Four concurrent files would contend for the same TensorRT
    execution context and finish *later* than four run in turn, while making
    every per-camera latency figure meaningless.
 2. **Demo correctness.** With all four cameras replaying the same footage,
@@ -307,6 +312,9 @@ This is deliberate, for three reasons:
    across the queue — so a reconstructed trajectory reads CAM001 → CAM004.
 3. **Migration fidelity.** It matches how a real deployment is reasoned
    about: each camera is an independent observer with its own source.
+
+Live streams cannot work that way, and §5's "Live streams run together"
+below says why.
 
 ### Threading
 
@@ -320,28 +328,87 @@ a reader polling every second can never see a half-written document. Reads
 never raise: a missing file means nothing has run yet, and a corrupt one
 degrades to "unknown" rather than taking the dashboard down.
 
-### Live streams in a sequential queue
+### Live streams run together
 
-A recorded file ends by itself; **an RTSP stream never does**. A queue that
-simply ran each camera "until its source is exhausted" would therefore block
-forever on its first live camera and never reach the second — a hang, not an
-error, which is the worst way for this to fail.
+A recorded file ends by itself; **an RTSP stream never does**. The first
+design bounded each live camera with a dwell time
+(`processing.live_duration_seconds`) so a sequential queue could move on.
+That was wrong for live operation: a stream carries what is happening *now*,
+so the minute camera 2 spends waiting its turn does not delay its footage,
+it **discards** it. Every vehicle passing camera 2 during camera 1's turn was
+simply never seen, and only one panel of the camera wall ever moved.
 
-Each live camera is therefore given a bounded **dwell time**
-(`processing.live_duration_seconds`, default 60 s): it is sampled for that
-long, then the queue moves on. Recorded files ignore the setting entirely.
+Live cameras therefore all start at once, each on its own thread, and run
+until `stop()` — no dwell time, no queue position. The dwell setting is gone.
 
-The clock starts at the **second** decoded frame, not at loop entry. The
-detectors and the OCR engine are lazily loaded on first use, and
-deserialising two TensorRT plans plus warmup costs tens of seconds on a
-Jetson — all of it inside the first iteration. Timing from loop entry spent
-almost the whole budget on warmup and sampled essentially no video (measured:
-a 20 s budget yielded **one** processed frame). Starting after frame 1 makes
-"sample this camera for N seconds" mean N seconds of actual streaming —
-measured at 126 frames and 3 stored plates for a 6 s budget.
+They share **one** set of GPU models, handed out through
+`PipelineModels.shared()`: a thin proxy that takes a lock around the calls
+that reach the GPU (`detect`, `recognize`, `enhance`). A TensorRT execution
+context processes one inference at a time, and two threads inside the same
+one corrupt each other's bindings. Everything else — decoding, tracking, OCR
+fusion, colour, thumbnails, database writes — runs genuinely in parallel,
+which is where a live stream spends most of its wall clock.
 
-Setting it to `0` means unbounded, which is only sensible when exactly one
-camera is enabled; the dashboard warns when that would strand later cameras.
+Measured on this Jetson, four cameras through the real pipeline sharing one
+model bundle: ~197 frames each in 25 s (**~7.9 fps per camera, ~31 fps in
+total**) with all 16 expected events stored, against ~20 fps for one camera
+running alone.
+
+Two concurrency faults this exposed, both fixed:
+
+* `init_db()` was not thread-safe. Four pipelines opening the database at
+  once raced inside `create_all()`, and three of them died with "table
+  vehicle_events already exists" or "database is locked" — losing three
+  cameras' detections. It is now guarded by a lock and returns immediately
+  when the process is already connected to that database.
+* SQLite now runs in **WAL** mode with a 30 s busy timeout, so concurrent
+  writers wait instead of failing and the dashboard can read while four
+  cameras write.
+
+A mixed queue runs the recorded files first, then brings the live cameras up
+together.
+
+### Adding and removing camera sites
+
+Cameras are managed from the dashboard ("Add camera", and "Remove camera" on
+each card) and over the API (`POST /trajectory-api/cameras`,
+`DELETE /trajectory-api/cameras/{id}`).
+
+Adding asks for the **place, latitude and longitude**. Coordinates are
+required rather than optional: a camera without them records events that no
+map or heatmap can place, so it would look configured and then quietly
+disappear from every view that matters. The new camera is complete from the
+moment it exists -- its own upload/RTSP controls, its own panel on the camera
+wall, its own marker on the map and heatmap, and the last place in the
+processing queue. It simply has no source yet, which is the state a shipped
+camera is in before anyone gives it one.
+
+**Renaming** changes only the label: the camera keeps its id, coordinates,
+queue position and source. Events already recorded keep the name they were
+stamped with -- they are a record of what the site was called when the
+vehicle passed, so the statistics table still reads the old name while the
+camera card, its feed panel and every new event read the new one.
+
+Removing takes the site's configuration, its uploaded video and its last
+preview frame (so the wall cannot leave a still image behind under a camera
+that no longer exists). It **keeps the detections it recorded**: those are
+history, they carry their own camera id and coordinates, and a trajectory
+that passed the site yesterday still plots. The last camera cannot be
+removed -- a file with no cameras does not load, so writing one would strand
+the deployment at the next start.
+
+**Where this is stored.** `camera_config.yaml` is hand-written and heavily
+commented, and rewriting it from a YAML dump would throw every comment away.
+So the shipped file stays the declaration an engineer edits, and the
+operator's camera list lives beside it in `config/cameras_runtime.yaml`,
+written and read only by code (`CameraRegistry.save()`). When that file holds
+a camera list it REPLACES the shipped one; `defaults`, `processing` and
+`trajectory` still come from `camera_config.yaml`. Delete it to go back to
+the shipped cameras. It is per-device runtime state, so it is git-ignored.
+
+Neither operation is allowed while a session is running: swapping the
+registry under a running queue would leave the worker processing cameras that
+no longer match the status it publishes.
 
 ### Failure isolation
 
@@ -467,30 +534,66 @@ vehicle.
 > and still runs**. The two read the same database and neither depends on the
 > other.
 
-### Operations tab
+The console is split into three pages, each with one job:
+
+| Page | What it is for | Sections |
+|------|----------------|----------|
+| **Home** | Watching: what is happening, and looking something up | Blacklisted vehicles · Camera feeds · Search by plate number · Search by description · Traffic heatmap |
+| **Operations** | Running: sources, the run, and what it produced | Cameras · Live Processing Status · Statistics (with detections per camera) |
+| **Trajectory** | One vehicle's route | Profile card · timeline · map · history table |
+
+Home is the page somebody leaves open all day, so it carries nothing they
+only touch when starting a run; Operations carries exactly those controls.
+
+### Operations page
+
+Stacked full width, in the order the work happens:
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ 🛰️  Multi-Camera Vehicle Trajectory Reconstruction System                 │
-│     Idle — ready to process · session —                                  │
-├────────────────┬───────────────────────────────────┬─────────────────────┤
-│ 📹 CAMERAS     │ ⚡ LIVE PROCESSING STATUS         │ 📊 STATISTICS       │
-│                │                                   │                     │
-│ 1. India Gate  │  Current camera │ FPS │ Progress   │ Vehicles detected   │
-│  (•)Upload     │  ─────────────────────────────    │ Unique plates       │
-│  ( )RTSP       │  ████████████░░░░░░░  2/4 done    │ Processing time     │
-│  🎞️ CAM001.mp4 │                                   │ Current camera      │
-│ 2. Connaught   │  1. India Gate      ✅ Complete   │ Avg OCR time        │
-│  ( )Upload     │  2. Connaught Place ⏳ Processing │ Avg detection time  │
-│  (•)RTSP       │  3. Karol Bagh      ○  Queued     │                     │
-│  📡 rtsp://…   │  4. Kashmere Gate   ○  Queued     │ Detections/camera   │
-│                │                                   │ ┌─────────────────┐ │
-│ ▶️ START       │  Current plate │ Vehicle │ Log     │ │ table           │ │
-│    PROCESSING  │   DL8CA1234    │  [img]  │ ...     │ └─────────────────┘ │
-├────────────────┴───────────────────────────────────┴─────────────────────┤
-│ 🔍 Search vehicle by plate number   [_______] [Search]  [2+ cameras ▾]   │
+│  CAMERAS            four camera cards per row, the rest on the next row   │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐                     │
+│  │1. Gate A │ │2. Gate B │ │3. Square │ │4. Parking│                     │
+│  │ (•)Upload│ │ ( )Upload│ │ (•)Upload│ │ (•)Upload│                     │
+│  │ ( )RTSP  │ │ (•)RTSP  │ │ ( )RTSP  │ │ ( )RTSP  │                     │
+│  │ [file]   │ │ rtsp://… │ │ [file]   │ │ [file]   │                     │
+│  │ Clear·Rm │ │ Clear·Rm │ │ Clear·Rm │ │ Clear·Rm │                     │
+│  │ Rename ▾ │ │ Rename ▾ │ │ Rename ▾ │ │ Rename ▾ │                     │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘                     │
+│  ┌──────────┐   Add camera ▾                                             │
+│  │5. Gate C │                                                            │
+│  └──────────┘   ▶ START PROCESSING                                       │
+├──────────────────────────────────────────────────────────────────────────┤
+│  LIVE PROCESSING STATUS   current camera · FPS · progress · ETA          │
+│                           per-camera queue, current plate, vehicle, log  │
+├──────────────────────────────────────────────────────────────────────────┤
+│  STATISTICS   detected · plates · time · camera · avg OCR · avg detect   │
+│               detections per camera (table)                              │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+Four cameras to a row, like the camera wall: stacked in one narrow column,
+five cameras were a metre of scrolling — each card's uploader, buttons and
+rename control sat between it and the next one, and the deployment could not
+be seen at once.
+
+### Home page
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  BLACKLISTED VEHICLES    alert banner + watch list                       │
+├──────────────────────────────────────────────────────────────────────────┤
+│  CAMERA FEEDS            four live panels per row; a fifth wraps          │
+├──────────────────────────────────────────────────────────────────────────┤
+│  SEARCH BY PLATE NUMBER  [_______] [Search]   [2+ cameras ▾]             │
+├──────────────────────────────────────────────────────────────────────────┤
+│  SEARCH BY DESCRIPTION   "white cars after 9am today"  → vehicle cards    │
+├──────────────────────────────────────────────────────────────────────────┤
+│  TRAFFIC HEATMAP         where vehicles are now / total traffic          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+Either search opens the vehicle on the **Trajectory** page.
 
 **Each camera gets exactly one source.** A radio per camera picks the kind,
 and the two are mutually exclusive — assigning a video clears the stream URL,
@@ -538,7 +641,7 @@ no Arrow, nothing to crash. (The original single-gate dashboard still uses
 
 ### Camera feeds
 
-The Operations tab shows every camera's annotated video in a 2×2 wall, played
+The Home page shows every camera's annotated video four panels to a row, played
 as continuous **MJPEG streams** rather than still images.
 
 Streamlit can only change the page by re-running it, so a still image updated
@@ -658,10 +761,13 @@ existing single-gate routes or the static dashboard mounted at `/`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/trajectory-api/cameras` | Camera registry, in processing order |
+| POST | `/trajectory-api/cameras` | Add a camera site (place + coordinates) |
+| PATCH | `/trajectory-api/cameras/{id}` | Rename a camera site |
+| DELETE | `/trajectory-api/cameras/{id}` | Remove a camera site; its events are kept |
 | POST | `/trajectory-api/cameras/upload` | Upload every camera's video at once |
 | POST | `/trajectory-api/cameras/{id}/upload` | Upload one camera's video |
 | POST | `/trajectory-api/cameras/{id}/rtsp` | Switch a camera to a live stream |
-| POST | `/trajectory-api/processing/start` | Start the sequential run |
+| POST | `/trajectory-api/processing/start` | Start the run (files in turn, streams together) |
 | POST | `/trajectory-api/processing/stop` | Request a cooperative stop |
 | GET | `/trajectory-api/processing/status` | Live progress |
 | GET | `/trajectory-api/trajectory/{plate}` | Reconstructed path (points + legs) |
@@ -697,17 +803,18 @@ cd /home/ansh/alpr/alpr-university-gate
 # 1. Start the dashboard
 streamlit run src/dashboard/trajectory_app.py
 
-# 2. In the browser (http://localhost:8501), Operations tab:
+# 2. In the browser (http://localhost:8501), Operations page:
 #      • for each camera pick its source — "Upload video" or "RTSP stream"
 #        (one or the other; setting one replaces the other)
 #      • upload the same recording to all four for the demo, or point a
 #        camera at a real stream
 #      • press START PROCESSING
-#      • watch CAM001 → CAM002 → CAM003 → CAM004 run one at a time
+#      • watch CAM001 → CAM002 → CAM003 → CAM004 (uploads run one at a time)
 #
 # 3. When the run finishes:
-#      • pick a plate from the "2+ cameras" dropdown, or type one
-#      • open the Trajectory tab for the timeline, map and history
+#      • on the Home page, pick a plate from the "2+ cameras" dropdown,
+#        type one, or describe the vehicle
+#      • the Trajectory page shows the timeline, map and history
 ```
 
 Optionally run the API alongside it, for the REST endpoints and the existing
@@ -848,15 +955,14 @@ Two things to plan for when going live:
    `video_path`. A bulk-upload API route
    (`POST /trajectory-api/cameras/upload`) remains available for scripted
    demos.
-5. **Live cameras need a dwell time.** An RTSP stream has no end, so a
-   sequential queue must bound how long it samples one or later cameras never
-   run. Default 60 s, measured from the first decoded frame so model warmup
-   does not eat the budget.
+5. **Live cameras run together and continuously.** An RTSP stream has no
+   end and no reason to wait: queueing one behind another loses its footage
+   rather than delaying it. They share the GPU models behind a lock. See §5.
 6. **One visit per camera by default** (`collapse_per_camera: true`). A
    four-camera journey should draw four markers, not forty. Every individual
    read remains in the history table.
-7. **Sequential processing is a design constraint, not a limitation.** See
-   §5.
+7. **Sequential processing of recorded files is a design constraint, not a
+   limitation.** See §5.
 8. **A file-backed status store, not a message broker.** One writer, a
    few-hundred-byte payload; adding Redis to a Jetson to move it would be out
    of proportion.

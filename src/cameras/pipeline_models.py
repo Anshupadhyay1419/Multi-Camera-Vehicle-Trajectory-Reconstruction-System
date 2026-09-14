@@ -28,11 +28,53 @@ cameras would suppress the second, third and fourth sighting of a plate as
 
 from __future__ import annotations
 
+import functools
+import threading
 from typing import Any, Optional
 
 from src.utils.logger import get_logger
 
 _logger = get_logger("cameras.pipeline_models")
+
+# The calls that reach the GPU. Guarded when several live cameras share one
+# bundle; everything else (thresholds, class names, paths) is read-only and
+# passes straight through.
+_GPU_CALLS = frozenset({"detect", "recognize", "enhance", "predict", "read"})
+
+
+class _Serialized:
+    """One model, callable from several camera threads without overlapping.
+
+    A thin proxy: the calls in `_GPU_CALLS` take the shared lock, and every
+    other attribute is the wrapped model's own. Proxying rather than editing
+    the detectors keeps the single-camera and CLI paths exactly as they
+    were -- they never see this class.
+    """
+
+    __slots__ = ("_wrapped", "_lock")
+
+    def __init__(self, wrapped: Any, lock: "threading.RLock") -> None:
+        object.__setattr__(self, "_wrapped", wrapped)
+        object.__setattr__(self, "_lock", lock)
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(object.__getattribute__(self, "_wrapped"), name)
+        if name not in _GPU_CALLS or not callable(attribute):
+            return attribute
+        lock = object.__getattribute__(self, "_lock")
+
+        @functools.wraps(attribute)
+        def guarded(*args, **kwargs):
+            with lock:
+                return attribute(*args, **kwargs)
+
+        return guarded
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_wrapped"), name, value)
+
+    def __repr__(self) -> str:
+        return f"_Serialized({object.__getattribute__(self, '_wrapped')!r})"
 
 
 class PipelineModels:
@@ -56,6 +98,9 @@ class PipelineModels:
         self.ocr_engine = ocr_engine
         self.sr_enhancer = sr_enhancer
         self._closed = False
+        # Held by every view handed out by shared(), so concurrent live
+        # cameras enter the GPU one at a time.
+        self._lock = threading.RLock()
 
     @classmethod
     def load(cls, config: dict, on_progress=None) -> "PipelineModels":
@@ -126,6 +171,31 @@ class PipelineModels:
 
         report("Models ready")
         return cls(vehicle_detector, plate_detector, ocr_engine, sr_enhancer)
+
+    def shared(self) -> "PipelineModels":
+        """A view of these models that is safe to use from another thread.
+
+        Live cameras all run at once, but the GPU underneath them does not:
+        a TensorRT execution context processes one inference at a time, and
+        two threads calling into the same one corrupt each other's bindings.
+
+        Every view returned here wraps the SAME models behind the SAME lock,
+        so the four streams take turns inside inference while decoding,
+        tracking, OCR fusion and database work carry on in parallel -- which
+        is where a live stream actually spends its time. Recorded files do
+        not need this: they never run concurrently.
+
+        The view does not own the models, so closing it is a no-op; whoever
+        loaded them still owns them.
+        """
+        view = PipelineModels(
+            _Serialized(self.vehicle_detector, self._lock),
+            _Serialized(self.plate_detector, self._lock),
+            _Serialized(self.ocr_engine, self._lock),
+            _Serialized(self.sr_enhancer, self._lock),
+        )
+        view._closed = True          # borrowed, never released by the borrower
+        return view
 
     def close(self) -> None:
         """Release every model that knows how to release itself.

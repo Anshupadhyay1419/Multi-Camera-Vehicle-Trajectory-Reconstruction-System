@@ -1,0 +1,694 @@
+<html>
+<head>
+<meta charset="utf-8">
+<title>Multi-Camera ALPR Vehicle Trajectory System — Technology Guide</title>
+<style>
+  body { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 10.5pt; line-height: 1.45; color: #1a1a1a; }
+  h1 { font-size: 20pt; color: #0b3d64; border-bottom: 2px solid #0b3d64; padding-bottom: 4px; margin-top: 18pt; }
+  h2 { font-size: 14pt; color: #0b3d64; margin-top: 14pt; }
+  h3 { font-size: 11.5pt; color: #333; margin-top: 10pt; }
+  table { border-collapse: collapse; width: 100%; margin: 6pt 0 10pt 0; }
+  th { background: #0b3d64; color: #ffffff; text-align: left; padding: 4px 6px; font-size: 9.5pt; }
+  td { border: 1px solid #b8c4cf; padding: 4px 6px; vertical-align: top; font-size: 9.5pt; }
+  pre { font-family: "DejaVu Sans Mono", monospace; font-size: 8.5pt; background: #f3f5f7; border: 1px solid #d0d7de; padding: 6px; }
+  code { font-family: "DejaVu Sans Mono", monospace; font-size: 9pt; background: #f3f5f7; }
+  .note { background: #fff7e0; border-left: 4px solid #e0a800; padding: 6px 8px; margin: 8pt 0; }
+  .title { font-size: 26pt; color: #0b3d64; font-weight: bold; margin-top: 120pt; }
+  .subtitle { font-size: 14pt; color: #444; margin-top: 8pt; }
+  .pb { page-break-before: always; }
+</style>
+</head>
+<body>
+
+<p class="title">Multi-Camera ALPR<br>Vehicle Trajectory Reconstruction System</p>
+<p class="subtitle">Complete Technology Guide — every technology, library, API, database table and design decision, explained</p>
+<p>Project: <b>alpr-university-gate</b> &nbsp;·&nbsp; Platform: NVIDIA Jetson Orin (JetPack R39, Ubuntu 24.04, aarch64)<br>
+Document date: 13 September 2026</p>
+
+<h2>Contents</h2>
+<ol>
+  <li>What the system does</li>
+  <li>Hardware and platform</li>
+  <li>Architecture and data flow</li>
+  <li>Technology stack at a glance</li>
+  <li>The ALPR pipeline (computer vision and AI)</li>
+  <li>Multi-camera layer (uploads, RTSP, sequential processing)</li>
+  <li>Database and SQL</li>
+  <li>Trajectory reconstruction and GIS</li>
+  <li>Maps and the traffic heatmap</li>
+  <li>Vehicle profiles and body-colour detection</li>
+  <li>Vehicle search (natural-language parser)</li>
+  <li>Blacklisted vehicles</li>
+  <li>REST API (FastAPI)</li>
+  <li>Dashboards and live video</li>
+  <li>Configuration files</li>
+  <li>Project structure</li>
+  <li>Running the system: processes, ports, commands</li>
+  <li>Measured performance</li>
+  <li>Testing</li>
+  <li>Known limitations</li>
+  <li>Glossary</li>
+</ol>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">1. What the system does</h1>
+<p>The system reads vehicle number plates from video (recorded files or live RTSP cameras), records every
+detection in a database with the camera's location, and reconstructs where each vehicle travelled across a
+network of cameras.</p>
+<table>
+<tr><th>Capability</th><th>What it means in practice</th></tr>
+<tr><td>Automatic Licence Plate Recognition (ALPR)</td><td>Finds vehicles, finds their plates, reads the plate text with a neural OCR model, and stores the result.</td></tr>
+<tr><td>Multi-camera processing</td><td>Four configured camera sites (India Gate, Connaught Place, Karol Bagh, Kashmere Gate). Each takes an uploaded video or a live RTSP stream. Uploaded videos are processed one after another; RTSP streams all run together and keep running until the session is stopped.</td></tr>
+<tr><td>Camera management</td><td>Camera sites are added and removed from the dashboard: adding asks for the place, latitude and longitude, and the new camera immediately gets its own upload/RTSP controls, feed panel, map marker and queue position. Cameras can also be renamed in place. Removing takes its feed with it and keeps its recorded detections.</td></tr>
+<tr><td>Trajectory reconstruction</td><td>For any plate, orders its sightings in time and draws the route on a map with distances, travel times and speeds.</td></tr>
+<tr><td>Vehicle profiles</td><td>One summary per vehicle: YOLO vehicle class, body colour, thumbnails, first/last seen, cameras visited, visit history.</td></tr>
+<tr><td>Vehicle search</td><td>Type a description (“white cars after 9am today at India Gate”) and see matching vehicles; click through to their trajectory.</td></tr>
+<tr><td>Traffic heatmap</td><td>2-D map coloured by where vehicles are now (or by total traffic per camera).</td></tr>
+<tr><td>Blacklist alerts</td><td>Plates on a watch list (e.g. DL7CD5017) raise a red alert on the dashboard and in the live processing log.</td></tr>
+<tr><td>Live camera wall</td><td>Four feeds per row of each camera's annotated video, streamed smoothly to the browser; a fifth camera starts the next row.</td></tr>
+<tr><td>REST API</td><td>Every capability is also available as HTTP/JSON endpoints for other software.</td></tr>
+</table>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">2. Hardware and platform</h1>
+<table>
+<tr><th>Component</th><th>Value on this device</th><th>Why it matters</th></tr>
+<tr><td>Computer</td><td>NVIDIA Jetson Orin (“Orin (nvgpu)”)</td><td>An edge AI computer with an integrated NVIDIA GPU. All inference runs locally — no cloud, no internet required.</td></tr>
+<tr><td>CPU architecture</td><td>aarch64 (64-bit ARM)</td><td>Python wheels must be ARM builds; some packages (TensorRT, PyCUDA) come from JetPack rather than pip.</td></tr>
+<tr><td>JetPack / L4T</td><td>R39 (release), revision 2.0</td><td>NVIDIA's board support package: Linux kernel, GPU driver, CUDA, TensorRT.</td></tr>
+<tr><td>Operating system</td><td>Ubuntu 24.04.4 LTS</td><td>Base OS supplied by JetPack.</td></tr>
+<tr><td>CUDA</td><td>13.2 (V13.2.78)</td><td>NVIDIA's GPU computing platform used by TensorRT, PyTorch and PyCUDA.</td></tr>
+<tr><td>Python</td><td>3.12.3, in virtual environment <code>/home/ansh/alpr/alpr_env</code></td><td>All application code is Python.</td></tr>
+</table>
+<div class="note"><b>Jetson detail:</b> TensorRT is installed by JetPack into <code>/usr/lib/python3.12/dist-packages</code>, which a virtual environment cannot see by default. <code>src/utils/jetson_paths.py</code> adds that path at startup; without it Ultralytics tries to download TensorRT from the internet and hangs.</div>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">3. Architecture and data flow</h1>
+<h2>3.1 Component architecture</h2>
+<pre>
+ ┌──────────────── Inputs ─────────────────┐
+ │ Uploaded video (MP4/AVI/…)  RTSP camera │
+ └────────────────────┬────────────────────┘
+                      ▼
+ ┌─────────── Multi-camera layer (src/cameras) ────────────┐
+ │ camera_config.yaml → CameraRegistry → CameraManager     │
+ │ VideoSource ─┬─ UploadSource   (recorded file)          │
+ │              └─ RTSPSource     (live stream, TCP probe) │
+ │ Files in turn · streams together · shared GPU models    │
+ └────────────────────┬────────────────────────────────────┘
+                      ▼
+ ┌─────────── ALPR pipeline (scripts/run_pipeline.py) ─────┐
+ │ OpenCV capture → YOLOv8 vehicle (TensorRT)              │
+ │ → ByteTrack tracking → YOLOv8 plate (TensorRT)          │
+ │ → preprocessing + upscaling → PARSeq OCR (TensorRT)     │
+ │ → plate validation → OCR fusion → duplicate filter      │
+ │ → plate colour, direction, body colour, thumbnails      │
+ └────────────────────┬────────────────────────────────────┘
+                      ▼
+ ┌─────────── Database (SQLite / PostgreSQL via SQLAlchemy) ┐
+ │ vehicle_events (every detection)                         │
+ │ vehicle_profiles (one summary per plate)                 │
+ └───────┬───────────────────┬──────────────────────────────┘
+         ▼                   ▼
+ ┌── Streamlit dashboard ─┐ ┌── FastAPI REST API ─────────┐
+ │ port 8501              │ │ port 8000  (+ web dashboard)│
+ │ trajectory · heatmap   │ │ /logs /search /trajectory-… │
+ │ search · blacklist     │ └─────────────────────────────┘
+ │ camera wall ← MJPEG    │
+ │   preview server :8765 │
+ └────────────────────────┘
+</pre>
+
+<h2>3.2 Data flow for one vehicle</h2>
+<pre>
+ 1. Frame read from video/RTSP                     (OpenCV + FFmpeg)
+ 2. Vehicles detected in the frame                 (YOLOv8n, TensorRT FP16)
+ 3. Each vehicle given a persistent track ID        (ByteTrack)
+ 4. Plate located inside the vehicle crop           (custom YOLOv8 plate model)
+ 5. Plate image cleaned and enlarged                (CLAHE, gamma, sharpen, upscale)
+ 6. Plate text read                                  (PARSeq-tiny, TensorRT)
+ 7. Text validated against Indian plate formats     (regex + OCR correction)
+ 8. 5 readings of the same track voted together     (OCR fusion)
+ 9. Duplicate check (same plate within 30 s)        (Levenshtein distance ≤ 2)
+10. Plate colour → registration category; direction; YOLO class; body colour
+11. Images and thumbnails saved to disk
+12. Row inserted into vehicle_events; vehicle profile updated in same transaction
+13. Blacklist checked → alert in live log / dashboard
+14. Dashboard and API read the database; trajectory rebuilt on demand
+</pre>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">4. Technology stack at a glance</h1>
+<table>
+<tr><th>Category</th><th>Technology</th><th>Version</th><th>Used for</th></tr>
+<tr><td>Language</td><td>Python</td><td>3.12.3</td><td>All application code</td></tr>
+<tr><td>Object detection</td><td>Ultralytics YOLOv8</td><td>8.4.93</td><td>Vehicle detection (COCO-pretrained yolov8n) and plate detection (custom-trained model)</td></tr>
+<tr><td>Inference engine</td><td>NVIDIA TensorRT</td><td>10.16.2.10</td><td>Runs the YOLO and PARSeq models as optimised GPU “engines” (FP16)</td></tr>
+<tr><td>GPU bindings</td><td>PyCUDA</td><td>JetPack build</td><td>GPU memory buffers and CUDA streams for the PARSeq TensorRT engine</td></tr>
+<tr><td>Deep learning</td><td>PyTorch</td><td>2.13.0 (CUDA 13.2)</td><td>Used by Ultralytics; model training</td></tr>
+<tr><td>Tracking</td><td>Supervision (ByteTrack)</td><td>0.25.0</td><td>Keeps a stable ID per vehicle across frames</td></tr>
+<tr><td>OCR model</td><td>PARSeq (tiny)</td><td>official baudm weights, fine-tuned</td><td>Reads plate characters</td></tr>
+<tr><td>Fallback OCR</td><td>RapidOCR + ONNX Runtime</td><td>ORT 1.20.1</td><td>CPU OCR backend (configurable)</td></tr>
+<tr><td>Image processing</td><td>OpenCV (cv2)</td><td>4.10.0</td><td>Video capture, RTSP, resizing, colour spaces, JPEG encoding, drawing</td></tr>
+<tr><td>Numerics</td><td>NumPy</td><td>1.26.4</td><td>Image arrays, colour statistics</td></tr>
+<tr><td>Database</td><td>SQLite (default) / PostgreSQL (supported)</td><td>SQLite 3</td><td>Stores detections and vehicle profiles</td></tr>
+<tr><td>ORM / SQL toolkit</td><td>SQLAlchemy</td><td>2.0.30</td><td>Tables, queries, sessions, schema migration</td></tr>
+<tr><td>Web API</td><td>FastAPI</td><td>0.115.0</td><td>REST endpoints</td></tr>
+<tr><td>ASGI framework</td><td>Starlette</td><td>0.37.2</td><td>FastAPI's foundation; static file serving</td></tr>
+<tr><td>ASGI server</td><td>Uvicorn</td><td>0.32.0</td><td>Runs the FastAPI app</td></tr>
+<tr><td>Validation</td><td>Pydantic</td><td>2.9.2</td><td>Request/response schemas</td></tr>
+<tr><td>Dashboard</td><td>Streamlit</td><td>1.39.0</td><td>Main operator dashboard</td></tr>
+<tr><td>Data frames</td><td>Pandas</td><td>2.2.3</td><td>Tables in the original dashboard</td></tr>
+<tr><td>Maps</td><td>Leaflet.js</td><td>1.9.4</td><td>Interactive trajectory map and heatmap</td></tr>
+<tr><td>Heatmap</td><td>Leaflet.heat</td><td>0.2.0</td><td>Heat layer on the map</td></tr>
+<tr><td>Map tiles</td><td>OpenStreetMap, Esri World Imagery</td><td>—</td><td>Street map and satellite layers</td></tr>
+<tr><td>Live video to browser</td><td>MJPEG over HTTP (Python <code>http.server</code>)</td><td>standard library</td><td>Smooth camera wall video</td></tr>
+<tr><td>Configuration</td><td>YAML (PyYAML)</td><td>6.0.2</td><td>config.yaml, camera_config.yaml, blacklist.yaml</td></tr>
+<tr><td>Testing</td><td>pytest, Hypothesis, Streamlit AppTest, FastAPI TestClient</td><td>pytest 8.2.0</td><td>665 automated tests</td></tr>
+</table>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">5. The ALPR pipeline (computer vision and AI)</h1>
+<p>Implemented in <code>scripts/run_pipeline.py</code> with components under <code>src/</code>. Each stage is described with the technology it uses and why.</p>
+
+<h2>5.1 Frame capture — OpenCV + FFmpeg</h2>
+<p><code>src/capture/frame_capture.py</code>. OpenCV's <code>VideoCapture</code> (backed by FFmpeg) opens local files, RTSP/RTMP/HTTP streams, or webcams.</p>
+<ul>
+  <li><b>Recorded files</b> are read frame by frame in order (<code>frame_skip: 1</code> — every frame).</li>
+  <li><b>Live streams</b> use a background reader thread that keeps only the newest frame, so latency cannot build up when processing is slower than the camera.</li>
+  <li>Automatic reconnection (5 retries) and stall detection (10 s without a frame).</li>
+</ul>
+
+<h2>5.2 Vehicle detection — YOLOv8 + TensorRT</h2>
+<p><b>YOLO (“You Only Look Once”)</b> is a single-pass convolutional neural network that outputs bounding boxes and class labels. The vehicle detector is <b>YOLOv8n</b> pretrained on the COCO dataset; only the classes <i>car, truck, bus, motorcycle</i> are kept.</p>
+<table>
+<tr><th>Setting</th><th>Value</th></tr>
+<tr><td>Model file</td><td><code>models/vehicle_detector/yolov8n.engine</code></td></tr>
+<tr><td>Input size</td><td>480 px</td></tr>
+<tr><td>Confidence threshold</td><td>0.5</td></tr>
+<tr><td>Precision</td><td>FP16 (half precision)</td></tr>
+</table>
+<p><b>TensorRT</b> is NVIDIA's inference optimiser. A trained model (<code>.pt</code> / <code>.onnx</code>) is compiled once into an <code>.engine</code> file tuned for this exact GPU: layers are fused, kernels are chosen for the hardware, and weights run in 16-bit floating point. On Jetson this is several times faster than running the PyTorch model directly.</p>
+
+<h2>5.3 Vehicle tracking — ByteTrack</h2>
+<p><code>src/tracking/vehicle_tracker.py</code> uses ByteTrack from the <b>Supervision</b> library. It links detections in consecutive frames into tracks, giving each physical vehicle a stable <i>track ID</i>. This is what lets several OCR readings of the same car be combined, and lets a vehicle be stored once per pass instead of once per frame. Lost tracks are kept for 60 frames; the IoU matching threshold is 0.5.</p>
+
+<h2>5.4 Plate detection — custom YOLOv8</h2>
+<p><code>src/detection/plate_detector.py</code>. A YOLOv8 model trained on number-plate images runs <i>inside each vehicle crop</i> (not the whole frame), which makes it faster and more accurate. Engine <code>models/plate_detector/best.engine</code>, input 320 px, confidence 0.4.</p>
+
+<h2>5.5 Plate preprocessing and super-resolution</h2>
+<p><code>src/preprocessing/plate_preprocessor.py</code> and <code>src/enhancement/super_resolution.py</code>:</p>
+<ul>
+  <li><b>CLAHE</b> (Contrast-Limited Adaptive Histogram Equalisation) — boosts local contrast so characters stand out.</li>
+  <li><b>Adaptive gamma</b> — brightens dark/night plates, tames glare.</li>
+  <li><b>Sharpening</b> — crisper character edges.</li>
+  <li><b>Upscaling</b> — plates narrower than 180 px are enlarged (OpenCV bicubic on Jetson; Real-ESRGAN is supported where PyTorch allows it).</li>
+</ul>
+
+<h2>5.6 OCR — PARSeq on TensorRT</h2>
+<p><code>src/ocr/parseq_tensorrt_engine.py</code>. <b>PARSeq</b> (Permuted Autoregressive Sequence model) is a transformer-based scene-text recogniser. The <i>tiny</i> variant, fine-tuned on plates, is compiled to TensorRT (<code>models/ocr/parseq_official_tiny.engine</code>, input 32×128).</p>
+<ul>
+  <li>Uses TensorRT 10's named-tensor API and <code>execute_async_v3</code>.</li>
+  <li><b>PyCUDA</b> allocates the GPU input/output buffers once and reuses them (avoids per-call allocation cost).</li>
+  <li>If the engine was built for a different GPU, it is rebuilt automatically for this one and saved.</li>
+  <li>Alternative backends selectable in config: RapidOCR (ONNX Runtime, CPU), EasyOCR, PaddleOCR, TrOCR.</li>
+</ul>
+
+<h2>5.7 Validation, fusion and de-duplication</h2>
+<table>
+<tr><th>Step</th><th>Module</th><th>How it works</th></tr>
+<tr><td>Plate validation</td><td><code>validation/plate_validator.py</code>, <code>ocr/ocr_postprocessor.py</code></td><td>Regular expressions for Indian plate formats (e.g. DL8CA1234) and BH series; common OCR confusions (O/0, I/1…) are corrected before re-validating.</td></tr>
+<tr><td>OCR fusion</td><td><code>validation/ocr_fusion.py</code></td><td>Collects up to 5 readings per track and votes; at least 2 identical readings and confidence ≥ 0.55 are required. Then an OCR pass on the best upscaled crop may replace the result if more confident.</td></tr>
+<tr><td>Duplicate filter</td><td><code>database/duplicate_filter.py</code></td><td>The same plate (or a plate within <b>Levenshtein edit distance 2</b>) within 30 s is not stored twice — catches a vehicle whose track split in two.</td></tr>
+</table>
+
+<h2>5.8 Attributes added to each detection</h2>
+<table>
+<tr><th>Attribute</th><th>Technology / method</th></tr>
+<tr><td>Plate colour</td><td>HSV colour ranges on the plate crop (<code>classification/color_classifier.py</code>)</td></tr>
+<tr><td>Registration category (<code>vehicle_type</code>)</td><td>Plate colour mapped by Indian rules: White → Private, Yellow → Commercial, Green → EV, …</td></tr>
+<tr><td>Direction (IN/OUT)</td><td>Track centroid crossing a virtual line (<code>utils/direction_detector.py</code>)</td></tr>
+<tr><td>Vehicle class</td><td>YOLO class of the tracked vehicle (car/truck/bus/motorcycle)</td></tr>
+<tr><td>Body colour</td><td>HSV heuristic on the vehicle crop (see section 10)</td></tr>
+<tr><td>Images</td><td>Full plate crop, full vehicle crop (largest view of the track), vehicle thumbnail ≤ 320 px, plate thumbnail ≥ 176 px wide — JPEG via OpenCV</td></tr>
+</table>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">6. Multi-camera layer</h1>
+<p>Package <code>src/cameras/</code>.</p>
+<table>
+<tr><th>Module</th><th>Responsibility</th></tr>
+<tr><td><code>registry.py</code></td><td>Loads <code>config/camera_config.yaml</code>; validates ids, coordinates, sources; orders cameras by <code>order</code>.</td></tr>
+<tr><td><code>sources.py</code></td><td><b>VideoSource</b> abstraction with <b>UploadSource</b> (checks the file exists and actually decodes) and <b>RTSPSource</b> (validates URL). Switching a camera from video to live is one config field: <code>source_type</code>.</td></tr>
+<tr><td><code>manager.py</code></td><td><b>CameraManager</b>: saves uploads, builds the queue, runs cameras <b>one at a time</b> on a background thread, reports progress, supports stop, deletes sessions.</td></tr>
+<tr><td><code>pipeline_models.py</code></td><td>Loads the vehicle detector, plate detector and OCR engine <b>once per process</b> and shares them with every camera (loading takes 13–40 s on this hardware).</td></tr>
+<tr><td><code>cuda_context.py</code></td><td>Pushes the CUDA primary context when a worker thread starts and pops it before the thread ends — otherwise PyCUDA aborts the whole process when processing finishes.</td></tr>
+<tr><td><code>stream_probe.py</code></td><td>TCP reachability check for RTSP URLs (seconds instead of ~3 minutes of OpenCV retries); “Test stream” preview frame; password masking in URLs.</td></tr>
+<tr><td><code>status_store.py</code></td><td>Writes live status as JSON with an atomic temp-file-and-rename, so the dashboard never reads a half-written file.</td></tr>
+<tr><td><code>preview_server.py</code></td><td>MJPEG HTTP server (port 8765) for the camera wall — see section 14.</td></tr>
+</table>
+<h3>Adding and removing camera sites</h3>
+<p>Operators manage the camera list from the dashboard (<b>Add camera</b>, and <b>Remove camera</b> on each card) or over the API (<code>POST /trajectory-api/cameras</code>, <code>DELETE /trajectory-api/cameras/{id}</code>).</p>
+<ul>
+  <li><b>Adding</b> asks for the <b>place, latitude and longitude</b>. Coordinates are required, not optional: a camera without them records events that no map or heatmap can place. The new camera is complete at once — its own upload/RTSP controls, its own panel on the camera wall, its own marker on the map and heatmap, and the last place in the processing queue. It just has no source yet.</li>
+  <li><b>Renaming</b> changes only the label. The camera keeps its id, coordinates, queue position and source, and events already recorded keep the name they were stamped with — they record what the site was called when the vehicle passed.</li>
+  <li><b>Removing</b> takes the site's configuration, its uploaded video and its last preview frame, so no still image is left behind on the wall. Detections it already recorded are <b>kept</b> — they are history and carry their own camera id and coordinates, so past trajectories still plot. The last camera cannot be removed.</li>
+  <li><b>Where it is stored:</b> <code>camera_config.yaml</code> is hand-written and heavily commented, so it is never rewritten. The operator's camera list lives beside it in <code>config/cameras_runtime.yaml</code>, written only by code; when present it replaces the shipped camera list, while <code>processing</code> and <code>trajectory</code> still come from the main file. Delete it to go back to the shipped cameras.</li>
+  <li>Neither operation is allowed while a session is running.</li>
+</ul>
+
+<h3>Why recorded files run one at a time</h3>
+<p>The Jetson has one GPU and the pipeline already uses it fully. Running cameras in parallel would make every camera slower. Sequential processing also means, for the demo, that timestamps increase camera by camera.</p>
+<h3>Why live streams run together</h3>
+<p>A live stream carries what is happening <i>now</i>. Making camera 2 wait its turn would not delay its footage, it would discard it: every vehicle passing camera 2 during camera 1's turn would simply never be seen. So every RTSP camera starts at once, on its own thread, and keeps running until the operator presses STOP — no time limit.</p>
+<p>They share one set of GPU models through a lock (<code>PipelineModels.shared()</code>), because a TensorRT execution context can only process one inference at a time. Decoding, tracking, OCR fusion and database writes still happen in parallel, which is where a live stream spends most of its time. Measured on this device with four cameras at once: about 7.9 fps each, roughly 31 fps in total, against about 20 fps for a single camera alone.</p>
+<p>A queue may mix the two: the uploaded videos run through first, then the live cameras start together and stay up.</p>
+<h3>Processing sessions</h3>
+<p>Each START creates a <b>processing session</b> id (e.g. <code>20260913-092351-5045e9</code>) stored on every detection. Sessions can be viewed separately and deleted (events, images and profiles are updated).</p>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">7. Database and SQL</h1>
+<h2>7.1 Database engines</h2>
+<table>
+<tr><th>Engine</th><th>When used</th><th>Connection</th></tr>
+<tr><td><b>SQLite</b> (default)</td><td>Single device, zero setup. File <code>data/alpr.db</code>.</td><td><code>sqlite:///data/alpr.db</code></td></tr>
+<tr><td><b>PostgreSQL</b></td><td>Production / multiple devices writing to one server.</td><td><code>DB_URL=postgresql://user:pass@host:5432/alpr_db</code></td></tr>
+</table>
+<p>Which database is used, in order of priority: environment variable <code>DB_URL</code> → <code>ALPR_DB_PATH</code> → <code>database.path</code> in <code>config.yaml</code>.</p>
+
+<h2>7.2 SQLAlchemy ORM</h2>
+<p><b>SQLAlchemy 2.0</b> maps Python classes to tables (<code>src/database/models.py</code>). The code never writes raw SQL strings for queries; SQLAlchemy generates SQL for SQLite or PostgreSQL. Sessions are opened with a context manager that commits on success and rolls back on error (<code>db.get_session()</code>).</p>
+
+<h2>7.3 Table <code>vehicle_events</code> — one row per stored detection</h2>
+<table>
+<tr><th>Column</th><th>SQL type</th><th>Meaning</th></tr>
+<tr><td>id</td><td>INTEGER PK</td><td>Auto-increment id</td></tr>
+<tr><td>plate_number</td><td>VARCHAR</td><td>Validated plate text, e.g. DL8CA1234</td></tr>
+<tr><td>vehicle_type</td><td>VARCHAR</td><td>Registration category from plate colour (Private, Commercial, EV…)</td></tr>
+<tr><td>plate_color</td><td>VARCHAR</td><td>Plate background colour</td></tr>
+<tr><td>series_type</td><td>VARCHAR</td><td>“normal” or “BH”</td></tr>
+<tr><td>timestamp</td><td>VARCHAR</td><td>ISO-8601 UTC time</td></tr>
+<tr><td>direction</td><td>VARCHAR</td><td>IN / OUT</td></tr>
+<tr><td>image_path</td><td>VARCHAR</td><td>Plate crop image</td></tr>
+<tr><td>camera_id, camera_name</td><td>VARCHAR</td><td>Which camera saw it</td></tr>
+<tr><td>latitude, longitude</td><td>DOUBLE PRECISION</td><td>Camera location (WGS84), copied at insert time</td></tr>
+<tr><td>vehicle_image_path</td><td>VARCHAR</td><td>Full vehicle crop</td></tr>
+<tr><td>trajectory_order</td><td>INTEGER</td><td>Camera's queue position at capture time</td></tr>
+<tr><td>processing_session</td><td>VARCHAR</td><td>Run id (NULL for single-gate pipeline events)</td></tr>
+<tr><td>video_source</td><td>VARCHAR</td><td>File path or RTSP URL</td></tr>
+<tr><td>confidence</td><td>DOUBLE PRECISION</td><td>Fused OCR confidence</td></tr>
+<tr><td>ocr_text</td><td>VARCHAR</td><td>Raw fused OCR string before validation</td></tr>
+<tr><td>vehicle_class</td><td>VARCHAR</td><td>YOLO class</td></tr>
+<tr><td>vehicle_color</td><td>VARCHAR</td><td>Body colour</td></tr>
+<tr><td>vehicle_thumbnail_path, plate_thumbnail_path</td><td>VARCHAR</td><td>Small JPEGs for cards</td></tr>
+</table>
+<p>Indexes: <code>idx_plate_number</code>, <code>idx_timestamp</code>, <code>idx_camera_id</code>, <code>idx_processing_session</code>.</p>
+
+<h2>7.4 Table <code>vehicle_profiles</code> — one row per plate</h2>
+<table>
+<tr><th>Column</th><th>SQL type</th><th>Meaning</th></tr>
+<tr><td>plate_number</td><td>VARCHAR UNIQUE</td><td>Vehicle key</td></tr>
+<tr><td>vehicle_class, vehicle_color, vehicle_type, plate_color</td><td>VARCHAR</td><td>Majority value over all detections</td></tr>
+<tr><td>vehicle_image_path, plate_image_path, vehicle_thumbnail_path, plate_thumbnail_path</td><td>VARCHAR</td><td>From the highest-confidence detection</td></tr>
+<tr><td>camera_id, camera_name, latitude, longitude, processing_session</td><td>VARCHAR / FLOAT</td><td>Where it was last seen</td></tr>
+<tr><td>ocr_confidence, best_confidence</td><td>FLOAT</td><td>Latest and best OCR confidence</td></tr>
+<tr><td>first_seen, last_seen</td><td>VARCHAR</td><td>ISO timestamps</td></tr>
+<tr><td>total_detections, total_camera_visits, unique_cameras</td><td>INTEGER</td><td>Counts</td></tr>
+<tr><td>trajectory_history</td><td>TEXT (JSON)</td><td>Ordered list of camera visits</td></tr>
+<tr><td>attribute_votes</td><td>TEXT (JSON)</td><td>Vote tallies behind class/colour</td></tr>
+<tr><td>updated_at</td><td>VARCHAR</td><td>Last update time</td></tr>
+</table>
+
+<h2>7.5 Schema migration</h2>
+<p>SQLAlchemy's <code>create_all()</code> creates missing tables but never changes existing ones. <code>db._migrate_schema()</code> therefore inspects the live table and runs <code>ALTER TABLE vehicle_events ADD COLUMN …</code> for any missing column, one statement per transaction. It is idempotent (safe to run on every start) and tolerates two processes migrating at the same time. When <code>vehicle_profiles</code> is created for the first time, profiles are built from existing history automatically.</p>
+
+<h2>7.6 Representative SQL (what SQLAlchemy generates)</h2>
+<h3>All detections of one plate, oldest first (trajectory)</h3>
+<pre>SELECT * FROM vehicle_events
+WHERE plate_number = 'DL8CA1234' AND processing_session IS NOT NULL
+ORDER BY timestamp ASC;</pre>
+<h3>Vehicles seen at two or more cameras</h3>
+<pre>SELECT plate_number,
+       COUNT(DISTINCT camera_id) AS camera_count,
+       COUNT(id)                 AS detection_count,
+       MIN(timestamp) AS first_seen, MAX(timestamp) AS last_seen
+FROM vehicle_events
+WHERE processing_session IS NOT NULL
+GROUP BY plate_number
+HAVING COUNT(DISTINCT camera_id) &gt;= 2
+ORDER BY camera_count DESC, detection_count DESC;</pre>
+<h3>Statistics per camera</h3>
+<pre>SELECT camera_id, camera_name, COUNT(id) AS detections,
+       COUNT(DISTINCT plate_number) AS unique_plates, AVG(confidence) AS avg_confidence
+FROM vehicle_events WHERE processing_session = :session
+GROUP BY camera_id, camera_name;</pre>
+<h3>Delete a processing session</h3>
+<pre>DELETE FROM vehicle_events WHERE processing_session = :session;
+-- then the affected vehicle_profiles are rebuilt from the remaining events</pre>
+<h3>Description search (e.g. “white commercial trucks”)</h3>
+<pre>SELECT * FROM vehicle_profiles
+WHERE vehicle_color IN ('White') AND vehicle_class IN ('truck')
+  AND vehicle_type IN ('Commercial')
+ORDER BY last_seen DESC;</pre>
+
+<h2>7.7 Files stored on disk</h2>
+<table>
+<tr><th>Folder</th><th>Contents</th></tr>
+<tr><td><code>data/plate_crops/</code></td><td>Plate images</td></tr>
+<tr><td><code>data/vehicle_crops/</code></td><td>Vehicle images</td></tr>
+<tr><td><code>data/thumbnails/vehicles</code>, <code>/plates</code></td><td>Card-sized thumbnails</td></tr>
+<tr><td><code>data/uploads/</code></td><td>Uploaded videos, one file per camera</td></tr>
+<tr><td><code>data/live_frames/</code></td><td>Latest annotated frame per camera (camera wall)</td></tr>
+<tr><td><code>data/processing_status.json</code></td><td>Live processing status</td></tr>
+</table>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">8. Trajectory reconstruction and GIS</h1>
+<p>Package <code>src/trajectory/</code>. Works on plain data, not on the database, so the logic is fully unit-tested.</p>
+<ol>
+  <li><b>Group into visits</b> — consecutive detections at the same camera within 300 s become one visit; a genuine return to a camera later is a new visit.</li>
+  <li><b>Order</b> — by timestamp; if any timestamp is unusable, by camera queue order (<code>order_by: auto</code>).</li>
+  <li><b>Measure each leg</b> between consecutive visits:
+    <ul>
+      <li><b>Distance</b> — Haversine great-circle formula on Earth radius 6371.0088 km.</li>
+      <li><b>Bearing</b> — initial compass bearing (used to rotate map arrows).</li>
+      <li><b>Duration</b> and <b>speed</b> = distance ÷ time (only when both exist and time &gt; 0).</li>
+    </ul></li>
+  <li><b>Output</b> — ordered points, legs, summary figures, and <b>GeoJSON</b> (RFC 7946): one LineString for the path plus one Point per visit.</li>
+</ol>
+<div class="note"><b>Coordinate order:</b> GeoJSON uses <code>[longitude, latitude]</code>; Leaflet uses <code>[latitude, longitude]</code>. The conversion happens in one place (<code>trajectory/geojson.py</code>).</div>
+<p>Coordinates always come from the camera location stored on each detection — no route is hard-coded.</p>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">9. Maps and the traffic heatmap</h1>
+<h2>9.1 Mapping technology</h2>
+<table>
+<tr><th>Technology</th><th>Role</th></tr>
+<tr><td>Leaflet.js 1.9.4</td><td>Open-source JavaScript map library, loaded from cdnjs</td></tr>
+<tr><td>OpenStreetMap tiles</td><td>Street map layer</td></tr>
+<tr><td>Esri World Imagery (+ reference labels)</td><td>Satellite layer</td></tr>
+<tr><td>Leaflet.heat 0.2.0</td><td>Heat layer plugin</td></tr>
+<tr><td>Streamlit <code>components.html</code></td><td>Embeds the self-contained map page in the dashboard</td></tr>
+</table>
+<p>The map HTML is generated in Python (<code>src/mapping/leaflet.py</code>, <code>src/mapping/heatmap.py</code>). Vehicle thumbnails are embedded as base64 data URIs because the embedded frame cannot read local files.</p>
+<h2>9.2 Trajectory map</h2>
+<p>Colour-graded polyline (green at the first camera → red at the last), direction arrows rotated to each leg's bearing, numbered markers with popups (camera, plate, time, confidence, image), street/satellite toggle, legend with path length.</p>
+<h2>9.3 Traffic heatmap</h2>
+<table>
+<tr><th>View</th><th>What each camera's value means</th></tr>
+<tr><td><b>Where vehicles are now</b> (default)</td><td>Number of vehicles whose <i>most recent</i> sighting was at that camera. If four vehicles passed cameras 1→2→3 and were last seen at 4, only camera 4 is red.</td></tr>
+<tr><td>Total traffic per camera</td><td>Every detection recorded at that camera.</td></tr>
+</table>
+<p>Colours run green → red with the count; grey means no vehicles. Follows the sidebar session scope.</p>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">10. Vehicle profiles and body-colour detection</h1>
+<h2>10.1 Profiles</h2>
+<p><code>src/database/vehicle_profiles.py</code>. Each detection is folded into the plate's profile inside the same database transaction, isolated in a <b>savepoint</b> so a profile error can never lose the detection. The same fold function can rebuild a profile from all events, so live and rebuilt profiles are identical.</p>
+<ul>
+  <li>Class and colour are <b>majority votes</b>, ignoring “Unknown”.</li>
+  <li>Images come from the highest-confidence detection.</li>
+  <li>Out-of-order detections trigger a rebuild so history stays in time order.</li>
+  <li>Deleting a session rebuilds affected profiles; a profile with no events left is deleted.</li>
+</ul>
+<h2>10.2 Body-colour detection</h2>
+<p><code>src/classification/vehicle_color.py</code> — a fast HSV (Hue-Saturation-Value) colour heuristic, no extra model. Supported: White, Black, Silver, Gray, Blue, Red, Green, Yellow, Brown, Orange.</p>
+<ol>
+  <li>Skip the top 35% of the vehicle box (windscreen and roof reflect sky) and the edges.</li>
+  <li>Downscale to ~64 px wide and convert BGR → HSV.</li>
+  <li>If ≥ 25% of pixels are saturated (S ≥ 55, V ≥ 50) the vehicle is <i>coloured</i>: vote on hue bands (brown = dark orange).</li>
+  <li>Otherwise it is <i>achromatic</i>: median brightness decides White (≥180) / Silver (≥130) / Gray (≥70) / Black.</li>
+</ol>
+<p>Measured accuracy: <b>30 of 36</b> hand-labelled vehicle crops from this site's videos. Cost ≈ 0.5 ms per stored vehicle. Thresholds are configurable under <code>vehicle_color:</code> in config.yaml.</p>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">11. Vehicle search (natural-language parser)</h1>
+<p><code>src/search/nl_query.py</code> turns a typed sentence into database filters. It is a <b>rule-based parser</b> using regular expressions and vocabularies, running locally — <i>not</i> a large language model (no model or API key is installed on the device). It answers instantly and offline.</p>
+<table>
+<tr><th>Feature</th><th>Example words</th><th>Filters on</th></tr>
+<tr><td>Body colour</td><td>white, grey, navy, maroon…</td><td>vehicle_color</td></tr>
+<tr><td>Vehicle type</td><td>car, suv, truck, lorry, bus, bike, scooter</td><td>vehicle_class</td></tr>
+<tr><td>Registration</td><td>private, commercial, taxi, electric, govt, diplomatic, army</td><td>vehicle_type</td></tr>
+<tr><td>Plate colour</td><td>“yellow plate”, “green number”</td><td>plate_color</td></tr>
+<tr><td>Plate</td><td>DL8CA1234, “plate KA02”</td><td>plate_number</td></tr>
+<tr><td>BH series</td><td>“bh series”</td><td>series_type</td></tr>
+<tr><td>Direction</td><td>entering, leaving, exit</td><td>direction</td></tr>
+<tr><td>Cameras visited</td><td>“3+ cameras”, “more than 1 cameras”, “multiple cameras”</td><td>unique_cameras</td></tr>
+<tr><td>Confidence</td><td>“high confidence”, “confidence above 80%”</td><td>best_confidence</td></tr>
+<tr><td>Time</td><td>today, yesterday, after 9am, before 18:30, between 9 and 11am, last 2 hours, 2026-09-12</td><td>visit times</td></tr>
+<tr><td>Camera</td><td>“at India Gate”, CAM002</td><td>visit camera</td></tr>
+</table>
+<p>Time and camera must be true for the <b>same visit</b>. Results show each vehicle's picture, colour, type, last matching camera and time, and a <b>View trajectory</b> button. The dashboard prints what was understood (e.g. “colour White, type car, seen after 13 Sep 09:00”).</p>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">12. Blacklisted vehicles</h1>
+<p><code>src/alerts/blacklist.py</code>, list stored in <code>config/blacklist.yaml</code> (currently <b>DL7CD5017</b>).</p>
+<ul>
+  <li><b>Matching</b> — case-insensitive, ignoring spaces and dashes; exact otherwise.</li>
+  <li><b>Live alert</b> — when the pipeline stores a blacklisted plate, the processing log shows “ALERT: BLACKLISTED vehicle … detected at &lt;camera&gt;” and a warning is logged.</li>
+  <li><b>Dashboard banner</b> — red alert at the top listing each blacklisted plate, last camera, time and number of sightings (from all sessions).</li>
+  <li><b>Management</b> — “Blacklisted vehicles” section to add (with reason) or remove plates; view image and trajectory.</li>
+  <li><b>Badges</b> — red BLACKLISTED badge on search results and trajectory card.</li>
+  <li>The file is re-read when it changes, so edits apply even during a running session.</li>
+</ul>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">13. REST API (FastAPI)</h1>
+<p><code>src/api/server.py</code> and <code>src/api/trajectory_routes.py</code>. Built with <b>FastAPI</b> (on <b>Starlette</b>), request/response schemas in <b>Pydantic</b> (<code>src/api/schemas.py</code>), served by <b>Uvicorn</b>. Interactive documentation is generated automatically at <code>http://&lt;device&gt;:8000/docs</code> (Swagger UI) and <code>/redoc</code>.</p>
+<h2>13.1 Core endpoints</h2>
+<table>
+<tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+<tr><td>POST</td><td>/entry</td><td>Record a vehicle event (JSON body)</td></tr>
+<tr><td>GET</td><td>/logs</td><td>All events, newest first</td></tr>
+<tr><td>GET</td><td>/search?plate=</td><td>Events for a plate</td></tr>
+<tr><td>GET</td><td>/direction?direction=IN|OUT</td><td>Events by direction</td></tr>
+<tr><td>GET</td><td>/stats</td><td>Today's statistics</td></tr>
+<tr><td>GET</td><td>/vehicles/{plate}</td><td>History of a vehicle, plus its profile</td></tr>
+<tr><td>GET</td><td>/live</td><td>Most recent events</td></tr>
+<tr><td>GET</td><td>/settings</td><td>Read-only configuration</td></tr>
+<tr><td>GET</td><td>/health</td><td>Health check</td></tr>
+<tr><td>POST</td><td>/clear</td><td>Delete all events and images</td></tr>
+<tr><td>GET</td><td>/snapshot, /stream</td><td>Current frame / MJPEG live feed (single-gate)</td></tr>
+<tr><td>—</td><td>/media, /thumbnails</td><td>Static image files</td></tr>
+</table>
+<h2>13.2 Multi-camera endpoints (<code>/trajectory-api</code>)</h2>
+<table>
+<tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+<tr><td>GET</td><td>/cameras</td><td>Camera registry</td></tr>
+<tr><td>POST</td><td>/cameras</td><td>Add a camera site (place + coordinates)</td></tr>
+<tr><td>PATCH</td><td>/cameras/{camera_id}</td><td>Rename a camera site</td></tr>
+<tr><td>DELETE</td><td>/cameras/{camera_id}</td><td>Remove a camera site; its events are kept</td></tr>
+<tr><td>POST</td><td>/cameras/upload</td><td>Upload videos for all cameras at once</td></tr>
+<tr><td>POST</td><td>/cameras/{camera_id}/upload</td><td>Upload one camera's video</td></tr>
+<tr><td>POST</td><td>/cameras/{camera_id}/rtsp</td><td>Switch a camera to an RTSP URL</td></tr>
+<tr><td>POST</td><td>/processing/start</td><td>Start the sequential run</td></tr>
+<tr><td>POST</td><td>/processing/stop</td><td>Request a stop</td></tr>
+<tr><td>GET</td><td>/processing/status</td><td>Live progress</td></tr>
+<tr><td>GET</td><td>/trajectory/{plate}</td><td>Reconstructed path, legs and profile</td></tr>
+<tr><td>GET</td><td>/map/{plate}</td><td>Path as GeoJSON</td></tr>
+<tr><td>GET</td><td>/map/{plate}/html</td><td>Path as a Leaflet page</td></tr>
+<tr><td>GET</td><td>/vehicles</td><td>Vehicle profiles, most recent first</td></tr>
+<tr><td>GET</td><td>/vehicles/{plate}</td><td>One vehicle profile</td></tr>
+<tr><td>GET</td><td>/statistics</td><td>Per-camera and total statistics</td></tr>
+<tr><td>GET</td><td>/plates</td><td>Plates seen at N+ cameras</td></tr>
+<tr><td>GET</td><td>/sessions</td><td>Processing sessions</td></tr>
+<tr><td>DELETE</td><td>/sessions/{session_id}</td><td>Delete a session and its events</td></tr>
+</table>
+<h2>13.3 Example</h2>
+<pre>curl http://localhost:8000/trajectory-api/trajectory/KA02MH7256
+{
+  "plate_number": "KA02MH7256",
+  "path_labels": ["India Gate", "Connaught Place"],
+  "cameras_visited": 2,
+  "total_distance_km": 2.4163,
+  "legs": [{"from_camera_name": "India Gate", "to_camera_name": "Connaught Place",
+            "distance_km": 2.4163, "duration_seconds": 37.0, "bearing_degrees": 328.9, ...}],
+  "profile": {"vehicle_class": "car", "vehicle_color": "Blue", "total_camera_visits": 2, ...}
+}</pre>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">14. Dashboards and live video</h1>
+<h2>14.1 Multi-camera dashboard (main) — Streamlit</h2>
+<p><code>src/dashboard/trajectory_app.py</code>, port 8501. Streamlit re-runs the Python script on every interaction and renders widgets as a web page; long-lived objects (camera manager, models, preview server) are kept in module-level singletons so they survive reruns.</p>
+<p>The console is split into three pages, each with one job. Home is the page an operator leaves open all day, so it carries nothing they only touch when starting a run; Operations carries exactly those controls.</p>
+<table>
+<tr><th>Page</th><th>Sections, in order</th></tr>
+<tr><td><b>Home</b><br>watching</td><td>
+  <b>Blacklisted vehicles</b> — alert banner, watch list, add/remove plates, sightings<br>
+  <b>Camera feeds</b> — live video wall, four feeds per row<br>
+  <b>Search vehicle by plate number</b> — with a “seen at 2+ cameras” picker<br>
+  <b>Search vehicles by description</b> — image results; click one for its route<br>
+  <b>Traffic heatmap</b> — “Where vehicles are now” or “Total traffic per camera”
+</td></tr>
+<tr><td><b>Operations</b><br>running</td><td>The three sections stacked full width, in the order the work happens:<br>
+  <b>Cameras</b> — four camera cards per row (a fifth starts the next row), each with Upload video <i>or</i> RTSP stream, Set/Test stream, Clear, Rename, Remove; then Add camera and START/STOP PROCESSING<br>
+  <b>Live Processing Status</b> — current camera, FPS, progress bars, time remaining, current plate and vehicle, processing log<br>
+  <b>Statistics</b> — vehicles detected, unique plates, processing time, average OCR and detection time, detections per camera
+</td></tr>
+<tr><td><b>Trajectory</b><br>one vehicle</td><td>Vehicle and plate images, type, colour, metrics, timeline, route map, detection history, GeoJSON download</td></tr>
+<tr><td>Sidebar (all pages)</td><td>Auto-refresh, session scope, delete session, camera network, reload config</td></tr>
+</table>
+<p>Either search on Home opens the vehicle on the Trajectory page.</p>
+<h2>14.2 Other dashboards</h2>
+<ul>
+  <li><b>Original Streamlit dashboard</b> — <code>src/dashboard/app.py</code>: live feed cards, search, analytics (Plotly charts), vehicle history, CSV export.</li>
+  <li><b>Web dashboard</b> — <code>src/dashboard_web/</code> (HTML, CSS, JavaScript), served by FastAPI at <code>/</code>.</li>
+</ul>
+<h2>14.3 Smooth live video — MJPEG preview server</h2>
+<ul>
+  <li>The pipeline's <b>LiveFramePublisher</b> writes each camera's annotated frame to <code>data/live_frames/&lt;camera&gt;.jpg</code> at up to 15 fps, downscaled to 960 px, encoded on a <b>background thread</b> so ALPR is not slowed.</li>
+  <li>The <b>preview server</b> (Python <code>http.server</code>, port 8765) streams those files as <b>MJPEG</b> (<code>multipart/x-mixed-replace</code>), which browsers play natively in an <code>&lt;img&gt;</code> tag.</li>
+  <li>The player HTML never changes between Streamlit reruns, so the video keeps playing continuously.</li>
+  <li>Measured: 14.1 fps (recorded video) and 13.6 fps (RTSP) delivered to the browser, versus 0.5 fps before.</li>
+</ul>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">15. Configuration files</h1>
+<table>
+<tr><th>File</th><th>Purpose</th><th>Key settings</th></tr>
+<tr><td><code>config/config.yaml</code></td><td>Pipeline, database, API, dashboard tuning</td><td><code>video</code> (frame_skip, retries), <code>detection</code> (model paths, thresholds, FP16), <code>tracking</code>, <code>preprocessing</code>, <code>enhancement</code>, <code>ocr</code> (backend, PARSeq engine), <code>fusion</code>, <code>deduplication</code>, <code>vehicle_color</code>, <code>color_classifier</code>, <code>direction</code>, <code>database</code> (path, image and thumbnail folders), <code>api</code> (ports, live frames, preview port), <code>logging</code>, <code>training</code></td></tr>
+<tr><td><code>config/camera_config.yaml</code></td><td>Camera network</td><td>Per camera: camera_id, camera_name, latitude, longitude, video_path, rtsp_url, source_type, enabled, order; <code>processing</code> (upload dir, status file, continue_on_error); <code>trajectory</code> (order_by, collapse, revisit gap)</td></tr>
+<tr><td><code>config/cameras_runtime.yaml</code></td><td>Cameras added or removed from the dashboard</td><td>Written by the app; replaces the shipped camera list. Delete it to restore the four shipped cameras.</td></tr>
+<tr><td><code>config/blacklist.yaml</code></td><td>Watch list</td><td>plate, reason, added</td></tr>
+<tr><td><code>.env</code></td><td>Local overrides (not in git)</td><td><code>ALPR_VIDEO_SOURCE</code>, <code>ALPR_DB_PATH</code>, <code>DB_URL</code></td></tr>
+</table>
+<h3>Camera sites</h3>
+<table>
+<tr><th>ID</th><th>Name</th><th>Latitude</th><th>Longitude</th></tr>
+<tr><td>CAM001</td><td>India Gate</td><td>28.6129</td><td>77.2295</td></tr>
+<tr><td>CAM002</td><td>Connaught Place</td><td>28.6315</td><td>77.2167</td></tr>
+<tr><td>CAM003</td><td>Karol Bagh</td><td>28.6519</td><td>77.1909</td></tr>
+<tr><td>CAM004</td><td>Kashmere Gate</td><td>28.6675</td><td>77.2273</td></tr>
+</table>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">16. Project structure</h1>
+<pre>
+alpr-university-gate/
+├── config/               config.yaml · camera_config.yaml · blacklist.yaml
+├── scripts/run_pipeline.py   ALPR pipeline (CLI entry: python main.py)
+├── src/
+│   ├── capture/          OpenCV frame capture (files, RTSP, webcam)
+│   ├── detection/        YOLOv8 vehicle and plate detectors
+│   ├── tracking/         ByteTrack vehicle tracker
+│   ├── preprocessing/    plate image preprocessing
+│   ├── enhancement/      super-resolution / upscaling
+│   ├── ocr/              PARSeq TensorRT, RapidOCR, other OCR backends
+│   ├── validation/       plate validation, OCR fusion
+│   ├── classification/   plate colour, registration category, body colour
+│   ├── database/         SQLAlchemy models, queries, migration, profiles
+│   ├── cameras/          registry, sources, manager, preview server, CUDA context
+│   ├── trajectory/       trajectory engine, GeoJSON
+│   ├── mapping/          Leaflet trajectory map, heatmap
+│   ├── search/           natural-language vehicle query parser
+│   ├── alerts/           blacklist
+│   ├── api/              FastAPI server, routes, schemas
+│   ├── dashboard/        Streamlit dashboards
+│   ├── dashboard_web/    HTML/JS web dashboard
+│   └── utils/            config, logging, live frames, Jetson paths
+├── models/               TensorRT engines and weights
+├── data/                 SQLite database, images, uploads, live frames
+├── tests/                unit and integration tests
+├── training/             model training scripts
+└── docs/                 documentation
+</pre>
+<p>Size: about 17,300 lines of Python in <code>src/</code> and <code>scripts/</code>.</p>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">17. Running the system</h1>
+<h2>17.1 Processes and ports</h2>
+<table>
+<tr><th>Process</th><th>Port</th><th>Start command</th></tr>
+<tr><td>Multi-camera dashboard (includes processing)</td><td>8501</td><td><code>streamlit run src/dashboard/trajectory_app.py</code></td></tr>
+<tr><td>Camera wall video streams (started by dashboard)</td><td>8765</td><td>automatic</td></tr>
+<tr><td>REST API + web dashboard</td><td>8000</td><td><code>uvicorn src.api.server:app --host 0.0.0.0 --port 8000</code></td></tr>
+<tr><td>Single-gate pipeline (optional)</td><td>—</td><td><code>python main.py</code> or <code>python scripts/run_pipeline.py --source ALPR.mp4</code></td></tr>
+<tr><td>Original dashboard (optional)</td><td>8501</td><td><code>streamlit run src/dashboard/app.py</code></td></tr>
+</table>
+<p>Activate the environment first: <code>source /home/ansh/alpr/alpr_env/bin/activate</code>, then run commands from the project folder.</p>
+<h2>17.2 Typical workflow</h2>
+<ol>
+  <li>Open <code>http://&lt;jetson-ip&gt;:8501</code>.</li>
+  <li>For each camera choose <b>Upload video</b> or <b>RTSP stream</b> (use <b>Test stream</b> to check a camera).</li>
+  <li>Press <b>START PROCESSING</b> and watch the live status and camera wall.</li>
+  <li>Search a plate or describe a vehicle; click <b>View trajectory</b>.</li>
+  <li>Review the heatmap, statistics, blacklist alerts; delete old sessions from the sidebar.</li>
+</ol>
+<h2>17.3 Moving a camera to live RTSP</h2>
+<pre>- camera_id: "CAM001"
+  source_type: "rtsp"
+  rtsp_url: "rtsp://user:password@192.168.1.100:554/11"</pre>
+<p>Nothing else changes. Every live camera runs together with the others, continuously, until the session is stopped.</p>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">18. Measured performance (Jetson Orin)</h1>
+<table>
+<tr><th>Measurement</th><th>Result</th></tr>
+<tr><td>Model load (once per process)</td><td>13–40 s (plus ~3 min once if the OCR engine is rebuilt for a new GPU)</td></tr>
+<tr><td>Pipeline speed, ALPR.mp4</td><td>≈ 19–22 fps</td></tr>
+<tr><td>Pipeline speed, mycarplate.mp4 (heavier)</td><td>≈ 2 fps</td></tr>
+<tr><td>Pipeline speed, live RTSP camera</td><td>≈ 20–24 fps</td></tr>
+<tr><td>Four cameras running together (shared models)</td><td>≈ 7.9 fps each, ≈ 31 fps in total</td></tr>
+<tr><td>Camera wall video in browser</td><td>13.6–14.1 fps</td></tr>
+<tr><td>Body colour detection</td><td>≈ 0.5 ms per stored vehicle</td></tr>
+<tr><td>Thumbnails (both)</td><td>≈ 1.3 ms per stored vehicle</td></tr>
+<tr><td>Profile update</td><td>≈ +14 ms on each database insert</td></tr>
+<tr><td>Unreachable RTSP camera detected</td><td>≤ 3 s (was ≈ 3 min)</td></tr>
+</table>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">19. Testing</h1>
+<table>
+<tr><th>Tool</th><th>Used for</th></tr>
+<tr><td><b>pytest</b> 8.2.0</td><td>Test runner — 665 automated tests (<code>tests/unit</code>, <code>tests/integration</code>)</td></tr>
+<tr><td><b>Hypothesis</b> 6.100.0</td><td>Property-based tests (random inputs) for validation logic</td></tr>
+<tr><td><b>FastAPI TestClient</b></td><td>Calls every API endpoint against temporary databases</td></tr>
+<tr><td><b>Streamlit AppTest</b></td><td>Renders the dashboard and clicks through it (uploads, RTSP, search, delete, blacklist)</td></tr>
+<tr><td>Real-footage checks</td><td>End-to-end runs on ALPR.mp4, mycarplate.mp4 and the live RTSP camera; 36 hand-labelled crops for colour accuracy</td></tr>
+</table>
+<p>Run: <code>python -m pytest tests/ -q</code>.</p>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">20. Known limitations</h1>
+<ul>
+  <li><b>Vehicle search is rule-based</b>, not a large language model; it understands the vocabulary in section 11, not arbitrary sentences.</li>
+  <li><b>Body colour is a heuristic</b> (30/36 on real crops); watermarks, reflections and partly hidden vehicles can mislead it.</li>
+  <li><b>Blacklist matching is exact</b>; an OCR misread of a blacklisted plate will not trigger an alert.</li>
+  <li><b>Uploaded videos are processed one at a time</b>, so a long queue of recordings takes the sum of their runtimes. Live cameras do run together and continuously; they share one GPU, so each stream runs slower than a single camera would.</li>
+  <li><b>Demo speeds look unrealistic</b> (hundreds of km/h) because one video is replayed at sites kilometres apart; real cameras give real travel times.</li>
+  <li><b>Clock sync</b>: trajectories order by timestamps, so live cameras/devices need NTP time synchronisation.</li>
+  <li>The camera wall uses a second port (8765); it must be reachable from viewing computers.</li>
+  <li>At process exit PyCUDA may print an “Exception ignored” message; it does not affect data or the running dashboard.</li>
+</ul>
+
+<!-- ═════════════════════════════════════════════════════════════════════ -->
+<h1 class="pb">21. Glossary</h1>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td>ALPR / ANPR</td><td>Automatic Licence (Number) Plate Recognition</td></tr>
+<tr><td>YOLO</td><td>“You Only Look Once” — real-time object detection neural network</td></tr>
+<tr><td>COCO</td><td>Large public image dataset with 80 object classes, used to pretrain YOLO</td></tr>
+<tr><td>TensorRT engine</td><td>A model compiled and optimised for one specific NVIDIA GPU</td></tr>
+<tr><td>FP16</td><td>16-bit floating point; halves memory and speeds up GPU inference</td></tr>
+<tr><td>CUDA</td><td>NVIDIA's platform for running computations on the GPU</td></tr>
+<tr><td>ByteTrack</td><td>Multi-object tracking algorithm that links detections across frames</td></tr>
+<tr><td>OCR</td><td>Optical Character Recognition — reading text from images</td></tr>
+<tr><td>PARSeq</td><td>Transformer-based scene-text recognition model</td></tr>
+<tr><td>CLAHE</td><td>Contrast-Limited Adaptive Histogram Equalisation</td></tr>
+<tr><td>Levenshtein distance</td><td>Number of single-character edits between two strings</td></tr>
+<tr><td>HSV</td><td>Hue-Saturation-Value colour space, convenient for colour rules</td></tr>
+<tr><td>RTSP</td><td>Real Time Streaming Protocol, used by IP cameras</td></tr>
+<tr><td>MJPEG</td><td>Motion JPEG — video sent as a stream of JPEG images over HTTP</td></tr>
+<tr><td>ORM</td><td>Object-Relational Mapper (SQLAlchemy) — Python objects ↔ database rows</td></tr>
+<tr><td>REST API</td><td>HTTP interface returning JSON</td></tr>
+<tr><td>ASGI</td><td>Asynchronous Server Gateway Interface — how Uvicorn runs FastAPI</td></tr>
+<tr><td>GeoJSON</td><td>Standard JSON format for geographic features (RFC 7946)</td></tr>
+<tr><td>WGS84</td><td>World coordinate system used by GPS (latitude/longitude)</td></tr>
+<tr><td>Haversine</td><td>Formula for distance between two latitude/longitude points on a sphere</td></tr>
+<tr><td>Processing session</td><td>One START-to-finish run over the camera queue</td></tr>
+<tr><td>Vehicle profile</td><td>One summary record per plate across all detections</td></tr>
+<tr><td>Savepoint</td><td>A nested transaction that can be rolled back without undoing the outer one</td></tr>
+</table>
+
+</body>
+</html>

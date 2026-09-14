@@ -7,10 +7,13 @@ dashboard mounted at "/". Every existing endpoint keeps its path and its
 behaviour; this module only adds.
 
   GET  /trajectory-api/cameras                camera registry
+  POST /trajectory-api/cameras                add a camera site
+  PATCH /trajectory-api/cameras/{id}          rename a camera site
+  DEL  /trajectory-api/cameras/{id}           remove a camera site
   POST /trajectory-api/cameras/upload         upload every camera's video at once
   POST /trajectory-api/cameras/{id}/upload    upload one camera's video
   POST /trajectory-api/cameras/{id}/rtsp      switch a camera to RTSP
-  POST /trajectory-api/processing/start       start the sequential run
+  POST /trajectory-api/processing/start       start the run (files in turn, streams together)
   POST /trajectory-api/processing/stop        request a stop
   GET  /trajectory-api/processing/status      live progress
   GET  /trajectory-api/trajectory/{plate}     reconstructed path
@@ -33,7 +36,9 @@ from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.api.schemas import (
+    AddCameraRequest,
     CameraResponse,
+    RenameCameraRequest,
     RTSPRequest,
     StartProcessingRequest,
     StartProcessingResponse,
@@ -135,6 +140,72 @@ def _reconstruct(plate: str, processing_session: Optional[str]):
 def list_cameras():
     """Return every configured camera, in processing order."""
     return [CameraResponse(**camera.to_dict()) for camera in _get_registry()]
+
+
+@router.post("/cameras", response_model=CameraResponse, status_code=201)
+def add_camera(request: AddCameraRequest):
+    """Register a new camera site, and persist it.
+
+    The camera is complete immediately: it takes an upload or an RTSP URL
+    like any other, joins the end of the processing queue, and appears on the
+    camera wall, the map and the heatmap.
+    """
+    manager = _get_manager()
+    try:
+        camera = manager.add_camera(
+            camera_name=request.camera_name,
+            latitude=request.latitude,
+            longitude=request.longitude,
+            camera_id=request.camera_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return CameraResponse(**camera.to_dict())
+
+
+@router.patch("/cameras/{camera_id}", response_model=CameraResponse)
+def rename_camera(camera_id: str, request: RenameCameraRequest):
+    """Rename a camera site.
+
+    Only the label changes: the camera keeps its id, coordinates, queue
+    position and source. Events already recorded keep the name they were
+    stamped with -- they record what the site was called at the time.
+    """
+    manager = _get_manager()
+    try:
+        camera = manager.rename_camera(camera_id, request.camera_name)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"No camera {camera_id!r}")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return CameraResponse(**camera.to_dict())
+
+
+@router.delete("/cameras/{camera_id}")
+def remove_camera(camera_id: str):
+    """Remove a camera site, its uploaded video and its preview frame.
+
+    Detections it already recorded are kept: they are history, and they carry
+    their own camera id and coordinates, so past trajectories still plot.
+    """
+    manager = _get_manager()
+    try:
+        camera = manager.remove_camera(camera_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"No camera {camera_id!r}")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "camera_id": camera.camera_id,
+        "camera_name": camera.camera_name,
+        "message": f"Removed {camera.camera_name}; its recorded events were kept",
+    }
 
 
 @router.post("/cameras/{camera_id}/upload")
@@ -266,9 +337,30 @@ def set_camera_rtsp(camera_id: str, request: RTSPRequest):
 # ── processing control ────────────────────────────────────────────────────
 
 
+def _queue_message(manager, queue) -> str:
+    """Say what the run will actually do, per kind of source."""
+    recorded, live = manager.split_queue(queue)
+    parts = []
+    if recorded:
+        parts.append(
+            f"{len(recorded)} recorded camera(s) one at a time: "
+            + " -> ".join(camera.camera_name for camera in recorded)
+        )
+    if live:
+        parts.append(
+            f"{len(live)} live stream(s) together until stopped: "
+            + ", ".join(camera.camera_name for camera in live)
+        )
+    return "; ".join(parts) or "Nothing to process"
+
+
 @router.post("/processing/start", response_model=StartProcessingResponse)
 def start_processing(request: StartProcessingRequest):
-    """Start the sequential run. Returns as soon as the queue is scheduled."""
+    """Start the run. Returns as soon as the queue is scheduled.
+
+    Recorded videos are processed one at a time, in queue order; live RTSP
+    cameras then all run together until /processing/stop.
+    """
     manager = _get_manager()
     try:
         queue = manager.build_queue(request.camera_ids)
@@ -283,10 +375,7 @@ def start_processing(request: StartProcessingRequest):
     return StartProcessingResponse(
         session_id=session_id,
         queued_cameras=[camera.camera_id for camera in queue],
-        message=(
-            f"Processing {len(queue)} camera(s) sequentially: "
-            + " -> ".join(camera.camera_name for camera in queue)
-        ),
+        message=_queue_message(manager, queue),
     )
 
 

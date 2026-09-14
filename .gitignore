@@ -55,3 +55,6 @@ Thumbs.db
 
 # Archives
 *.zip
+
+# Cameras added or removed from the dashboard (runtime state, per device).
+config/cameras_runtime.yaml

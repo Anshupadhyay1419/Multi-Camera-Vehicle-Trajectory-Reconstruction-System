@@ -9,14 +9,18 @@ untouched and still runs (`streamlit run src/dashboard/app.py`); the two
 read the same database and neither depends on the other.
 
 Layout
-    HEADER          title + live session state
-    OPERATIONS tab  LEFT   per-camera upload + status, START PROCESSING
-                    CENTER live processing status (camera, progress, plate,
-                           vehicle, FPS, logs)
-                    RIGHT  statistics
-                    BOTTOM search panel
-    TRAJECTORY tab  search result: vehicle, summary, timeline, map,
-                    history table
+    HEADER           title + live session state, and the blacklist alert
+    HOME tab         blacklisted vehicles, camera feeds, search by plate
+                     number, search by description, traffic heatmap
+    OPERATIONS tab   LEFT   per-camera source + START PROCESSING
+                     CENTER live processing status (camera, progress, plate,
+                            vehicle, FPS, logs)
+                     RIGHT  statistics, including detections per camera
+    TRAJECTORY tab   search result: vehicle, summary, timeline, map,
+                     history table
+
+Home is what an operator leaves open; Operations holds the controls they
+touch when starting a run. Either search on Home opens the Trajectory tab.
 
 Processing runs on a background thread owned by the CameraManager singleton
 (see cameras/manager.py). Streamlit re-runs this script top to bottom on
@@ -29,6 +33,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -46,7 +51,7 @@ import streamlit.components.v1 as components
 from src.cameras.manager import get_camera_manager, reset_camera_manager
 from src.cameras.preview_server import get_preview_server
 from src.cameras.models import CameraState, SessionState
-from src.cameras.registry import CameraConfigError, load_camera_registry
+from src.cameras.registry import CameraConfigError
 from src.cameras.sources import VideoSourceError
 from src.cameras.stream_probe import grab_preview_frame, mask_credentials, probe_stream
 from src.database import db as database
@@ -61,7 +66,20 @@ from src.utils.data_reset import delete_processing_session
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPO_ROOT / "config" / "config.yaml"
-CAMERA_CONFIG_PATH = REPO_ROOT / "config" / "camera_config.yaml"
+DEFAULT_CAMERA_CONFIG_PATH = REPO_ROOT / "config" / "camera_config.yaml"
+
+
+def camera_config_path() -> Path:
+    """Where this page reads its cameras from.
+
+    ALPR_CAMERA_CONFIG mirrors ALPR_DB_PATH: it points the page at another
+    camera registry without editing the shipped one, so a test (or a second
+    deployment on the same machine) can work on its own file. Read on every
+    call rather than frozen at import, because this module stays in
+    sys.modules across reruns -- a value captured once would outlive the
+    environment it was read from.
+    """
+    return Path(os.getenv("ALPR_CAMERA_CONFIG") or DEFAULT_CAMERA_CONFIG_PATH)
 
 # How often the page re-runs itself while a session is in progress. Fast
 # enough to feel live, slow enough that the rerun (which re-reads the status
@@ -147,21 +165,32 @@ st.markdown(
 
 @st.cache_resource
 def _bootstrap() -> dict:
-    """Load config, open the database, and read the camera registry once.
+    """Load the config and open the database once.
 
     `cache_resource` (not `cache_data`): these are live handles, and the
     database must be initialised exactly once per process, not once per
-    rerun.
+    rerun. The camera registry is deliberately NOT cached here -- see
+    _registry().
     """
     config = load_config(str(CONFIG_PATH))
     database.init_db(config.get("database", {}).get("path", "data/alpr.db"))
-    registry = load_camera_registry(str(CAMERA_CONFIG_PATH))
-    return {"config": config, "registry": registry}
+    return {"config": config}
 
 
 def _manager():
-    """This process's CameraManager, sharing the bootstrapped registry."""
-    return get_camera_manager(_bootstrap()["config"], str(CAMERA_CONFIG_PATH))
+    """This process's CameraManager."""
+    return get_camera_manager(_bootstrap()["config"], str(camera_config_path()))
+
+
+def _registry():
+    """The one camera registry this page reads.
+
+    The manager's own, deliberately: adding or removing a camera mutates
+    that registry, and a second copy cached beside it would leave the map,
+    the heatmap and the search box describing a deployment that no longer
+    exists until the next restart.
+    """
+    return _manager().registry
 
 
 # ── formatting helpers ────────────────────────────────────────────────────
@@ -424,6 +453,125 @@ def _render_camera_source(camera, manager, running: bool) -> None:
                          **{_IMAGE_FIT_KWARG: True})
 
 
+def _render_add_camera(manager, running: bool) -> None:
+    """Add a camera site: place, latitude, longitude.
+
+    Coordinates are asked for up front, not left optional, because a camera
+    without them records events that no map or heatmap can place -- it would
+    look configured and then quietly vanish from every view that matters.
+    """
+    with st.expander("Add camera", expanded=False):
+        if running:
+            st.caption("Stop the session before adding a camera.")
+            return
+
+        place = st.text_input(
+            "Place", key="new_camera_place",
+            placeholder="e.g. Rajiv Chowk",
+            help="Shown on the dashboard and stored on every event this camera records.",
+        )
+        coordinates = st.columns(2)
+        latitude = coordinates[0].text_input(
+            "Latitude", key="new_camera_lat", placeholder="28.6129",
+        )
+        longitude = coordinates[1].text_input(
+            "Longitude", key="new_camera_lon", placeholder="77.2295",
+        )
+
+        if st.button("Add camera", key="add_camera_go", use_container_width=True,
+                     type="primary"):
+            try:
+                camera = manager.add_camera(place, latitude, longitude)
+            except (ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+            else:
+                # Clear the form, then rerun so the new camera's own card,
+                # source controls and feed panel are drawn immediately.
+                for key in ("new_camera_place", "new_camera_lat", "new_camera_lon"):
+                    st.session_state.pop(key, None)
+                st.session_state["camera_notice"] = (
+                    f"Added {camera.camera_name} ({camera.camera_id}). "
+                    "Give it a video or an RTSP stream below."
+                )
+                st.rerun()
+
+        st.caption(
+            "The new camera behaves exactly like the others: upload or RTSP, "
+            "its own feed panel, its own place on the map, heatmap and queue."
+        )
+
+
+def _render_rename_camera(camera, manager, running: bool) -> None:
+    """Rename a camera site in place.
+
+    Only the label changes: the camera keeps its id, coordinates, queue
+    position and source, and events already recorded keep the name they were
+    stamped with.
+    """
+    with st.expander("Rename", expanded=False):
+        if running:
+            st.caption("Stop the session before renaming a camera.")
+            return
+
+        name = st.text_input(
+            "Place", value=camera.camera_name,
+            key=f"rename_{camera.camera_id}",
+            label_visibility="collapsed",
+        )
+        if st.button("Save name", key=f"rename_go_{camera.camera_id}",
+                     use_container_width=True):
+            try:
+                renamed = manager.rename_camera(camera.camera_id, name)
+            except (KeyError, ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.pop(f"rename_{camera.camera_id}", None)
+                st.session_state["camera_notice"] = (
+                    f"{camera.camera_id} is now {renamed.camera_name}."
+                )
+                st.rerun()
+        st.caption("Detections already recorded keep the name they were stored with.")
+
+
+def _render_remove_camera(camera, manager, running: bool, container) -> None:
+    """Two-step removal, so one stray click cannot delete a camera site."""
+    confirm_key = f"confirm_remove_{camera.camera_id}"
+
+    if st.session_state.get(confirm_key):
+        st.warning(
+            f"Remove **{camera.camera_name}** ({camera.camera_id})? Its feed "
+            "panel goes too. Detections it already recorded are kept."
+        )
+        choice = st.columns(2)
+        if choice[0].button("Remove", key=f"remove_yes_{camera.camera_id}",
+                            type="primary", use_container_width=True):
+            try:
+                manager.remove_camera(camera.camera_id)
+            except (KeyError, ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+                st.session_state.pop(confirm_key, None)
+            else:
+                st.session_state.pop(confirm_key, None)
+                st.session_state.pop(f"saved_{camera.camera_id}", None)
+                st.session_state["camera_notice"] = (
+                    f"Removed {camera.camera_name} ({camera.camera_id})."
+                )
+                st.rerun()
+        if choice[1].button("Cancel", key=f"remove_no_{camera.camera_id}",
+                            use_container_width=True):
+            st.session_state.pop(confirm_key, None)
+            st.rerun()
+        return
+
+    if container.button(
+        "Remove", key=f"remove_{camera.camera_id}",
+        use_container_width=True, disabled=running,
+        help="Remove this camera site. Its recorded detections are kept.",
+    ):
+        st.session_state[confirm_key] = True
+        st.rerun()
+
+
 def render_camera_panel(status: dict) -> None:
     st.subheader("Cameras")
     manager = _manager()
@@ -435,80 +583,95 @@ def render_camera_panel(status: dict) -> None:
         "stream. Setting one replaces the other."
     )
 
+    notice = st.session_state.pop("camera_notice", None)
+    if notice:
+        st.success(notice)
+
     ready = 0
     live_cameras = 0
-    for camera in manager.registry:
-        progress = progress_by_id.get(camera.camera_id)
-        state = progress["state"] if progress else CameraState.PENDING.value
-        color, label = _STATE_STYLE.get(state, ("#6b7280", state))
+    # Same grid as the camera wall: CAMERAS_PER_ROW across, the rest below.
+    # Stacked in one narrow column, five cameras were a metre of scrolling
+    # with each card's upload box, buttons and rename control between the
+    # next one -- and no way to see the whole deployment at once.
+    for row in wall_rows(list(manager.registry)):
+        columns = st.columns(CAMERAS_PER_ROW, gap="medium")
+        for column, camera in zip(columns, row):
+            progress = progress_by_id.get(camera.camera_id)
+            state = progress["state"] if progress else CameraState.PENDING.value
+            color, label = _STATE_STYLE.get(state, ("#6b7280", state))
 
-        location = (
-            f"{camera.latitude:.4f}, {camera.longitude:.4f}"
-            if camera.has_location else "no coordinates configured"
-        )
-        usable, source_text = _describe_source(camera)
-        if usable:
-            ready += 1
-            if camera.source_type.value == "rtsp":
-                live_cameras += 1
+            location = (
+                f"{camera.latitude:.4f}, {camera.longitude:.4f}"
+                if camera.has_location else "no coordinates configured"
+            )
+            usable, source_text = _describe_source(camera)
+            if usable:
+                ready += 1
+                if camera.source_type.value == "rtsp":
+                    live_cameras += 1
 
-        st.markdown(
-            f"""<div class="tj-card">
-                  <b>{camera.order}. {camera.camera_name}</b> {_badge(label, color)}<br>
-                  <span style="opacity:.72;font-size:.82rem">
-                    {camera.camera_id} &middot; {location}<br>{source_text}
-                  </span>
-                </div>""",
-            unsafe_allow_html=True,
-        )
+            with column:
+                st.markdown(
+                    f"""<div class="tj-card">
+                          <b>{camera.order}. {camera.camera_name}</b> {_badge(label, color)}<br>
+                          <span style="opacity:.72;font-size:.82rem">
+                            {camera.camera_id} &middot; {location}<br>{source_text}
+                          </span>
+                        </div>""",
+                    unsafe_allow_html=True,
+                )
 
-        _render_camera_source(camera, manager, running)
+                _render_camera_source(camera, manager, running)
 
-        if usable and not running:
-            if st.button(
-                "Clear source", key=f"clear_{camera.camera_id}",
-                use_container_width=True,
-            ):
-                manager.clear_source(camera.camera_id)
-                st.session_state.pop(f"saved_{camera.camera_id}", None)
-                st.rerun()
+                actions = st.columns(2)
+                if usable and not running:
+                    if actions[0].button(
+                        "Clear", key=f"clear_{camera.camera_id}",
+                        use_container_width=True,
+                    ):
+                        manager.clear_source(camera.camera_id)
+                        st.session_state.pop(f"saved_{camera.camera_id}", None)
+                        st.rerun()
 
-        if progress and progress.get("error"):
-            st.caption(f"Error: {progress['error']}")
+                _render_remove_camera(camera, manager, running, actions[1])
+                _render_rename_camera(camera, manager, running)
 
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+                if progress and progress.get("error"):
+                    st.caption(f"Error: {progress['error']}")
+
+                st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+    # The Add camera form and the run controls belong to the whole section,
+    # not to a column, so they sit under the grid at a readable width.
+    controls = st.columns([1, 1, 2])
+    with controls[0]:
+        _render_add_camera(manager, running)
 
     st.divider()
 
     total = len(manager.registry.enabled)
     st.caption(
         f"**{ready} of {total}** camera(s) have a source. "
-        "Cameras are processed **one at a time**, in order."
+        "Uploaded videos are processed **one at a time**, in order; "
+        "RTSP streams all run **together**."
     )
 
     if live_cameras:
-        # A live stream has no end, so the queue needs a dwell time or it
-        # would never reach the next camera. Say so plainly rather than
-        # letting the run look stuck.
-        dwell = manager.live_duration_seconds
-        if dwell:
-            st.info(
-                f"{live_cameras} live stream(s): each is sampled for "
-                f"**{dwell:.0f}s**, then the queue moves on.",
-            )
-        elif total > 1:
-            st.warning(
-                "A live camera with no time limit will run until stopped, so "
-                "the cameras after it never run. Set "
-                "`processing.live_duration_seconds` in camera_config.yaml.",
-            )
+        # A live stream carries what is happening now, so it is not queued
+        # behind anything and it is not cut short -- it runs until STOP.
+        st.info(
+            f"{live_cameras} live stream(s) will start together and keep "
+            "running until you press STOP.",
+        )
 
+    run_button, _ = st.columns([1, 3])
     if running:
-        if st.button("STOP PROCESSING", type="secondary", use_container_width=True):
+        if run_button.button("STOP PROCESSING", type="secondary",
+                             use_container_width=True):
             manager.stop()
             st.rerun()
     else:
-        if st.button(
+        if run_button.button(
             "START PROCESSING",
             type="primary",
             use_container_width=True,
@@ -590,7 +753,13 @@ def _live_frame_bytes(camera_id: str) -> Optional[bytes]:
 
 
 # Height of each camera's video panel on the wall, in CSS pixels.
-FEED_PANEL_HEIGHT = 300
+# The camera wall puts CAMERAS_PER_ROW feeds side by side. Four across is a
+# surveillance wall rather than four big screens: the whole deployment fits
+# one glance on a laptop, and a fifth camera starts the next row instead of
+# pushing the first four off-screen. The panel is sized to match -- a quarter
+# of the width no longer needs the height a half-width panel did.
+CAMERAS_PER_ROW = 4
+FEED_PANEL_HEIGHT = 168
 
 
 def _preview_server():
@@ -770,7 +939,7 @@ def render_traffic_heatmap(session_filter: Optional[str]) -> None:
     sites = [
         {"camera_id": c.camera_id, "camera_name": c.camera_name, "latitude": c.latitude,
          "longitude": c.longitude, "detections": counts.get(c.camera_id, 0)}
-        for c in _bootstrap()["registry"]
+        for c in _registry()
     ]
     total = sum(site["detections"] for site in sites)
     scope = f"session `{session_filter}`" if session_filter else "all sessions"
@@ -783,14 +952,25 @@ def render_traffic_heatmap(session_filter: Optional[str]) -> None:
     components.html(render_traffic_heatmap_html(sites), height=480)
 
 
-def render_camera_wall(status: dict) -> None:
-    """All cameras' feeds in one view, two per row.
+def wall_rows(cameras: list, per_row: int = CAMERAS_PER_ROW) -> list[list]:
+    """Group cameras into the rows of the camera wall.
 
-    Cameras are processed one at a time, so at most one panel is live at any
-    moment; the others hold the last frame that camera produced, which is
-    what makes this a useful summary of the whole run rather than a single
-    moving picture. Each panel is labelled with the camera and its state, so
-    a still image is never mistaken for a live one.
+    Four across, in registry order, and a fifth camera starts the next row
+    rather than shrinking the first four.
+    """
+    return [cameras[start:start + per_row]
+            for start in range(0, len(cameras), per_row)]
+
+
+def render_camera_wall(status: dict) -> None:
+    """All cameras' feeds in one view, four per row.
+
+    Live (RTSP) cameras run together, so every live panel moves at once.
+    Recorded files are processed in turn, so only the camera whose clip is
+    playing updates and the rest hold the last frame they produced -- which
+    is what makes this a summary of the whole run rather than a single moving
+    picture. Each panel is labelled with the camera and its state, so a still
+    image is never mistaken for a live one.
     """
     manager = _manager()
     cameras = list(manager.registry)
@@ -802,23 +982,25 @@ def render_camera_wall(status: dict) -> None:
     streaming = server.running
 
     st.subheader("Camera feeds")
+    # No explanatory caption: the panels are labelled with their camera and
+    # state, which is all this section needs to say. The one thing worth
+    # interrupting for is smooth video being unavailable -- silently showing
+    # stills instead would look like a broken feed -- and that is a fault,
+    # not a description, so it is a warning and only appears when it is true.
     if not streaming:
-        st.caption(
-            f"Smooth video is unavailable ({server.error}); showing still frames "
-            "that refresh every few seconds instead. Free the port or change "
-            "`api.preview_port` in config.yaml, then restart the dashboard."
+        st.warning(
+            f"Live video unavailable ({server.error}) — showing still frames. "
+            "Free the port or change `api.preview_port` in config.yaml, then "
+            "restart the dashboard."
         )
-    st.caption(
-        "Annotated frames from the ALPR pipeline — boxes are tracked "
-        "vehicles, green once a plate has been stored. Cameras run one at a "
-        "time, so only the active camera updates; the rest hold their last "
-        "frame."
-    )
 
     any_frame = False
-    for row_start in range(0, len(cameras), 2):
-        columns = st.columns(2, gap="medium")
-        for column, camera in zip(columns, cameras[row_start:row_start + 2]):
+    for row in wall_rows(cameras):
+        # Always CAMERAS_PER_ROW columns, even for a short last row, so a
+        # fifth camera gets a panel the same size as the first four rather
+        # than one stretched across the whole page.
+        columns = st.columns(CAMERAS_PER_ROW, gap="small")
+        for column, camera in zip(columns, row):
             with column:
                 progress = progress_by_id.get(camera.camera_id)
                 state = progress["state"] if progress else CameraState.PENDING.value
@@ -890,9 +1072,10 @@ def render_processing_status(status: dict) -> None:
 
     if not cameras:
         st.info(
-            "No processing session yet. Upload a video for each camera on the "
-            "left, then press **START PROCESSING**. Cameras run sequentially: "
-            "each one finishes completely before the next begins."
+            "No processing session yet. Give each camera a source in the "
+            "**Cameras** section above, then press **START PROCESSING**. "
+            "Uploaded videos are processed one at a time, in order; RTSP "
+            "streams all run together until you stop them."
         )
         return
 
@@ -1033,25 +1216,24 @@ def render_statistics(status: dict, session_filter: Optional[str]) -> None:
     cameras = status.get("cameras", [])
     running = [c for c in cameras if c["state"] == CameraState.RUNNING.value]
 
-    row = st.columns(2)
-    row[0].metric("Vehicles detected", stats["total_detections"])
-    row[1].metric("Unique plates", stats["unique_plates"])
-
-    row = st.columns(2)
-    row[0].metric("Processing time", _fmt_duration(status.get("elapsed_seconds")))
-    row[1].metric("Current camera", running[0]["camera_name"] if running else "—")
-
     # Averaged across cameras that have actually reported a figure, so a
     # queue that has only run two of four cameras is not dragged toward zero
     # by the two that have not started.
     reported_ocr = [c["avg_ocr_ms"] for c in cameras if c.get("avg_ocr_ms")]
     reported_det = [c["avg_detection_ms"] for c in cameras if c.get("avg_detection_ms")]
-    row = st.columns(2)
-    row[0].metric(
+
+    # One row across the page. Stacked in pairs they were a tall narrow
+    # column, which is what the right-hand column used to force.
+    row = st.columns(6)
+    row[0].metric("Vehicles detected", stats["total_detections"])
+    row[1].metric("Unique plates", stats["unique_plates"])
+    row[2].metric("Processing time", _fmt_duration(status.get("elapsed_seconds")))
+    row[3].metric("Current camera", running[0]["camera_name"] if running else "—")
+    row[4].metric(
         "Avg OCR time",
         f"{sum(reported_ocr) / len(reported_ocr):.1f} ms" if reported_ocr else "—",
     )
-    row[1].metric(
+    row[5].metric(
         "Avg detection time",
         f"{sum(reported_det) / len(reported_det):.1f} ms" if reported_det else "—",
     )
@@ -1069,7 +1251,6 @@ def render_statistics(status: dict, session_filter: Optional[str]) -> None:
                 "still shown in the original dashboard."
             )
 
-    st.divider()
     st.markdown("**Detections per camera**")
     if session_filter:
         st.caption(f"Scoped to session `{session_filter}`.")
@@ -1093,7 +1274,7 @@ def render_statistics(status: dict, session_filter: Optional[str]) -> None:
 
 
 def _load_trajectory(plate: str, session_filter: Optional[str]):
-    registry = _bootstrap()["registry"]
+    registry = _registry()
     engine = TrajectoryEngine.from_registry(registry)
     with database.get_session() as session:
         detections = database.get_plate_detections(
@@ -1325,7 +1506,7 @@ def render_vehicle_search() -> None:
     profiles. What was understood is shown above the results, so a surprising
     match is explainable.
     """
-    st.markdown("**Search vehicles by description**")
+    st.subheader("Search vehicles by description")
     form = st.columns([4, 1])
     with form[0]:
         text = st.text_input(
@@ -1342,7 +1523,7 @@ def render_vehicle_search() -> None:
     if not asked:
         return
 
-    registry = _bootstrap()["registry"]
+    registry = _registry()
     cameras = [(c.camera_id, c.camera_name) for c in registry]
     query = parse_query(asked, cameras=cameras)
     if query.is_empty:
@@ -1542,23 +1723,17 @@ def main() -> None:
         if manager.is_running():
             st.caption("Reload is disabled while a session is running.")
 
-    # ── tabs ──────────────────────────────────────────────────────────────
-    tab_ops, tab_traj = st.tabs(["Operations", "Trajectory"])
+    # ── pages ─────────────────────────────────────────────────────────────
+    #
+    # Home is the watch page: what is happening, and how to look something
+    # up. Operations is the control page: sources, the run, and what it
+    # produced. Trajectory is one vehicle's route. Splitting them keeps the
+    # page somebody leaves open all day from scrolling past four columns of
+    # controls they only touch when starting a run.
+    tab_home, tab_ops, tab_traj = st.tabs(["Home", "Operations", "Trajectory"])
 
-    with tab_ops:
-        left, center, right = st.columns([1.05, 2.0, 1.15], gap="medium")
-        with left:
-            render_camera_panel(status)
-        with center:
-            render_processing_status(status)
-        with right:
-            render_statistics(status, session_filter)
-
-        st.divider()
+    with tab_home:
         render_blacklist_panel()
-
-        st.divider()
-        render_traffic_heatmap(session_filter)
 
         st.divider()
         render_camera_wall(status)
@@ -1568,11 +1743,29 @@ def main() -> None:
         if plate:
             st.info(f"Showing **{plate}** on the **Trajectory** tab.")
 
+        # Last: the heatmap is the one section that is read rather than used,
+        # so putting it below the search boxes keeps both of those within
+        # reach of the feeds instead of behind a full-width map.
+        st.divider()
+        render_traffic_heatmap(session_filter)
+
+    with tab_ops:
+        # Stacked, each at full width: the cameras are a grid of their own
+        # (four across), so squeezing them into a third of the page was what
+        # made five cameras an unreadable column.
+        render_camera_panel(status)
+
+        st.divider()
+        render_processing_status(status)
+
+        st.divider()
+        render_statistics(status, session_filter)
+
     with tab_traj:
         plate = st.session_state.get("active_plate")
         if not plate:
             st.info(
-                "Search for a plate on the **Operations** tab to reconstruct its "
+                "Search for a plate on the **Home** tab to reconstruct its "
                 "route across the camera network."
             )
         else:

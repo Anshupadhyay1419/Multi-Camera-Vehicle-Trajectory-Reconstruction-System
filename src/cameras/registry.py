@@ -35,6 +35,38 @@ _logger = get_logger("cameras.registry")
 
 DEFAULT_CAMERA_CONFIG_PATH = "config/camera_config.yaml"
 
+# Where cameras added or removed from the dashboard are kept.
+#
+# camera_config.yaml is hand-written and heavily commented -- rewriting it
+# from a YAML dump would throw every one of those comments away. So the
+# shipped file stays the declaration an engineer edits, and operator changes
+# live in this small file beside it, written and read only by code. When it
+# holds a camera list, that list REPLACES the shipped one (the operator's
+# view of the deployment is the current one); everything else -- defaults,
+# processing, trajectory -- still comes from camera_config.yaml. Delete the
+# file to go back to the shipped cameras.
+RUNTIME_CAMERAS_FILENAME = "cameras_runtime.yaml"
+
+_RUNTIME_HEADER = """\
+# Cameras as managed from the dashboard (Add camera / Remove).
+#
+# Written by src/cameras/registry.py -- edit camera_config.yaml instead if you
+# want comments to survive. This list REPLACES the `cameras:` list in
+# camera_config.yaml; delete this file to go back to the shipped cameras.
+"""
+
+# The camera fields worth persisting. `video_path` and `rtsp_url` are left
+# out on purpose: which clip or stream a camera is replaying is session
+# state, chosen per run, exactly as save_upload()/set_rtsp_url() already
+# treat it.
+_PERSISTED_FIELDS = ("camera_id", "camera_name", "latitude", "longitude",
+                     "order", "enabled")
+
+
+def runtime_cameras_path(base_path: str = DEFAULT_CAMERA_CONFIG_PATH) -> Path:
+    """The operator-managed camera file that sits beside *base_path*."""
+    return Path(base_path).resolve().parent / RUNTIME_CAMERAS_FILENAME
+
 # Fallbacks for the whole `processing:` / `trajectory:` blocks, so a config
 # written before either existed still loads with sensible behaviour.
 _DEFAULT_PROCESSING = {
@@ -147,12 +179,21 @@ class CameraRegistry:
     sequence instead of one that depends on dict iteration.
     """
 
-    def __init__(self, cameras: Iterable[CameraConfig], settings: Optional[dict] = None) -> None:
+    def __init__(
+        self,
+        cameras: Iterable[CameraConfig],
+        settings: Optional[dict] = None,
+        source_path: Optional[str] = None,
+    ) -> None:
         self._cameras: list[CameraConfig] = sorted(
             cameras, key=lambda camera: (camera.order, camera.camera_id)
         )
         self._by_id: dict[str, CameraConfig] = {c.camera_id: c for c in self._cameras}
         self._settings: dict = settings or {}
+        # Where this registry was loaded from, so add/remove know which
+        # runtime file to write. None for a registry built in memory (tests),
+        # which then simply does not persist.
+        self._source_path = source_path
 
     # ── access ────────────────────────────────────────────────────────────
 
@@ -199,6 +240,88 @@ class CameraRegistry:
         self._cameras = sorted(
             self._by_id.values(), key=lambda c: (c.order, c.camera_id)
         )
+
+    def add(self, camera: CameraConfig) -> CameraConfig:
+        """Register a new camera site.
+
+        Raises:
+            ValueError: A camera with that id is already registered. Two
+                sites sharing an id merge every trajectory that passes
+                either of them, which nothing downstream can undo.
+        """
+        if camera.camera_id in self._by_id:
+            raise ValueError(f"Camera {camera.camera_id!r} already exists")
+        self._by_id[camera.camera_id] = camera
+        self._cameras = sorted(
+            self._by_id.values(), key=lambda c: (c.order, c.camera_id)
+        )
+        return camera
+
+    def remove(self, camera_id: str) -> CameraConfig:
+        """Unregister a camera site and return what was removed.
+
+        Only the site's *configuration* goes. Events it already recorded stay
+        in the database: they are history, and a trajectory that passed this
+        camera yesterday still happened. They keep the camera_id and the
+        coordinates stamped on them at capture time, so past trajectories
+        still plot correctly.
+
+        Raises:
+            KeyError:   No such camera.
+            ValueError: It is the last one -- a deployment with no cameras
+                        cannot be loaded back (camera_config.yaml requires a
+                        non-empty list), so refusing here is kinder than
+                        writing a file that fails at the next start.
+        """
+        camera = self.require(camera_id)
+        if len(self._cameras) == 1:
+            raise ValueError(
+                "Cannot remove the last camera -- a deployment needs at "
+                "least one. Add its replacement first."
+            )
+        del self._by_id[camera_id]
+        self._cameras = [c for c in self._cameras if c.camera_id != camera_id]
+        return camera
+
+    def next_camera_id(self, prefix: str = "CAM") -> str:
+        """An unused id in the deployment's CAMnnn style."""
+        used = set(self._by_id)
+        number = 1
+        while f"{prefix}{number:03d}" in used:
+            number += 1
+        return f"{prefix}{number:03d}"
+
+    def next_order(self) -> int:
+        """The queue position a newly added camera should take: last."""
+        return max((c.order for c in self._cameras), default=0) + 1
+
+    def save(self) -> Optional[Path]:
+        """Persist the current camera list so it survives a restart.
+
+        Writes the runtime file beside the config this registry was loaded
+        from. Returns the path written, or None for an in-memory registry
+        with nowhere to write.
+        """
+        if not self._source_path:
+            return None
+        path = runtime_cameras_path(self._source_path)
+        payload = yaml.safe_dump(
+            {"cameras": [
+                {field: value for field, value in camera.to_dict().items()
+                 if field in _PERSISTED_FIELDS}
+                for camera in self._cameras
+            ]},
+            sort_keys=False,
+            allow_unicode=True,
+        )
+        # Write-and-rename: the dashboard may be reading this file in another
+        # process, and a half-written camera list is a registry that refuses
+        # to load.
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(_RUNTIME_HEADER + payload, encoding="utf-8")
+        temporary.replace(path)
+        _logger.info("Wrote %d camera(s) to %s", len(self._cameras), path)
+        return path
 
     # ── settings blocks ───────────────────────────────────────────────────
 
@@ -257,6 +380,31 @@ def load_camera_registry(path: str = DEFAULT_CAMERA_CONFIG_PATH) -> CameraRegist
         _logger.critical(msg)
         raise CameraConfigError(msg)
 
+    # Cameras the operator has added or removed from the dashboard replace
+    # the shipped list. A missing, empty or unreadable runtime file is not an
+    # error: it just means nobody has changed the deployment yet.
+    runtime_path = runtime_cameras_path(path)
+    if runtime_path.is_file():
+        try:
+            runtime_raw = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            msg = f"Failed to parse '{runtime_path}': {exc}"
+            _logger.critical(msg)
+            raise CameraConfigError(msg) from exc
+        runtime_entries = (runtime_raw or {}).get("cameras") \
+            if isinstance(runtime_raw, dict) else None
+        if isinstance(runtime_entries, list) and runtime_entries:
+            _logger.info(
+                "Using the %d camera(s) managed from the dashboard (%s)",
+                len(runtime_entries), runtime_path,
+            )
+            entries = runtime_entries
+        elif runtime_entries is not None:
+            _logger.warning(
+                "%s has no usable 'cameras' list -- using the cameras in %s",
+                runtime_path, path,
+            )
+
     defaults = raw.get("defaults") or {}
     if not isinstance(defaults, dict):
         _logger.warning(
@@ -271,7 +419,7 @@ def load_camera_registry(path: str = DEFAULT_CAMERA_CONFIG_PATH) -> CameraRegist
         for index, entry in enumerate(entries)
     ]
 
-    registry = CameraRegistry(cameras, settings=raw)
+    registry = CameraRegistry(cameras, settings=raw, source_path=str(config_path))
     _logger.info(
         "Loaded %d camera(s) from %s (%d enabled): %s",
         len(registry), path, len(registry.enabled),

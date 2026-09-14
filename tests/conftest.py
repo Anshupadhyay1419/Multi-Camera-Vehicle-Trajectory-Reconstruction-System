@@ -87,3 +87,68 @@ def initialized_db(tmp_path):
     # Cleanup: reset module-level engine
     database._engine = None
     database._SessionFactory = None
+
+
+# ---------------------------------------------------------------------------
+# Camera registry
+# ---------------------------------------------------------------------------
+
+# The four camera sites the tests are written against.
+#
+# A FIXED registry, not a copy of config/camera_config.yaml: cameras are now
+# added, renamed and removed from the dashboard, so the deployment's own file
+# is operator state that changes between runs. Tests that read it broke the
+# moment somebody renamed a camera -- and worse, tests that add or remove
+# cameras would write to the live deployment.
+TEST_CAMERA_SITES = (
+    ("CAM001", "India Gate",      28.6129, 77.2295, 1),
+    ("CAM002", "Connaught Place", 28.6315, 77.2167, 2),
+    ("CAM003", "Karol Bagh",      28.6519, 77.1909, 3),
+    ("CAM004", "Kashmere Gate",   28.6675, 77.2273, 4),
+)
+
+def _test_camera_config(directory) -> str:
+    """The YAML for TEST_CAMERA_SITES, with every path inside *directory*.
+
+    upload_dir and status_file are pointed at the temp directory too: left at
+    their defaults they resolve to the deployment's own data/, so a test
+    would read the status of the operator's last real run (and write junk
+    uploads into it).
+    """
+    return "\n".join(
+        ["defaults:",
+         '  source_type: "upload"',
+         "  enabled: true",
+         "",
+         "cameras:"]
+        + [f'  - camera_id: "{camera_id}"\n'
+           f'    camera_name: "{name}"\n'
+           f"    latitude: {latitude}\n"
+           f"    longitude: {longitude}\n"
+           f'    video_path: "{directory / (camera_id + ".mp4")}"\n'
+           f"    order: {order}\n"
+           for camera_id, name, latitude, longitude, order in TEST_CAMERA_SITES]
+        + ["processing:",
+           f'  upload_dir: "{directory / "uploads"}"',
+           f'  status_file: "{directory / "processing_status.json"}"',
+           "  continue_on_error: true",
+           "",
+           "trajectory:",
+           '  order_by: "auto"',
+           "  collapse_per_camera: true",
+           "  revisit_gap_seconds: 300",
+           ""]
+    )
+
+
+@pytest.fixture()
+def camera_config_file(tmp_path):
+    """A four-camera registry of this suite's own, in a temp directory.
+
+    Written per test, so a test may add, rename or remove cameras freely:
+    those changes persist beside this file (cameras_runtime.yaml), never in
+    the deployment's config/.
+    """
+    path = tmp_path / "camera_config.yaml"
+    path.write_text(_test_camera_config(tmp_path), encoding="utf-8")
+    return path

@@ -114,6 +114,26 @@ class RTSPRequest(BaseModel):
     rtsp_url: str
 
 
+class RenameCameraRequest(BaseModel):
+    """A camera's new place name. Nothing else about it changes."""
+
+    camera_name: str
+
+
+class AddCameraRequest(BaseModel):
+    """A new camera site.
+
+    Coordinates are required, not optional: a camera without them records
+    events that no map or heatmap can place, so it would look configured and
+    then quietly disappear from every view that matters.
+    """
+
+    camera_name: str
+    latitude:    float
+    longitude:   float
+    camera_id:   Optional[str] = None
+
+
 class TrajectoryPointResponse(BaseModel):
     """One camera visit on a reconstructed path."""
 

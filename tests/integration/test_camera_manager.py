@@ -1,12 +1,14 @@
 """
-Integration tests for the sequential CameraManager (cameras/manager.py).
+Integration tests for the CameraManager's two schedules (cameras/manager.py).
 
-The one property this module exists to guarantee is that cameras are
-processed STRICTLY ONE AT A TIME, in queue order -- the demo depends on it
-for monotonic timestamps, and the Jetson depends on it because the ALPR
-pipeline already saturates the single GPU. Everything else here protects
-that guarantee's usefulness: a failing camera must not take the queue down,
-and a stop must be cooperative so buffered plates are still flushed.
+Recorded files are processed STRICTLY ONE AT A TIME, in queue order -- the
+demo depends on it for monotonic timestamps, and the Jetson depends on it
+because the ALPR pipeline already saturates the single GPU. Live streams are
+the opposite: they all run TOGETHER and until stopped, because a stream that
+has to wait its turn does not delay its footage, it loses it. Everything else
+here protects those guarantees' usefulness: a failing camera must not take
+the queue down, and a stop must be cooperative so buffered plates are still
+flushed.
 
 A fake runner stands in for the real pipeline, so these run in under a
 second with no GPU, no models and no video decoding.
@@ -17,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -63,9 +66,16 @@ def video_file(tmp_path_factory):
 
 
 @pytest.fixture()
-def registry(video_file):
-    """The shipped four-camera registry, every camera pointed at a real file."""
-    registry = load_camera_registry("config/camera_config.yaml")
+def registry(video_file, camera_config_file):
+    """This suite's own four-camera registry, each camera on a real file.
+
+    Fixed, and in a temp directory (see conftest.camera_config_file): cameras
+    are added, renamed and removed from the dashboard, so the deployment's own
+    config/camera_config.yaml is operator state -- reading it would make these
+    tests depend on how somebody last configured the Jetson, and writing it
+    would change their deployment.
+    """
+    registry = load_camera_registry(str(camera_config_file))
     for camera in registry.all:
         registry.replace(dataclasses.replace(camera, video_path=video_file))
     return registry
@@ -595,12 +605,9 @@ class TestSourceSelection:
         assert camera.source_uri is None
 
     def test_a_mixed_queue_runs_both_kinds_of_camera(self, registry, store, tmp_path, video_file):
-        """Upload and RTSP cameras in one sequential run -- the pipeline is
-        driven identically for both."""
-        registry._settings["processing"] = {
-            "upload_dir": str(tmp_path / "uploads"),
-            "live_duration_seconds": 5,
-        }
+        """Upload and RTSP cameras in one run -- the pipeline is driven
+        identically for both, and the files go first."""
+        registry._settings["processing"] = {"upload_dir": str(tmp_path / "uploads")}
         runner = RecordingRunner()
         manager = CameraManager({"video": {}}, registry, runner, store)
 
@@ -611,11 +618,14 @@ class TestSourceSelection:
         manager.start()
         assert manager.wait(timeout=30)
 
-        assert runner.order == ["CAM001", "CAM002", "CAM003", "CAM004"]
+        # Recorded files in queue order and strictly in turn; the live camera
+        # afterwards, since it would otherwise hold the files up forever.
+        assert runner.order == ["CAM002", "CAM003", "CAM004", "CAM001"]
         assert runner.overlaps == []
-        sources = [call["source_override"] for call in runner.calls]
-        assert sources[0] == "rtsp://host/stream"
-        assert all(s.endswith(".mp4") for s in sources[1:])
+        by_camera = {call["camera_meta"]["camera_id"]: call["source_override"]
+                     for call in runner.calls}
+        assert by_camera["CAM001"] == "rtsp://host/stream"
+        assert all(by_camera[c].endswith(".mp4") for c in ("CAM002", "CAM003", "CAM004"))
 
 
 class TestPreflightChecks:
@@ -722,50 +732,368 @@ class TestForgetSession:
             manager.wait(timeout=30)
 
 
-class TestLiveDwellTime:
-    """A live stream never ends, so the queue must bound how long it samples
-    one -- otherwise camera 1 runs forever and camera 2 never starts."""
+class LiveRunner:
+    """Fake pipeline for live streams: runs until stopped, like a real one.
 
-    def test_a_live_camera_is_given_a_time_limit(self, registry, store):
-        registry._settings["processing"] = {"live_duration_seconds": 45}
-        runner = RecordingRunner()
+    Records which cameras were inside it at the same moment, which is the
+    property the live schedule exists to provide.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.started = threading.Event()
+        self.peak_concurrency = 0
+        self._active: list[str] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, config, camera_meta, session_context, progress,
+                 source_override, max_duration_seconds=None, models=None):
+        camera_id = camera_meta["camera_id"]
+        with self._lock:
+            self.calls.append({
+                "camera_id": camera_id,
+                "max_duration_seconds": max_duration_seconds,
+                "models": models,
+            })
+            self._active.append(camera_id)
+            self.peak_concurrency = max(self.peak_concurrency, len(self._active))
+        self.started.set()
+
+        frames = 0
+        while not progress.should_stop():
+            frames += 1
+            progress.on_frame(frames_processed=frames, fps=25.0)
+            time.sleep(0.01)
+
+        with self._lock:
+            self._active.remove(camera_id)
+        return {"frames_processed": frames}
+
+
+class TestLiveStreamsRunTogether:
+    """A live stream carries what is happening NOW.
+
+    Queueing one behind another does not delay its footage, it discards it:
+    every vehicle passing camera 2 during camera 1's turn is never seen. So
+    live cameras start together and run until they are stopped, while
+    recorded files keep their strict one-at-a-time order.
+    """
+
+    def _live_manager(self, registry, store, runner, count=4):
         manager = CameraManager({"video": {}}, registry, runner, store)
+        for camera in list(registry.enabled)[:count]:
+            manager.set_rtsp_url(camera.camera_id, f"rtsp://host/{camera.camera_id}")
+        return manager
 
-        manager.set_rtsp_url("CAM001", "rtsp://host/stream")
+    def test_every_live_camera_runs_at_the_same_time(self, registry, store):
+        runner = LiveRunner()
+        manager = self._live_manager(registry, store, runner)
+
+        manager.start()
+        try:
+            deadline = time.time() + 20
+            while runner.peak_concurrency < 4 and time.time() < deadline:
+                time.sleep(0.05)
+            assert runner.peak_concurrency == 4, "live cameras did not run together"
+            assert {call["camera_id"] for call in runner.calls} == {
+                camera.camera_id for camera in list(registry.enabled)[:4]
+            }
+        finally:
+            manager.stop()
+            assert manager.wait(timeout=30)
+
+    def test_a_live_stream_is_never_cut_short_by_a_clock(self, registry, store):
+        """No dwell time: the stream ends when the operator stops it."""
+        runner = LiveRunner()
+        manager = self._live_manager(registry, store, runner, count=1)
+
         manager.start(camera_ids=["CAM001"])
+        try:
+            assert runner.started.wait(timeout=20)
+            assert runner.calls[0]["max_duration_seconds"] is None
+            # Still running well after any old 60s sampling window would
+            # have mattered -- the only thing that ends it is stop().
+            time.sleep(0.3)
+            assert manager.is_running()
+        finally:
+            manager.stop()
+            assert manager.wait(timeout=30)
+
+    def test_stopping_completes_a_live_camera_rather_than_skipping_it(
+        self, registry, store
+    ):
+        """Being stopped is how a live camera finishes; it is not a camera
+        whose clip was cut short."""
+        runner = LiveRunner()
+        manager = self._live_manager(registry, store, runner, count=2)
+
+        manager.start(camera_ids=["CAM001", "CAM002"])
+        assert runner.started.wait(timeout=20)
+        manager.stop()
         assert manager.wait(timeout=30)
 
-        assert runner.calls[0]["max_duration_seconds"] == 45
+        status = manager.get_status()
+        assert status["state"] == SessionState.COMPLETED.value
+        live = [c for c in status["cameras"] if c["camera_id"] in ("CAM001", "CAM002")]
+        assert [c["state"] for c in live] == [CameraState.COMPLETED.value] * 2
 
-    def test_a_recorded_file_is_never_cut_short(self, registry, store):
-        """A file ends on its own; imposing a limit would truncate a long
-        clip for no reason."""
-        registry._settings["processing"] = {"live_duration_seconds": 45}
+    def test_recorded_files_still_run_one_at_a_time_before_the_streams(
+        self, registry, store
+    ):
+        """The upload path is unchanged: files in turn, then the live wall."""
+        recorded = RecordingRunner()
+        live = LiveRunner()
+
+        def runner(**kwargs):
+            camera_id = kwargs["camera_meta"]["camera_id"]
+            if camera_id in ("CAM003", "CAM004"):
+                return live(**kwargs)
+            return recorded(**kwargs)
+
+        manager = CameraManager({"video": {}}, registry, runner, store)
+        manager.set_rtsp_url("CAM003", "rtsp://host/three")
+        manager.set_rtsp_url("CAM004", "rtsp://host/four")
+
+        manager.start()
+        try:
+            assert live.started.wait(timeout=30)
+            assert recorded.overlaps == [], "uploaded videos overlapped"
+            assert recorded.order == ["CAM001", "CAM002"]
+            deadline = time.time() + 20
+            while live.peak_concurrency < 2 and time.time() < deadline:
+                time.sleep(0.05)
+            assert live.peak_concurrency == 2
+        finally:
+            manager.stop()
+            assert manager.wait(timeout=30)
+
+    def test_each_live_camera_gets_its_own_guarded_view_of_the_models(self):
+        """Concurrent cameras must not share one TensorRT context directly."""
+        from src.cameras.pipeline_models import PipelineModels
+
+        class FakeDetector:
+            def __init__(self):
+                self.concurrent = 0
+                self.peak = 0
+                self.confidence = 0.5
+
+            def detect(self, _frame):
+                self.concurrent += 1
+                self.peak = max(self.peak, self.concurrent)
+                time.sleep(0.01)
+                self.concurrent -= 1
+                return []
+
+        detector = FakeDetector()
+        models = PipelineModels(detector, detector, detector, detector)
+        views = [models.shared() for _ in range(4)]
+
+        threads = [threading.Thread(target=lambda v=v: [v.vehicle_detector.detect(None)
+                                                        for _ in range(5)])
+                   for v in views]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert detector.peak == 1, "two threads were inside the model at once"
+        # Attributes pass through; closing a borrowed view leaves the real
+        # models alone (the session, not the camera, owns them).
+        assert views[0].vehicle_detector.confidence == 0.5
+        views[0].close()
+        assert models._closed is False
+
+
+class TestAddingAndRemovingCameras:
+    """Cameras are managed from the dashboard, so the manager owns the
+    add/remove rules: a new site is complete from the moment it exists, and
+    removing one takes its feed with it but keeps its recorded history."""
+
+    def test_a_new_camera_is_queued_and_configurable_like_any_other(
+        self, registry, store, tmp_path, video_file
+    ):
+        registry._settings["processing"] = {"upload_dir": str(tmp_path / "uploads")}
         runner = RecordingRunner()
         manager = CameraManager({"video": {}}, registry, runner, store)
 
-        manager.start(camera_ids=["CAM002"])
-        assert manager.wait(timeout=30)
+        camera = manager.add_camera("Rajiv Chowk", 28.6328, 77.2197)
 
-        assert runner.calls[0]["max_duration_seconds"] is None
+        # Same controls as the shipped cameras: upload, RTSP, clear.
+        assert camera.camera_id in [c.camera_id for c in manager.cameras]
+        assert camera.order == max(c.order for c in manager.cameras)
+        assert camera.has_location and camera.camera_name == "Rajiv Chowk"
+        assert manager.has_source_configured(camera) is False
 
-    def test_zero_means_unbounded(self, registry, store):
-        registry._settings["processing"] = {"live_duration_seconds": 0}
-        runner = RecordingRunner()
-        manager = CameraManager({"video": {}}, registry, runner, store)
+        manager.save_upload(camera.camera_id, "clip.mp4", Path(video_file).read_bytes())
+        assert manager.has_usable_source(manager.registry.require(camera.camera_id))
+        manager.set_rtsp_url(camera.camera_id, "rtsp://host/new")
+        assert manager.is_live_camera(manager.registry.require(camera.camera_id))
+        manager.clear_source(camera.camera_id)
 
-        manager.set_rtsp_url("CAM001", "rtsp://host/stream")
-        manager.start(camera_ids=["CAM001"])
-        assert manager.wait(timeout=30)
+        # And it is processed, in its queue position, by the same pipeline.
+        manager.save_upload(camera.camera_id, "clip.mp4", Path(video_file).read_bytes())
+        manager.start()
+        assert manager.wait(timeout=60)
+        assert runner.order[-1] == camera.camera_id
+        stamped = runner.calls[-1]["camera_meta"]
+        assert stamped["camera_name"] == "Rajiv Chowk"
+        assert (stamped["latitude"], stamped["longitude"]) == (28.6328, 77.2197)
 
-        assert runner.calls[0]["max_duration_seconds"] is None
-
-    def test_a_malformed_setting_falls_back_to_a_usable_default(self, registry, store):
-        """A hand-edited config must not leave the queue unbounded by
-        accident -- that is the failure that looks like a hang."""
-        registry._settings["processing"] = {"live_duration_seconds": "soon"}
+    def test_coordinates_are_required_and_validated(self, registry, store):
+        """A camera with no position silently vanishes from every map."""
         manager = CameraManager({"video": {}}, registry, RecordingRunner(), store)
-        assert manager.live_duration_seconds == 60.0
+
+        for latitude, longitude in [("", 77.0), ("north", 77.0), (91.0, 77.0),
+                                    (28.6, 181.0), (28.6, None)]:
+            with pytest.raises(ValueError):
+                manager.add_camera("Nowhere", latitude, longitude)
+        with pytest.raises(ValueError, match="place name"):
+            manager.add_camera("   ", 28.6, 77.2)
+
+    def test_a_camera_cannot_be_added_or_removed_mid_session(self, registry, store):
+        def slow(**kwargs):
+            time.sleep(0.5)
+            return {}
+
+        manager = CameraManager({"video": {}}, registry, slow, store)
+        manager.start(camera_ids=["CAM001"])
+        try:
+            with pytest.raises(RuntimeError, match="running"):
+                manager.add_camera("Rajiv Chowk", 28.63, 77.21)
+            with pytest.raises(RuntimeError, match="running"):
+                manager.remove_camera("CAM002")
+        finally:
+            manager.stop()
+            manager.wait(timeout=30)
+
+    def test_renaming_changes_only_the_label(self, registry, store):
+        manager = CameraManager({"video": {}}, registry, RecordingRunner(), store)
+        before = manager.registry.require("CAM002")
+
+        renamed = manager.rename_camera("CAM002", "  Rajiv Chowk  ")
+
+        assert renamed.camera_name == "Rajiv Chowk", "whitespace is trimmed"
+        assert renamed.camera_id == before.camera_id
+        assert (renamed.latitude, renamed.longitude) == (before.latitude, before.longitude)
+        assert renamed.order == before.order
+        assert renamed.source_uri == before.source_uri
+        assert manager.registry.require("CAM002").camera_name == "Rajiv Chowk"
+
+    def test_a_renamed_camera_stamps_the_new_name_on_new_events(self, registry, store):
+        runner = RecordingRunner()
+        manager = CameraManager({"video": {}}, registry, runner, store)
+        manager.rename_camera("CAM001", "North Gate")
+
+        manager.start(camera_ids=["CAM001"])
+        assert manager.wait(timeout=30)
+
+        assert runner.calls[0]["camera_meta"]["camera_name"] == "North Gate"
+
+    def test_a_blank_name_is_refused(self, registry, store):
+        manager = CameraManager({"video": {}}, registry, RecordingRunner(), store)
+        with pytest.raises(ValueError, match="place name"):
+            manager.rename_camera("CAM001", "   ")
+        assert manager.registry.require("CAM001").camera_name == "India Gate"
+
+    def test_renaming_an_unknown_camera_raises(self, registry, store):
+        manager = CameraManager({"video": {}}, registry, RecordingRunner(), store)
+        with pytest.raises(KeyError):
+            manager.rename_camera("CAM999", "Somewhere")
+
+    def test_a_camera_cannot_be_renamed_mid_session(self, registry, store):
+        def slow(**kwargs):
+            time.sleep(0.5)
+            return {}
+
+        manager = CameraManager({"video": {}}, registry, slow, store)
+        manager.start(camera_ids=["CAM001"])
+        try:
+            with pytest.raises(RuntimeError, match="running"):
+                manager.rename_camera("CAM002", "Renamed")
+        finally:
+            manager.stop()
+            manager.wait(timeout=30)
+
+    def test_a_rename_survives_a_reload(self, camera_config_file, store):
+        config_copy = camera_config_file
+
+        first = CameraManager(
+            {"video": {}}, load_camera_registry(str(config_copy)), RecordingRunner(), store
+        )
+        first.rename_camera("CAM001", "North Gate")
+
+        reloaded = load_camera_registry(str(config_copy))
+        assert reloaded.require("CAM001").camera_name == "North Gate"
+
+    def test_removing_a_camera_takes_its_feed_and_upload_with_it(
+        self, registry, store, tmp_path, video_file
+    ):
+        frames = tmp_path / "live_frames"
+        frames.mkdir()
+        (frames / "CAM002.jpg").write_bytes(b"frame")
+        (frames / "CAM003.jpg").write_bytes(b"other camera")
+        registry._settings["processing"] = {"upload_dir": str(tmp_path / "uploads")}
+        manager = CameraManager(
+            {"video": {}, "api": {"live_frames_dir": str(frames)}},
+            registry, RecordingRunner(), store,
+        )
+        upload = manager.save_upload("CAM002", "clip.mp4", Path(video_file).read_bytes())
+
+        removed = manager.remove_camera("CAM002")
+
+        assert removed.camera_id == "CAM002"
+        assert "CAM002" not in [c.camera_id for c in manager.cameras]
+        # The camera wall is drawn from the registry, so its panel goes with
+        # it -- and its last frame must not linger behind.
+        assert not (frames / "CAM002.jpg").exists()
+        assert (frames / "CAM003.jpg").exists(), "other cameras' frames are untouched"
+        assert not upload.exists()
+
+    def test_removing_a_camera_keeps_the_events_it_recorded(self, registry, store, tmp_path):
+        """They are history: they carry their own camera id and coordinates,
+        so trajectories that passed this site still plot."""
+        from src.database import db as database
+
+        database.init_db(str(tmp_path / "events.db"))
+        try:
+            with database.get_session() as session:
+                database.insert_event(session, {
+                    "plate_number": "DL8CA1234", "vehicle_type": "Private",
+                    "plate_color": "White", "series_type": "normal", "direction": "IN",
+                    "image_path": "", "camera_id": "CAM002",
+                    "camera_name": "Connaught Place", "latitude": 28.6315,
+                    "longitude": 77.2167, "processing_session": "S1",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+
+            manager = CameraManager({"video": {}}, registry, RecordingRunner(), store)
+            manager.remove_camera("CAM002")
+
+            with database.get_session() as session:
+                kept = database.get_plate_detections(session, "DL8CA1234")
+            assert len(kept) == 1
+            assert kept[0]["camera_id"] == "CAM002"
+            assert kept[0]["latitude"] == 28.6315
+        finally:
+            database._engine = database._SessionFactory = database._db_type = None
+            database._db_url = None
+
+    def test_changes_persist_for_the_next_process(self, camera_config_file, store):
+        """The dashboard restarts; the deployment should not revert."""
+        config_copy = camera_config_file
+
+        first = CameraManager(
+            {"video": {}}, load_camera_registry(str(config_copy)), RecordingRunner(), store
+        )
+        added = first.add_camera("Rajiv Chowk", 28.6328, 77.2197)
+        first.remove_camera("CAM001")
+
+        second = CameraManager(
+            {"video": {}}, load_camera_registry(str(config_copy)), RecordingRunner(), store
+        )
+        assert [c.camera_id for c in second.cameras] == [c.camera_id for c in first.cameras]
+        assert second.registry.require(added.camera_id).camera_name == "Rajiv Chowk"
+        assert second.registry.get("CAM001") is None
 
 
 class TestSingleton:

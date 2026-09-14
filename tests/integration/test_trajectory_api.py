@@ -105,7 +105,7 @@ def _event(**overrides) -> dict:
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, camera_config_file):
     monkeypatch.setenv("DB_URL", f"sqlite:///{tmp_path}/api.db")
     from src.api import trajectory_routes
     from src.api.server import app
@@ -118,7 +118,11 @@ def client(tmp_path, monkeypatch):
     # an upload test would write junk .mp4 files into the project's own
     # data/uploads -- leaving cameras looking "ready" with 256 bytes of
     # test data in them.
-    registry = load_camera_registry("config/camera_config.yaml")
+    # This suite's own four-camera registry (conftest.camera_config_file),
+    # not the deployment's: cameras are added, renamed and removed from the
+    # dashboard, so config/camera_config.yaml is operator state that these
+    # tests must neither depend on nor rewrite.
+    registry = load_camera_registry(str(camera_config_file))
     registry._settings["processing"] = {
         "upload_dir": str(tmp_path / "uploads"),
         "status_file": str(tmp_path / "status.json"),
@@ -497,6 +501,100 @@ class TestSessionDeletion:
             {"database": {"path": str(tmp_path / "del.db")}}, "RUN_A"
         )
         assert counts["events"] == 2
+
+
+class TestCameraManagementRoutes:
+    """Cameras can be added and removed over the API, the same way the
+    dashboard does it."""
+
+    def test_adding_a_camera_returns_it_and_lists_it(self, client):
+        response = client.post("/trajectory-api/cameras", json={
+            "camera_name": "Rajiv Chowk", "latitude": 28.6328, "longitude": 77.2197,
+        })
+        assert response.status_code == 201, response.text
+        camera = response.json()
+        assert camera["camera_name"] == "Rajiv Chowk"
+        assert camera["has_location"] is True
+        assert camera["source_type"] == "upload" and camera["video_path"] is None
+        assert camera["order"] == 5
+
+        listed = client.get("/trajectory-api/cameras").json()
+        assert camera["camera_id"] in [c["camera_id"] for c in listed]
+
+    def test_a_new_camera_accepts_a_source_like_any_other(self, client):
+        camera_id = client.post("/trajectory-api/cameras", json={
+            "camera_name": "Rajiv Chowk", "latitude": 28.6328, "longitude": 77.2197,
+        }).json()["camera_id"]
+
+        response = client.post(
+            f"/trajectory-api/cameras/{camera_id}/rtsp",
+            json={"rtsp_url": "rtsp://host/new"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["rtsp_url"] == "rtsp://host/new"
+
+    @pytest.mark.parametrize("payload", [
+        {"camera_name": "", "latitude": 28.6, "longitude": 77.2},
+        {"camera_name": "Nowhere", "latitude": 91.0, "longitude": 77.2},
+        {"camera_name": "Nowhere", "latitude": 28.6, "longitude": 181.0},
+    ])
+    def test_a_camera_that_cannot_be_placed_is_refused(self, client, payload):
+        assert client.post("/trajectory-api/cameras", json=payload).status_code == 400
+
+    def test_a_duplicate_id_is_refused(self, client):
+        response = client.post("/trajectory-api/cameras", json={
+            "camera_name": "Copy", "latitude": 28.6, "longitude": 77.2,
+            "camera_id": "CAM001",
+        })
+        assert response.status_code == 400
+        assert "already exists" in response.json()["detail"]
+
+    def test_renaming_a_camera_changes_only_its_label(self, client):
+        response = client.patch("/trajectory-api/cameras/CAM002",
+                                json={"camera_name": "Rajiv Chowk"})
+        assert response.status_code == 200, response.text
+        camera = response.json()
+        assert camera["camera_name"] == "Rajiv Chowk"
+        assert camera["camera_id"] == "CAM002"
+        assert (camera["latitude"], camera["longitude"]) == (28.6315, 77.2167)
+        assert camera["order"] == 2
+
+        listed = {c["camera_id"]: c["camera_name"]
+                  for c in client.get("/trajectory-api/cameras").json()}
+        assert listed["CAM002"] == "Rajiv Chowk"
+
+    def test_a_rename_leaves_recorded_events_as_they_were(self, client):
+        """They record what the site was called when the vehicle passed."""
+        client.patch("/trajectory-api/cameras/CAM002",
+                     json={"camera_name": "Rajiv Chowk"})
+        trajectory = client.get("/trajectory-api/trajectory/DL8CA1234").json()
+        assert "Connaught Place" in trajectory["path_labels"]
+
+    def test_a_blank_rename_is_refused(self, client):
+        assert client.patch("/trajectory-api/cameras/CAM002",
+                            json={"camera_name": "  "}).status_code == 400
+
+    def test_renaming_an_unknown_camera_is_a_404(self, client):
+        assert client.patch("/trajectory-api/cameras/CAM999",
+                            json={"camera_name": "Somewhere"}).status_code == 404
+
+    def test_removing_a_camera_drops_it_from_the_registry(self, client):
+        response = client.delete("/trajectory-api/cameras/CAM002")
+        assert response.status_code == 200, response.text
+        assert response.json()["camera_id"] == "CAM002"
+
+        listed = client.get("/trajectory-api/cameras").json()
+        assert "CAM002" not in [c["camera_id"] for c in listed]
+
+    def test_removing_a_camera_keeps_its_recorded_trajectory(self, client):
+        """History is not configuration: the events stay, and still plot."""
+        client.delete("/trajectory-api/cameras/CAM002")
+
+        trajectory = client.get("/trajectory-api/trajectory/DL8CA1234").json()
+        assert "Connaught Place" in trajectory["path_labels"]
+
+    def test_removing_an_unknown_camera_is_a_404(self, client):
+        assert client.delete("/trajectory-api/cameras/CAM999").status_code == 404
 
 
 class TestSessionDeleteRoute:

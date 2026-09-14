@@ -271,10 +271,168 @@ class TestCameraConfigHelpers:
         assert dataclasses.replace(camera, longitude=None).has_location is False
 
 
-def test_shipped_camera_config_is_valid():
-    """The registry that actually ships must load and describe four sites."""
+def test_the_deployments_own_camera_config_is_valid():
+    """Whatever cameras this device is configured with, its registry loads.
+
+    Deliberately not an assertion about WHICH cameras: they are added,
+    renamed and removed from the dashboard, so the roster is operator state.
+    What must always hold is that the file (plus any runtime changes made on
+    top of it) parses, has unique ids, and gives every camera a queue
+    position -- a deployment that fails this cannot start at all.
+    """
     registry = load_camera_registry("config/camera_config.yaml")
-    assert len(registry) == 4
-    assert [c.camera_id for c in registry] == ["CAM001", "CAM002", "CAM003", "CAM004"]
-    assert all(c.has_location for c in registry), "every demo camera is surveyed"
-    assert [c.order for c in registry] == [1, 2, 3, 4]
+
+    assert len(registry) >= 1
+    ids = [camera.camera_id for camera in registry]
+    assert len(set(ids)) == len(ids), "camera ids must be unique"
+    assert all(camera.camera_name for camera in registry)
+    assert [c.order for c in registry] == sorted(c.order for c in registry)
+    for camera in registry:
+        if camera.latitude is not None:
+            assert -90 <= camera.latitude <= 90
+        if camera.longitude is not None:
+            assert -180 <= camera.longitude <= 180
+
+
+class TestAddAndRemove:
+    """Cameras are added and removed from the dashboard, so the registry has
+    to change at runtime AND survive a restart -- without rewriting the
+    hand-commented camera_config.yaml."""
+
+    def _registry(self, tmp_path):
+        return load_camera_registry(_write(tmp_path, VALID))
+
+    def _camera(self, registry, name="Rajiv Chowk", **overrides):
+        from src.cameras.models import CameraConfig
+
+        fields = dict(
+            camera_id=registry.next_camera_id(),
+            camera_name=name,
+            latitude=28.6328,
+            longitude=77.2197,
+            order=registry.next_order(),
+        )
+        fields.update(overrides)
+        return CameraConfig(**fields)
+
+    def test_a_new_camera_joins_the_end_of_the_queue(self, tmp_path):
+        registry = self._registry(tmp_path)
+        before = [c.camera_id for c in registry]
+
+        added = registry.add(self._camera(registry))
+
+        assert added.camera_id not in before
+        assert [c.camera_id for c in registry] == before + [added.camera_id]
+        assert added.order == max(c.order for c in registry)
+        assert registry.require(added.camera_id).camera_name == "Rajiv Chowk"
+
+    def test_a_duplicate_id_is_refused(self, tmp_path):
+        """Two sites sharing an id merge every trajectory through either."""
+        registry = self._registry(tmp_path)
+        with pytest.raises(ValueError, match="already exists"):
+            registry.add(self._camera(registry, camera_id="CAM001"))
+
+    def test_generated_ids_skip_the_ones_in_use(self, tmp_path):
+        registry = self._registry(tmp_path)
+        first = registry.add(self._camera(registry))
+        second = registry.add(self._camera(registry, name="Saket"))
+        assert first.camera_id != second.camera_id
+        assert second.camera_id not in [c.camera_id for c in registry][:-1]
+
+    def test_removing_takes_the_camera_out_of_the_registry(self, tmp_path):
+        registry = self._registry(tmp_path)
+        removed = registry.remove("CAM001")
+
+        assert removed.camera_id == "CAM001"
+        assert registry.get("CAM001") is None
+        assert "CAM001" not in [c.camera_id for c in registry]
+        with pytest.raises(KeyError):
+            registry.require("CAM001")
+
+    def test_removing_an_unknown_camera_raises(self, tmp_path):
+        with pytest.raises(KeyError):
+            self._registry(tmp_path).remove("CAM999")
+
+    def test_the_last_camera_cannot_be_removed(self, tmp_path):
+        """A file with no cameras does not load, so writing one would strand
+        the deployment at the next start."""
+        registry = load_camera_registry(
+            _write(tmp_path, 'cameras:\n  - {camera_id: "CAM001", order: 1}\n')
+        )
+        with pytest.raises(ValueError, match="last camera"):
+            registry.remove("CAM001")
+
+    def test_changes_survive_a_reload_without_touching_the_shipped_file(self, tmp_path):
+        path = _write(tmp_path, VALID)
+        shipped_before = (tmp_path / "camera_config.yaml").read_text()
+
+        registry = load_camera_registry(path)
+        added = registry.add(self._camera(registry))
+        registry.remove("CAM001")
+        registry.save()
+
+        reloaded = load_camera_registry(path)
+        assert [c.camera_id for c in reloaded] == [
+            c.camera_id for c in registry
+        ]
+        assert reloaded.require(added.camera_id).camera_name == "Rajiv Chowk"
+        assert reloaded.require(added.camera_id).latitude == 28.6328
+        assert reloaded.get("CAM001") is None
+        # The hand-written, heavily commented file is left exactly as it was.
+        assert (tmp_path / "camera_config.yaml").read_text() == shipped_before
+
+    def test_the_runtime_file_keeps_the_settings_blocks_from_the_main_file(
+        self, tmp_path
+    ):
+        path = _write(tmp_path, VALID + """
+    processing:
+      upload_dir: "somewhere/else"
+    trajectory:
+      order_by: "timestamp"
+    """)
+        registry = load_camera_registry(path)
+        registry.add(self._camera(registry))
+        registry.save()
+
+        reloaded = load_camera_registry(path)
+        assert reloaded.processing["upload_dir"] == "somewhere/else"
+        assert reloaded.trajectory["order_by"] == "timestamp"
+
+    def test_a_source_is_not_persisted(self, tmp_path):
+        """Which clip or stream a camera is replaying is session state."""
+        import dataclasses
+
+        path = _write(tmp_path, VALID)
+        registry = load_camera_registry(path)
+        registry.replace(dataclasses.replace(
+            registry.require("CAM001"), rtsp_url="rtsp://host/one",
+            source_type=SourceType.RTSP, video_path=None,
+        ))
+        registry.save()
+
+        reloaded = load_camera_registry(path)
+        assert reloaded.require("CAM001").rtsp_url is None
+
+    def test_an_empty_runtime_file_falls_back_to_the_shipped_cameras(self, tmp_path):
+        from src.cameras.registry import runtime_cameras_path
+
+        path = _write(tmp_path, VALID)
+        runtime_cameras_path(path).write_text("cameras: []\n", encoding="utf-8")
+
+        registry = load_camera_registry(path)
+        assert [c.camera_id for c in registry] == ["CAM001", "CAM002"]
+
+    def test_a_broken_runtime_file_is_fatal_rather_than_silently_ignored(self, tmp_path):
+        """Loading the shipped cameras instead would quietly resurrect sites
+        the operator deleted."""
+        from src.cameras.registry import runtime_cameras_path
+
+        path = _write(tmp_path, VALID)
+        runtime_cameras_path(path).write_text("cameras: [unclosed\n", encoding="utf-8")
+
+        with pytest.raises(CameraConfigError):
+            load_camera_registry(path)
+
+    def test_an_in_memory_registry_has_nowhere_to_save(self, tmp_path):
+        registry = CameraRegistry(load_camera_registry(_write(tmp_path, VALID)).all)
+        assert registry.save() is None

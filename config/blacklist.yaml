@@ -1,8 +1,2 @@
-# Blacklisted vehicles. A detection of any plate below raises an alert on the
-# dashboard and in the live processing log. Edited from the dashboard's
-# "Blacklisted vehicles" section, or by hand (plates are matched
-# case-insensitively, ignoring spaces).
-plates:
-  - plate: "DL7CD5017"
-    reason: "Flagged vehicle"
-    added: "2026-09-13"
+# Blacklisted vehicles -- detections of these plates raise an alert.
+plates: []

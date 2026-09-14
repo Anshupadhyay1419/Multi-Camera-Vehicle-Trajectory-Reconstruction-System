@@ -12,6 +12,7 @@ Environment variable: DB_URL
 from __future__ import annotations
 
 import os
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,10 @@ _logger = get_logger("database.db")
 _engine = None
 _SessionFactory = None
 _db_type = None  # "sqlite" or "postgres"
+_db_url = None   # the URL _engine was opened on, so a repeat init is a no-op
+# Serialises init_db(). Live cameras each open the database from their own
+# thread; without this they race inside create_all()/_migrate_schema().
+_init_lock = threading.RLock()
 
 
 # Columns added to vehicle_events after the first deployment, as
@@ -171,15 +176,32 @@ def init_db(db_url: str = None) -> None:
         init_db("sqlite:///data/alpr.db")  # SQLite explicitly
         init_db("postgresql://user:pass@localhost/alpr_db")  # PostgreSQL
     """
-    global _engine, _SessionFactory, _db_type
+    global _engine, _SessionFactory, _db_type, _db_url
 
     # Resolve DB URL
     if db_url is None:
         db_url = os.getenv("DB_URL", "sqlite:///data/alpr.db")
-    
+
     # If db_url is a plain file path (no scheme), convert to SQLite URL
     if "://" not in db_url:
         db_url = f"sqlite:///{Path(db_url).absolute()}"
+
+    with _init_lock:
+        # Already open on this database: nothing to do. The guard is what
+        # makes init_db() safe to call from several threads at once, which
+        # live cameras do -- every camera's pipeline run opens the database
+        # on its own thread, and four concurrent create_all() calls raced
+        # into "table vehicle_events already exists" and "database is
+        # locked", losing three cameras' detections.
+        if _engine is not None and _db_url == db_url:
+            return
+        _init_engine(db_url)
+        _db_url = db_url
+
+
+def _init_engine(db_url: str) -> None:
+    """Build the engine, schema and session factory. Caller holds _init_lock."""
+    global _engine, _SessionFactory, _db_type
 
     # Determine database type
     parsed = urlparse(db_url)
@@ -209,10 +231,29 @@ def init_db(db_url: str = None) -> None:
         # SQLite does not support pool_size / max_overflow
         engine_kwargs = {
             "echo": False,
-            "connect_args": {"check_same_thread": False},
+            # timeout: live cameras run concurrently and each stores its own
+            # detections, so several threads can want the write lock at the
+            # same moment. SQLite's 5s default surfaced as "database is
+            # locked"; waiting is the right answer for writes this short.
+            "connect_args": {"check_same_thread": False, "timeout": 30.0},
         }
 
     _engine = create_engine(db_url, **engine_kwargs)
+
+    if _db_type == "sqlite":
+        # Write-ahead logging: readers (the dashboard, the API) no longer
+        # block on the writer, and vice versa -- which is what keeps the page
+        # responsive while four live cameras are inserting events.
+        from sqlalchemy import event as _sa_event
+
+        @_sa_event.listens_for(_engine, "connect")
+        def _sqlite_pragmas(dbapi_connection, _record):   # pragma: no cover
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+            finally:
+                cursor.close()
 
     # Create all tables (SQLite) or verify they exist (PostgreSQL), then
     # bring an older table up to the current model's column set.

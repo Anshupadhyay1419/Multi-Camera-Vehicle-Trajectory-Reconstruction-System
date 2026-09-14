@@ -39,11 +39,17 @@
 #                order entries appear in this file.
 #
 # ── Processing ────────────────────────────────────────────────────────────
-# Cameras are processed STRICTLY ONE AT A TIME, in ascending `order`. Each
-# camera runs its full ALPR pass to completion before the next one opens its
-# source. This is deliberate: the Jetson has one GPU and the ALPR pipeline
-# already saturates it, so parallel cameras would contend for the same
-# TensorRT context and make every stream slower than running them in turn.
+# UPLOADED VIDEOS are processed STRICTLY ONE AT A TIME, in ascending `order`.
+# Each camera runs its full ALPR pass to completion before the next one opens
+# its source. This is deliberate: the Jetson has one GPU and the ALPR
+# pipeline already saturates it, so parallel files would contend for the same
+# TensorRT context and finish later than the same files run in turn.
+#
+# RTSP STREAMS all run TOGETHER, and keep running until the session is
+# stopped. A live stream carries what is happening right now: making camera 2
+# wait its turn would not delay its footage, it would throw it away. The
+# streams share one set of GPU models behind a lock, so inference is still
+# serialised while four streams are decoded and tracked in parallel.
 
 defaults:
   # Applied to every camera that does not override the key itself. Keeps the
@@ -53,19 +59,13 @@ defaults:
   rtsp_url: null
 
 cameras:
+
   - camera_id: "CAM001"
-    camera_name: "India Gate"
-    latitude: 28.6129
-    longitude: 77.2295
+    camera_name: "Main Gate"
+    latitude: 28.44862429379594
+    longitude: 77.5819637633273
     video_path: "data/uploads/CAM001.mp4"
     order: 1
-
-  - camera_id: "CAM002"
-    camera_name: "Connaught Place"
-    latitude: 28.6315
-    longitude: 77.2167
-    video_path: "data/uploads/CAM002.mp4"
-    order: 2
 
   - camera_id: "CAM003"
     camera_name: "Karol Bagh"
@@ -94,19 +94,10 @@ processing:
   # the next. Continuing is the better default for a survey: three good
   # cameras still reconstruct a usable partial trajectory.
   continue_on_error: true
-  # How long each LIVE (rtsp) camera is sampled before the queue moves on.
-  #
-  # A recorded file ends by itself and ignores this setting entirely. An RTSP
-  # stream never ends, so without a bound a sequential queue would block
-  # forever on its first live camera and never reach the second. Each live
-  # camera therefore gets a fixed dwell time: long enough for vehicles to
-  # pass and for OCR fusion to accumulate votes, short enough that a four
-  # camera sweep completes in a few minutes.
-  #
-  # Set to 0 to run a live camera until it is stopped by hand -- only
-  # sensible when exactly one camera is enabled, since nothing after it in
-  # the queue would ever run.
-  live_duration_seconds: 60
+  # NOTE: `live_duration_seconds` used to bound how long each live camera was
+  # sampled before a sequential queue moved on. Live cameras now run together
+  # and continuously, so nothing has to take turns and the setting is gone --
+  # a stream ends when the session is stopped, not on a clock.
 
 trajectory:
   # How detections are ordered into a path.
