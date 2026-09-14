@@ -110,8 +110,23 @@ st.markdown(
         background: linear-gradient(100deg, #0b1f36 0%, #123a63 55%, #1b5e8a 100%);
         color: #fff; padding: 20px 26px; border-radius: 12px; margin-bottom: 18px;
       }
-      .tj-header h1 { margin: 0; font-size: 1.62rem; font-weight: 700; letter-spacing: .2px; }
-      .tj-header p  { margin: 5px 0 0 0; opacity: .82; font-size: .93rem; }
+      /* Streamlit styles h1/p directly, and those rules beat the colour
+         inherited from .tj-header -- which left the title dark grey on a
+         dark blue banner, effectively invisible. Stated explicitly here,
+         and marked important so a theme change cannot take it back. */
+      .tj-header h1 {
+        margin: 0; padding: 0; font-size: 1.62rem; font-weight: 700;
+        letter-spacing: .2px; color: #ffffff !important;
+      }
+      .tj-header p  {
+        margin: 5px 0 0 0; font-size: .93rem; color: rgba(255,255,255,.86) !important;
+      }
+      .tj-header code {
+        background: rgba(255,255,255,.16); padding: 1px 7px; border-radius: 5px;
+        /* Same reason as the heading: Streamlit colours <code> green, which
+           is hard to read on this banner. */
+        color: #ffd54f !important;
+      }
       .tj-card {
         border: 1px solid rgba(128,128,128,.24); border-radius: 10px;
         padding: 13px 15px; margin-bottom: 11px;
@@ -312,8 +327,7 @@ def render_header(status: dict) -> None:
         f"""
         <div class="tj-header">
           <h1>Multi-Camera Vehicle Trajectory Reconstruction System</h1>
-          <p>ALPR across a camera network · {label} · session <code
-             style="color:#ffd54f">{session_id}</code></p>
+          <p>ALPR across a camera network · {label} · session <code>{session_id}</code></p>
         </div>
         """,
         unsafe_allow_html=True,
