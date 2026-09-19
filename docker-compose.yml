@@ -1,6 +1,7 @@
 # ALPR University Gate — full system on one GPU PC.
 #
-#   docker compose up -d --build     build (first time) and start
+#   ./docker/start.sh                first time on a fresh clone (does the setup)
+#   docker compose up -d --build     build and start
 #   docker compose logs -f alpr      follow the pipeline/dashboard log
 #   docker compose down              stop
 #
@@ -13,8 +14,9 @@ x-alpr: &alpr
   # does, so rtsp://<camera-ip> works with no NAT or port mapping in between.
   network_mode: host
   # Files written to the mounted folders stay owned by you on the host, not
-  # root. Override with: UID=$(id -u) GID=$(id -g) docker compose up
-  user: "${UID:-1005}:${GID:-1005}"
+  # root. docker/start.sh writes your UID/GID into .env; 1000 is the usual
+  # first Linux user if you start without it.
+  user: "${UID:-1000}:${GID:-1000}"
   # PyTorch/OpenCV worker memory; Docker's 64 MB default crashes them.
   shm_size: 2gb
   restart: unless-stopped

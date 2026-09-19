@@ -4,8 +4,46 @@ A production-quality **Automatic License Plate Recognition (ALPR)** system built
 
 ---
 
+##  Quick Start with Docker (recommended)
+
+The whole system (AI pipeline, dashboard, REST API) runs in Docker on a Linux PC with an NVIDIA GPU. You don't need to install Python, CUDA or any packages yourself.
+
+**You need:** Linux, an NVIDIA GPU with driver **580 or newer** (`nvidia-smi` shows the version), [Docker](https://docs.docker.com/engine/install/) with Compose v2, the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), and [Git LFS](https://git-lfs.com). You also need about 30 GB of free disk space.
+
+```bash
+git lfs install
+git clone https://github.com/Anshupadhyay1419/Multi-Camera-Vehicle-Trajectory-Reconstruction-System.git
+cd Multi-Camera-Vehicle-Trajectory-Reconstruction-System
+./docker/start.sh
+```
+
+The first build takes about 20–30 minutes because it downloads PyTorch, TensorRT and PaddlePaddle. Later starts take seconds. When it's done, open:
+
+- **Dashboard:** `http://<this-pc-ip>:8502`. Upload a video or enter an RTSP camera URL for each camera, then press START.
+- **API docs:** `http://<this-pc-ip>:8000/docs`
+
+| Task | Command |
+|---|---|
+| Check status | `docker compose ps` |
+| Watch the pipeline log | `docker compose logs -f alpr` |
+| Stop | `docker compose down` |
+| Start again | `docker compose up -d` |
+| Rebuild after code changes | `docker compose up -d --build` |
+
+`models/`, `config/`, `data/` and `logs/` are shared with the container, not copied into it. Your database, uploads and settings survive rebuilds, and config edits apply after `docker compose restart`.
+
+**If something goes wrong:**
+- `permission denied ... docker.sock`: add yourself to the docker group with `sudo usermod -aG docker $USER`, then log out and back in.
+- `model weights are Git LFS pointers`: run `git lfs install && git lfs pull`.
+- The dashboard page doesn't load from another computer: open the ports with `sudo ufw allow 8502,8000,8765/tcp`.
+- A different GPU: the OCR TensorRT engine is rebuilt automatically on the first run, which takes a minute or two once.
+- A Jetson: this image is for x86 PCs only. Use `install_jetson.sh` there.
+
+---
+
 ##  Table of Contents
 
+- [Quick Start with Docker](#-quick-start-with-docker-recommended)
 - [Features](#-features)
 - [Multi-Camera Trajectory Reconstruction](#-multi-camera-trajectory-reconstruction)
 - [Pipeline Overview](#-pipeline-overview)
