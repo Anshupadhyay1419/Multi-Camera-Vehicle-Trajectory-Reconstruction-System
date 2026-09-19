@@ -10,6 +10,7 @@ build/
 venv/
 env/
 .venv/
+alpr/
 cuda_env/
 
 # Model weights - epoch checkpoints excluded, best.pt via Git LFS
