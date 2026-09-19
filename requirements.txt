@@ -1,6 +1,6 @@
 # Core ML
 ultralytics==8.2.0
-supervision==0.20.0
+supervision==0.25.0
 
 # ── OCR ───────────────────────────────────────────────────────────────────────
 # PRIMARY: RapidOCR — PP-OCR ONNX models without PaddlePaddle dependency.
@@ -27,8 +27,7 @@ rapidocr-onnxruntime==1.4.0
 #   Track wheel availability: https://pypi.jetson-ai-lab.dev/jp7/
 #
 # Default (CPU — works everywhere, change for GPU):
-onnxruntime==1.20.2
-
+onnxruntime==1.21.0
 # FALLBACK / dev alternatives (not used on Jetson):
 # EasyOCR — general-purpose, lower accuracy on Indian plates
 easyocr==1.7.2

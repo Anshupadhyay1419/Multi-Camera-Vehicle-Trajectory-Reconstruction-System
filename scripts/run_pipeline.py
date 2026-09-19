@@ -86,6 +86,7 @@ def _store_event(
     vehicle_color_detector=None,
     plate_thumbnail_source: np.ndarray | None = None,
     thumbnail_dir: str = "data/thumbnails",
+    now: float | None = None,
 ) -> bool:
     """Classify, deduplicate, and store a confirmed plate event.
 
@@ -120,12 +121,16 @@ def _store_event(
                        plate_crop itself is often the preprocessed/enhanced
                        image used for OCR, which is not what a person wants
                        to look at on a card.
+      now              Stream time (see FrameCapture.stream_time_seconds) at
+                       which this vehicle was SEEN, which is what the dedup
+                       window must be measured against. None falls back to
+                       the filter's own wall clock.
 
     Profile work (colour, two small thumbnails, the profile update inside
     insert_event) happens only here -- once per stored vehicle, never per
     frame -- so it does not touch the per-frame inference path.
     """
-    if dup_filter.is_duplicate(plate_number, track_id):
+    if dup_filter.is_duplicate(plate_number, track_id, now=now):
         log.info("DUPLICATE skipped: %s (track %d)", plate_number, track_id)
         return False
 
@@ -180,7 +185,7 @@ def _store_event(
     try:
         with database.get_session() as session:
             database.insert_event(session, event_data)
-        dup_filter.record(plate_number, track_id)
+        dup_filter.record(plate_number, track_id, now=now)
         log.info(
             "✅ STORED: plate=%s type=%s color=%s class=%s body=%s dir=%s camera=%s conf=%s",
             plate_number, vehicle_type, color, vehicle_class, vehicle_color, direction,
@@ -538,6 +543,7 @@ def run_pipeline(
     track_plate_crops: dict[int, np.ndarray] = {}   # best raw plate crop
     track_centroids:   dict[int, tuple]      = {}
     track_classes:     dict[int, str]        = {}   # YOLO class, for profiles
+    track_last_seen:   dict[int, float]      = {}   # stream time, for dedup
     track_vehicle_areas: dict[int, int]      = {}   # largest vehicle crop so far
     stored_tracks:     set[int]              = set()
 
@@ -547,7 +553,7 @@ def run_pipeline(
     # cleanup() so a 24/7 deployment doesn't pay an ever-growing per-event
     # scan cost.
     _DUP_CLEANUP_INTERVAL_S = 60.0
-    _last_dup_cleanup = time.monotonic()
+    _last_dup_cleanup = 0.0
 
     # ── open video ────────────────────────────────────────────────────────
     try:
@@ -626,6 +632,7 @@ def run_pipeline(
 
             frame_start = time.perf_counter()
             frames_processed += 1
+            stream_now = frame_capture.stream_time_seconds()
 
             if (
                 progress is not None
@@ -649,10 +656,12 @@ def run_pipeline(
                 except Exception as exc:
                     log.debug("Progress reporter raised on_frame: %s", exc)
 
-            _now_monotonic = time.monotonic()
-            if _now_monotonic - _last_dup_cleanup >= _DUP_CLEANUP_INTERVAL_S:
-                dup_filter.cleanup()
-                _last_dup_cleanup = _now_monotonic
+            # Pruned against the same stream clock the entries were recorded
+            # on -- calling cleanup() with wall clock would treat every
+            # video-time entry as ancient and empty the filter outright.
+            if stream_now - _last_dup_cleanup >= _DUP_CLEANUP_INTERVAL_S:
+                dup_filter.cleanup(now=stream_now)
+                _last_dup_cleanup = stream_now
 
             # Vehicle detection
             vehicle_detection_start = time.perf_counter()
@@ -684,6 +693,7 @@ def run_pipeline(
                 motion_filter.update(tid, track.centroid)
                 track_centroids[tid] = track.centroid
                 track_classes[tid] = track.class_label
+                track_last_seen[tid] = stream_now
 
                 # Only apply motion filter after enough history (5 frames)
                 buf_size = len(motion_filter._history.get(tid, []))
@@ -862,6 +872,7 @@ def run_pipeline(
                                 vehicle_color_detector=vehicle_color_detector,
                                 plate_thumbnail_source=best_crop,
                                 thumbnail_dir=thumbnail_dir,
+                                now=stream_now,
                             )
                             if stored:
                                 events_stored += 1
@@ -889,9 +900,17 @@ def run_pipeline(
         # Flush remaining buffers
         log.info("Flushing remaining OCR fusion buffers...")
         pending = ocr_fusion.flush_all()
-        for tid, (plate_number, confidence) in pending.items():
+        # Oldest sighting first, and each judged at the stream time its track
+        # was last seen rather than at shutdown. Flushing is a single instant
+        # at the end of the run, so stamping every leftover fragment with
+        # "now" put them all past the dedup window and re-stored vehicles the
+        # loop had already recorded minutes of wall clock earlier.
+        for tid, (plate_number, confidence) in sorted(
+            pending.items(), key=lambda kv: track_last_seen.get(kv[0], 0.0)
+        ):
             if tid in stored_tracks:
                 continue
+            seen_at = track_last_seen.get(tid)
             if not plate_number or confidence < min_conf * 0.9:
                 log.info(
                     "Track %d: dropped at final flush (fused_plate=%r confidence=%.2f "
@@ -934,6 +953,7 @@ def run_pipeline(
                 vehicle_color_detector=vehicle_color_detector,
                 plate_thumbnail_source=best_crop,
                 thumbnail_dir=thumbnail_dir,
+                now=seen_at,
             ):
                 events_stored += 1
 

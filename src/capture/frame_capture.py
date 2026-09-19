@@ -137,12 +137,48 @@ class FrameCapture:
         Returns:
             (success, frame) — frame is None when success is False.
         """
+        if self.is_live:
+            # `self._cap` is None whenever a reader thread exhausted its own
+            # reconnect attempts, because _reconnect() clears it before
+            # retrying. For a live camera that must NOT be terminal: a stream
+            # that is down for longer than max_retries*5s almost always comes
+            # back, and a camera is supposed to run until STOP. Returning
+            # early here left the capture permanently dead -- the pipeline
+            # spun on `continue` forever while the dashboard still showed the
+            # camera as "running". _read_live_frame() reopens instead.
+            # _epoch guards against a read before open(); _stop_reader
+            # against one after release().
+            if self._epoch == 0 or self._stop_reader.is_set():
+                return False, None
+            return self._read_live_frame()
+
         if self._cap is None:
             return False, None
-
-        if self.is_live:
-            return self._read_live_frame()
         return self._read_file_frame()
+
+    def stream_time_seconds(self) -> float:
+        """Seconds elapsed *within the stream*, for time-windowed logic.
+
+        A live source runs at real time, so wall clock is its stream clock.
+        A recorded file does not: it decodes as fast (or as slowly) as the
+        host manages, so anything that means "within the last N seconds of
+        footage" -- deduplication above all -- has to measure the video's own
+        timeline or its behaviour changes with the machine it runs on. This
+        gate video is 10.7s long but takes 28-51s to process here, which was
+        ageing a plate out of a 30s dedup window mid-video and storing the
+        same vehicle twice.
+        """
+        if self.is_live or self._cap is None:
+            return time.time()
+        position_ms = self._cap.get(cv2.CAP_PROP_POS_MSEC)
+        if position_ms and position_ms > 0:
+            return float(position_ms) / 1000.0
+        # Backends that don't report position still need a monotonic video
+        # clock; derive one from the decoded frame count.
+        fps = self._cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            fps = 30.0
+        return self._frame_count * self.frame_skip / fps
 
     def release(self) -> None:
         """Release the video capture resource."""
@@ -316,7 +352,11 @@ class FrameCapture:
                 self.source, attempt, self.max_retries,
             )
             cap.release()
-            time.sleep(5)
+            # Interruptible wait: a live camera whose stream is gone retries
+            # indefinitely, so an uninterruptible sleep here would make STOP
+            # take up to max_retries*5s to be noticed.
+            if self._stop_reader.wait(timeout=5):
+                break
 
         msg = (
             f"Could not open video source '{self.source}' "
@@ -363,7 +403,8 @@ class FrameCapture:
                 _logger.info("Reconnected to '%s'", self.source)
                 return True
             cap.release()
-            time.sleep(5)
+            if self._stop_reader.wait(timeout=5):
+                return False
 
         _logger.critical(
             "Could not reconnect to '%s' after %d attempts. Halting.",

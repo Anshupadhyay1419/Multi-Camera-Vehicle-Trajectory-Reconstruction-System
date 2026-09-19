@@ -175,6 +175,7 @@ class OCRFusion:
 
         best_cluster: Optional[_Cluster] = None
         best_score = -1.0
+        best_plate_score = -1.0
 
         for cluster_plates in clusters:
             cluster_confs: List[float] = []
@@ -217,15 +218,21 @@ class OCRFusion:
                     best_plate=best_plate,
                 )
                 best_score = hybrid_score
+                best_plate_score = per_plate_sum[best_plate]
             elif abs(hybrid_score - best_score) <= 1e-6:
-                # Tie-breaker on hybrid score: use higher per-plate sum
-                if per_plate_sum[best_plate] > per_plate_sum.get(best_cluster.best_plate, 0.0):
+                # Tie-breaker on hybrid score: use higher per-plate sum. The
+                # incumbent's score has to be carried forward -- looking it up
+                # in *this* cluster's per_plate_sum always missed (clusters are
+                # disjoint) and defaulted to 0.0, so any tie handed the win to
+                # whichever cluster happened to be scored last.
+                if per_plate_sum[best_plate] > best_plate_score:
                     best_cluster = _Cluster(
                         plates=cluster_plates,
                         total_conf=total_conf,
                         best_plate=best_plate,
                     )
                     best_score = hybrid_score
+                    best_plate_score = per_plate_sum[best_plate]
 
         assert best_cluster is not None
 
@@ -235,7 +242,10 @@ class OCRFusion:
         if len(plate_to_confs[best_cluster.best_plate]) < self.min_exact_votes:
             return ("", 0.0)
 
-        # Return best cluster's canonical plate and max confidence from all entries
-        best_single = max(entries, key=lambda e: e[1])
-        return (best_cluster.best_plate, best_single[1])
+        # Confidence must describe the plate actually being returned, so it
+        # comes from that plate's own reads. Taking the max across *all*
+        # entries let a discarded competing read donate its score: a track
+        # that read HP26CO6860 four times at 0.92 and HR26CQ6869 once at 1.00
+        # was stored as HP26CO6860 with confidence 1.00.
+        return (best_cluster.best_plate, max(plate_to_confs[best_cluster.best_plate]))
 

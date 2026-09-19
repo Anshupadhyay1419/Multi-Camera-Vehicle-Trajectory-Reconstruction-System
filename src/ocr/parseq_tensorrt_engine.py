@@ -229,8 +229,43 @@ class PARSeqTensorRTOCREngine(OCREngine):
         try:
             subprocess.run(command, cwd=Path(__file__).resolve().parents[2], check=True)
             return True
-        except (OSError, subprocess.CalledProcessError) as exc:
+        except FileNotFoundError:
+            return self._rebuild_engine_with_python(engine_file)
+        except subprocess.CalledProcessError as exc:
             _logger.error("TensorRT engine rebuild failed: %s", exc)
+            return False
+
+    def _rebuild_engine_with_python(self, engine_file: Path) -> bool:
+        """Build an engine when the TensorRT Python package has no trtexec CLI."""
+        try:
+            import tensorrt as trt
+
+            logger = trt.Logger(trt.Logger.WARNING)
+            builder = trt.Builder(logger)
+            creation_flag = getattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH", None)
+            network = builder.create_network(
+                1 << int(creation_flag) if creation_flag is not None else 0
+            )
+            parser = trt.OnnxParser(network, logger)
+            if not parser.parse(self.onnx_path.read_bytes()):
+                errors = "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors))
+                raise RuntimeError(f"ONNX parse failed: {errors}")
+
+            config = builder.create_builder_config()
+            config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 << 30)
+            fp16_flag = getattr(trt.BuilderFlag, "FP16", None)
+            if fp16_flag is not None and getattr(builder, "platform_has_fast_fp16", True):
+                config.set_flag(fp16_flag)
+
+            serialized = builder.build_serialized_network(network, config)
+            if serialized is None:
+                raise RuntimeError("TensorRT returned no serialized engine")
+            engine_file.write_bytes(bytes(serialized))
+            self._write_engine_metadata(engine_file, self.runtime_info())
+            _logger.info("PARSeq TensorRT engine rebuilt with the TensorRT Python API: %s", engine_file)
+            return True
+        except Exception as exc:
+            _logger.error("TensorRT Python engine rebuild failed: %s", exc)
             return False
 
     @staticmethod

@@ -32,20 +32,19 @@ class VehicleTracker:
 
     Args:
         lost_track_timeout:       Number of frames before a lost track is retired.
-        minimum_matching_threshold: IOU threshold ByteTrack requires to keep
-            associating a detection with an existing track. The supervision
-            default (0.8) assumes small inter-frame motion; with frame_skip
-            > 1 a vehicle's box can move enough between processed frames to
-            drop under 0.8 IOU, which fragments one physical vehicle into
-            several track IDs (each restarting OCR fusion from zero votes,
-            so plates and cars go unstored). Lowering it tolerates that
-            larger jump.
+        minimum_matching_threshold: Maximum association COST (1 - IOU) ByteTrack
+            will accept, NOT a minimum IOU. Raising it is what tolerates a
+            larger inter-frame jump: 0.8 (the supervision/ByteTrack default)
+            matches down to IOU 0.2, while 0.5 demands IOU 0.5 and splits one
+            physical vehicle into several track IDs -- each restarting OCR
+            fusion from zero votes, so plates and cars go unstored. Measured on
+            this site's gate video (4 vehicles): 0.8 -> 6 track ids, 0.5 -> 24.
     """
 
     def __init__(
         self,
         lost_track_timeout: int = 30,
-        minimum_matching_threshold: float = 0.5,
+        minimum_matching_threshold: float = 0.8,
     ) -> None:
         self.lost_track_timeout = lost_track_timeout
         self.minimum_matching_threshold = minimum_matching_threshold
@@ -113,6 +112,13 @@ class VehicleTracker:
 
         except Exception as exc:
             _logger.warning("ByteTrack update failed: %s", exc)
+            return []
+
+        # supervision <=0.20 returns the *input* detections with an empty
+        # tracker_id when ByteTrack has no confirmed track this frame, so
+        # len(tracked) counts boxes that have no id behind them.
+        tracker_ids = tracked.tracker_id
+        if tracker_ids is None or len(tracker_ids) < len(tracked):
             return []
 
         tracks: list[Track] = []

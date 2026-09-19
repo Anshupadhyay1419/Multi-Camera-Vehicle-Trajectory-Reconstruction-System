@@ -132,8 +132,15 @@ class TestOCRFusionProperty12:
         )
     )
     @settings(max_examples=30)
-    def test_no_majority_returns_highest_confidence(self, entries):
-        """When no majority, the highest-confidence entry is returned."""
+    def test_no_majority_returns_confidence_of_the_plate_it_returns(self, entries):
+        """With no majority, the reported confidence describes the fused plate.
+
+        Fusion scores *clusters* of similar reads, so the winner is not always
+        the single highest-confidence entry. What must always hold is that the
+        confidence returned alongside a plate came from reads OF THAT PLATE --
+        otherwise a losing candidate donates its score and the stored event
+        claims a certainty no read of it ever had.
+        """
         from collections import Counter
         plates = [e[0] for e in entries]
         counter = Counter(plates)
@@ -147,8 +154,10 @@ class TestOCRFusionProperty12:
 
         result = fusion.get_result(1)
         assert result is not None
-        best_conf = max(e[1] for e in entries)
-        assert abs(result[1] - best_conf) < 1e-9
+        fused_plate, fused_conf = result
+        own_confs = [c for p, c in entries if p == fused_plate]
+        assert own_confs, f"fused plate {fused_plate!r} was never read"
+        assert abs(fused_conf - max(own_confs)) < 1e-9
 
 
 # ---------------------------------------------------------------------------

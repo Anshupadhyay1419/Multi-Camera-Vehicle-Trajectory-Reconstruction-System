@@ -53,12 +53,12 @@ detection:
   # Point *_model_path at a .engine file (run scripts/export_detectors_trt.sh
   # once on-device) for the biggest latency win — raw .pt inference through
   # PyTorch/ultralytics is 3-5x slower than TensorRT on this hardware.
-  device: 0
-  half: true
-  vehicle_model_path: "models/vehicle_detector/yolov8n.engine"
+  device: "cpu"
+  half: false
+  vehicle_model_path: "yolov8s.pt"
   vehicle_confidence: 0.5                  # Back to conservative (0.4 catches too many false positives)
   vehicle_imgsz: 480                       # full-frame detection; 480 balances speed/recall
-  plate_model_path: "models/plate_detector/best.engine"
+  plate_model_path: "models/plate_detector/best.pt"
   plate_confidence: 0.4                    # Back to conservative
   plate_imgsz: 320                         # plate search is within an already-localized vehicle crop
 
@@ -68,11 +68,15 @@ tracking:
   # track now gets dropped (and a re-detected vehicle gets a brand new ID)
   # after half the real-world time it used to tolerate.
   lost_track_timeout: 60                   # frames before track is retired
-  # ByteTrack's default (0.8) requires 80% IOU overlap to keep matching a
-  # detection to its track. Lowered so a fast-moving or partially-occluded
-  # vehicle doesn't get split into a new track ID mid-pass (see frame_skip
-  # comment above — same underlying symptom).
-  minimum_matching_threshold: 0.5
+  # ByteTrack matches a detection to a track when the association COST
+  # (1 - IOU) is at or below this value — so this is a cost ceiling, NOT a
+  # minimum IOU. 0.8 (the ByteTrack/supervision default) accepts any pair
+  # overlapping by IOU >= 0.2; 0.5 demands IOU >= 0.5, which is far stricter
+  # and splits a fast-moving or partially-occluded vehicle into new track IDs
+  # mid-pass. This was set to 0.5 believing it was the permissive direction;
+  # measured on the gate video (4 vehicles), 0.5 produced 24 track IDs and
+  # 0.8 produces 6. Lower this only to make tracking stricter.
+  minimum_matching_threshold: 0.8
   # Live sources only (ignored for a video file — see frame_capture.py: a
   # file has no real-time pressure, so every track gets serviced every
   # frame regardless of this setting). Caps how many tracks get the full

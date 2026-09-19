@@ -320,8 +320,8 @@ class TestPipelineStoreStep:
             def classify(self, value): return "Private"
 
         class Dedup:
-            def is_duplicate(self, *a): return False
-            def record(self, *a): pass
+            def is_duplicate(self, *a, **kw): return False
+            def record(self, *a, **kw): pass
 
         class Direction:
             def update(self, *a): return "IN"
