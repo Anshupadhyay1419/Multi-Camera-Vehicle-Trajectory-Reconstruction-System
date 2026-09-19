@@ -1,0 +1,61 @@
+# ALPR University Gate — full system on one GPU PC.
+#
+#   docker compose up -d --build     build (first time) and start
+#   docker compose logs -f alpr      follow the pipeline/dashboard log
+#   docker compose down              stop
+#
+# Dashboard  http://<this-pc>:8502
+# API        http://<this-pc>:8000/docs
+
+x-alpr: &alpr
+  image: alpr-university-gate:latest
+  # Host networking: the container sees the campus LAN exactly as this PC
+  # does, so rtsp://<camera-ip> works with no NAT or port mapping in between.
+  network_mode: host
+  # Files written to the mounted folders stay owned by you on the host, not
+  # root. Override with: UID=$(id -u) GID=$(id -g) docker compose up
+  user: "${UID:-1005}:${GID:-1005}"
+  # PyTorch/OpenCV worker memory; Docker's 64 MB default crashes them.
+  shm_size: 2gb
+  restart: unless-stopped
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu, compute, utility, video]
+  volumes:
+    - ./models:/app/models      # weights + TensorRT engines (rebuilt here if mismatched)
+    - ./config:/app/config      # config.yaml, cameras, blacklist -- edits persist
+    - ./data:/app/data          # database, uploads, plate/vehicle crops, previews
+    - ./logs:/app/logs
+
+services:
+  # Dashboard + camera manager + ALPR pipeline. They share one process by
+  # design: models load once and every live camera thread uses them.
+  alpr:
+    <<: *alpr
+    build: .
+    container_name: alpr-dashboard
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8502/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # REST API for other systems (security office, police software, etc.).
+  api:
+    <<: *alpr
+    container_name: alpr-api
+    # Same image as the dashboard; never try to pull it from a registry.
+    pull_policy: never
+    depends_on: [alpr]
+    command: ["uvicorn", "src.api.server:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3

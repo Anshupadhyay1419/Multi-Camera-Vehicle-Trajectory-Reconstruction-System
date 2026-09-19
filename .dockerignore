@@ -1,0 +1,27 @@
+# Host virtualenv (12 GB) -- the image builds its own.
+alpr/
+venv/
+.venv/
+cuda_env/
+
+# Mounted at runtime from the host (see docker-compose.yml), never baked in.
+models/
+data/
+logs/
+config/
+
+# Not needed to run the system.
+.git/
+.hypothesis/
+.pytest_cache/
+**/__pycache__/
+*.pyc
+OCR_data/
+training/
+Real-ESRGAN/
+output/
+debug_crops/
+dataset_validation_report.json
+*.mp4
+*.avi
+*.mkv
