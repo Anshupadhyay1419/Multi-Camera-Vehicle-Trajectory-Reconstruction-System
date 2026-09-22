@@ -58,6 +58,30 @@ from src.utils.logger import get_logger
 _logger = get_logger("ocr.rapidocr_engine")
 
 
+def _is_detection_list(value) -> bool:
+    """True when *value* is RapidOCR's list of [box, text, score] entries.
+
+    This is the only reliable way to tell RapidOCR's return shapes apart.
+    Keying on the TYPE of the second tuple element does not work: different
+    builds return the timings as a bare float or as a list of per-stage
+    floats, and treating `(detections, [t_det, t_cls, t_rec])` as the
+    `(txts, scores)` shape pairs each detection with a STOPWATCH READING
+    instead of its confidence. A plate recognised at 0.98 was reported at
+    0.30, which is below both ocr.confidence_threshold (0.70) and
+    fusion.min_confidence (0.55) -- so every CPU-backend read was discarded
+    and nothing was ever stored.
+    """
+    if not isinstance(value, (list, tuple)) or not value:
+        return False
+    entry = value[0]
+    return (
+        isinstance(entry, (list, tuple))
+        and len(entry) >= 3
+        and isinstance(entry[1], (str, bytes))
+        and isinstance(entry[2], (int, float))
+    )
+
+
 class RapidOCREngine(OCREngine):
     """OCR engine backed by RapidOCR (PP-OCR ONNX models via onnxruntime).
 
@@ -213,35 +237,34 @@ class RapidOCREngine(OCREngine):
                 txts = list(result.txts or [])
                 scores = list(result.scores or [])
             elif isinstance(result, (tuple, list)):
-                # Support several observed RapidOCR return shapes:
-                # 1) (boxes, txts, scores)
-                # 2) (txts, scores)
-                # 3) (detections_list, time_float) where detections_list contains
-                #    items like [box, text, score]
-                if len(result) >= 3:
+                # Observed RapidOCR return shapes, in order of how specific
+                # the test for them is:
+                #   1) (detections, timings)  -- detections are [box, text, score];
+                #      `timings` is a float in some builds and a list in others
+                #   2) (boxes, txts, scores)
+                #   3) (txts, scores)
+                #
+                # Shape 1 is checked FIRST and by inspecting the entries, not
+                # by the type of the second element. Checking `isinstance(
+                # second, list)` first made shape 1 look like shape 3 and
+                # paired every detection with an elapsed time -- see
+                # _is_detection_list().
+                if result and _is_detection_list(result[0]):
+                    txts, scores = [], []
+                    for item in list(result[0] or []):
+                        try:
+                            txts.append(item[1])
+                            scores.append(item[2])
+                        except Exception:
+                            continue
+                elif len(result) >= 3:
                     txts = list(result[1] or [])
                     scores = list(result[2] or [])
                 elif len(result) == 2:
                     first, second = result[0], result[1]
-                    # Case: (txts, scores)
                     if isinstance(first, (list, tuple)) and isinstance(second, (list, tuple)):
                         txts = list(first or [])
                         scores = list(second or [])
-                    # Case: (detections_list, time_float) where detections_list
-                    # contains entries like [box, text, score]
-                    elif isinstance(first, (list, tuple)) and (isinstance(second, float) or isinstance(second, int)):
-                        dets = list(first or [])
-                        txts = []
-                        scores = []
-                        for item in dets:
-                            try:
-                                # item may be (box, text, score) or similar
-                                txt = item[1]
-                                score = item[2]
-                            except Exception:
-                                continue
-                            txts.append(txt)
-                            scores.append(score)
                     else:
                         return ("", 0.0)
                 else:

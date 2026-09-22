@@ -4,38 +4,61 @@ A production-quality **Automatic License Plate Recognition (ALPR)** system built
 
 ---
 
-##  Quick Start with Docker (recommended)
+##  Quick Start
 
-The whole system (AI pipeline, dashboard, REST API) runs in Docker on a Linux PC with an NVIDIA GPU. You don't need to install Python, CUDA or any packages yourself.
+Everything goes through one script, `./run`. It does its own setup, so there is no step to remember first and nothing to activate.
 
-**You need:** Linux, an NVIDIA GPU with driver **580 or newer** (`nvidia-smi` shows the version), [Docker](https://docs.docker.com/engine/install/) with Compose v2, the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), and [Git LFS](https://git-lfs.com). You also need about 30 GB of free disk space.
+**You need:** Linux, an NVIDIA GPU with driver **580 or newer** (`nvidia-smi` shows the version), [Docker](https://docs.docker.com/engine/install/) with Compose v2, the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), and [Git LFS](https://git-lfs.com). About 30 GB of free disk space.
 
 ```bash
 git lfs install
 git clone https://github.com/Anshupadhyay1419/Multi-Camera-Vehicle-Trajectory-Reconstruction-System.git
 cd Multi-Camera-Vehicle-Trajectory-Reconstruction-System
-./docker/start.sh
+./run up
 ```
 
-The first build takes about 20–30 minutes because it downloads PyTorch, TensorRT and PaddlePaddle. Later starts take seconds. When it's done, open:
+The first build takes about 20–30 minutes because it downloads PyTorch, TensorRT and PaddlePaddle. Later starts take seconds. `./run up` waits until the dashboard actually answers before it prints the address, so when you see the URL the system is genuinely ready:
 
 - **Dashboard:** `http://<this-pc-ip>:8502`. Upload a video or enter an RTSP camera URL for each camera, then press START.
 - **API docs:** `http://<this-pc-ip>:8000/docs`
 
+### Everything you can run
+
 | Task | Command |
 |---|---|
-| Check status | `docker compose ps` |
-| Watch the pipeline log | `docker compose logs -f alpr` |
-| Stop | `docker compose down` |
-| Start again | `docker compose up -d` |
-| Rebuild after code changes | `docker compose up -d --build` |
+| Start the dashboard and API | `./run up` |
+| Stop | `./run down` |
+| Restart after editing code | `./run restart` |
+| Whole pipeline over a video | `./run video ALPR.mp4` |
+| Whole pipeline over a camera | `./run rtsp rtsp://user:pass@10.0.0.5/live` |
+| Run the tests | `./run test` |
+| Follow the logs | `./run logs` |
+| What is running | `./run status` |
+| **Something is wrong** | **`./run doctor`** |
 
-`models/`, `config/`, `data/` and `logs/` are shared with the container, not copied into it. Your database, uploads and settings survive rebuilds, and config edits apply after `docker compose restart`.
+`./run doctor` checks this machine and this checkout — driver version, LFS weights, ports, stale containers, whether `.env` matches your user — and names anything that would stop a run. It changes nothing, so it is always safe to run first.
 
-**If something goes wrong:**
-- `permission denied ... docker.sock`: add yourself to the docker group with `sudo usermod -aG docker $USER`, then log out and back in.
+### Docker or your own virtualenv
+
+`./run` uses Docker by default. Add `--native` to run in the `./alpr` virtualenv instead, using this machine's own CUDA:
+
+```bash
+./run video ALPR.mp4              # in the container
+./run --native video ALPR.mp4     # in ./alpr
+```
+
+Both are kept working. `export ALPR_RUNTIME=native` makes `--native` the default for your shell. Native is the faster edit loop; Docker is what the deployment actually runs.
+
+### Editing code
+
+`src/`, `scripts/`, `tests/` and `main.py` are **mounted** into the container, not baked into the image. An edit takes effect on `./run restart` — there is no rebuild step, and the container can never quietly run a stale copy of the code. Only a change to `requirements.txt` or the `Dockerfile` needs a build, and `./run` notices that by itself and rebuilds.
+
+`models/`, `config/`, `data/` and `logs/` are shared the same way, so your database, uploads and settings survive everything.
+
+**If something goes wrong,** run `./run doctor` first. It explains most of these:
+- `permission denied ... docker.sock`: add yourself to the docker group with `sudo usermod -aG docker $USER`, then log out and back in — or just use `./run --native up`.
 - `model weights are Git LFS pointers`: run `git lfs install && git lfs pull`.
-- The dashboard page doesn't load from another computer: open the ports with `sudo ufw allow 8502,8000,8765/tcp`.
+- The dashboard doesn't load from another computer: open the ports with `sudo ufw allow 8502,8000,8765/tcp`.
 - A different GPU: the OCR TensorRT engine is rebuilt automatically on the first run, which takes a minute or two once.
 - A Jetson: this image is for x86 PCs only. Use `install_jetson.sh` there.
 
@@ -43,7 +66,7 @@ The first build takes about 20–30 minutes because it downloads PyTorch, Tensor
 
 ##  Table of Contents
 
-- [Quick Start with Docker](#-quick-start-with-docker-recommended)
+- [Quick Start](#-quick-start)
 - [Features](#-features)
 - [Multi-Camera Trajectory Reconstruction](#-multi-camera-trajectory-reconstruction)
 - [Pipeline Overview](#-pipeline-overview)

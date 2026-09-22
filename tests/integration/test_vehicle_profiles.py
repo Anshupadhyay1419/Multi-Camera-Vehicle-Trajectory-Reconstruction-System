@@ -43,23 +43,47 @@ def _reset_engine():
     database._db_type = None
 
 
+# Where detection() puts the image files it claims to have.
+#
+# A profile only adopts a detection's pictures if those pictures are really
+# there -- that is what stops it pinning itself forever to a crop that has
+# since been deleted. So these tests have to put real files on disk, or
+# every detection would look like one with no images at all and the
+# selection rules below would have nothing to select between.
+_IMAGE_DIR: Path | None = None
+
+
 @pytest.fixture()
 def fresh(tmp_path):
+    global _IMAGE_DIR
+    _IMAGE_DIR = tmp_path / "images"
+    _IMAGE_DIR.mkdir()
     database.init_db(str(tmp_path / "profiles.db"))
     return tmp_path
+
+
+def _image(name: str) -> str:
+    """A real 8x8 JPEG called `name`, and its path."""
+    if _IMAGE_DIR is None:
+        return name
+    path = _IMAGE_DIR / name
+    if not path.exists():
+        cv2.imwrite(str(path), np.full((8, 8, 3), 128, np.uint8))
+    return str(path)
 
 
 def detection(plate="DL8CA1234", camera="CAM001", minute=0, second=0, **overrides):
     name, lat, lon = SITES[camera]
     event = {
         "plate_number": plate, "vehicle_type": "Private", "plate_color": "White",
-        "series_type": "normal", "direction": "IN", "image_path": f"plate_{camera}.jpg",
+        "series_type": "normal", "direction": "IN",
+        "image_path": _image(f"plate_{camera}.jpg"),
         "camera_id": camera, "camera_name": name, "latitude": lat, "longitude": lon,
         "timestamp": f"2026-09-13T09:{minute:02d}:{second:02d}+00:00",
         "processing_session": "S1", "confidence": 0.9,
         "vehicle_class": "car", "vehicle_color": "Blue",
-        "vehicle_thumbnail_path": f"vt_{camera}_{minute}.jpg",
-        "plate_thumbnail_path": f"pt_{camera}_{minute}.jpg",
+        "vehicle_thumbnail_path": _image(f"vt_{camera}_{minute}.jpg"),
+        "plate_thumbnail_path": _image(f"pt_{camera}_{minute}.jpg"),
     }
     event.update(overrides)
     return event
@@ -173,11 +197,57 @@ class TestImages:
         store(*journey())
         p = profile()
         assert p["best_confidence"] == pytest.approx(0.97)
-        assert p["vehicle_thumbnail_path"] == "vt_CAM001_0.jpg"
+        assert Path(p["vehicle_thumbnail_path"]).name == "vt_CAM001_0.jpg"
 
     def test_images_are_filled_even_without_a_confidence(self, fresh):
         store(detection(confidence=None))
         assert profile()["vehicle_thumbnail_path"]
+
+    def test_a_deleted_picture_is_replaced_by_one_that_still_exists(self, fresh):
+        """A profile must never stay pinned to a crop that is gone.
+
+        Images are taken from the best detection, so the best detection's
+        crop is what the profile points at -- and that file can disappear
+        afterwards (a run deleted while the plate was also seen elsewhere, a
+        half-restored data directory, a manual cleanup). The paths are still
+        recorded, so a check for "is this field set?" says yes forever and
+        the next sighting never replaces them: the dashboard then reports
+        "No image stored" for a vehicle whose picture is on disk the whole
+        time, under a different detection. Which is exactly what happened.
+        """
+        store(detection(minute=0, confidence=0.99))
+        best = profile()["vehicle_thumbnail_path"]
+        assert Path(best).exists()
+
+        for field in ("vehicle_thumbnail_path", "plate_thumbnail_path",
+                      "vehicle_image_path", "plate_image_path"):
+            stale = profile().get(field)
+            if stale:
+                Path(stale).unlink(missing_ok=True)
+
+        # Lower confidence, so the old rule would have kept the dead paths.
+        store(detection(camera="CAM002", minute=10, confidence=0.10))
+
+        healed = profile()
+        assert Path(healed["vehicle_thumbnail_path"]).exists(), (
+            "profile is still pointing at a deleted image"
+        )
+        assert Path(healed["vehicle_thumbnail_path"]).name == "vt_CAM002_10.jpg"
+
+    def test_a_rebuild_also_heals_a_dead_picture(self, fresh):
+        """The same repair, for a profile rebuilt rather than updated."""
+        store(detection(minute=0, confidence=0.99),
+              detection(camera="CAM002", minute=10, confidence=0.10))
+        for field in ("vehicle_thumbnail_path", "plate_thumbnail_path",
+                      "vehicle_image_path", "plate_image_path"):
+            stale = profile().get(field)
+            if stale and "CAM001" in stale:
+                Path(stale).unlink(missing_ok=True)
+
+        with database.get_session() as session:
+            rebuild_all_profiles(session)
+
+        assert Path(profile()["vehicle_thumbnail_path"]).exists()
 
 
 class TestConsistency:
@@ -238,7 +308,7 @@ class TestSessionDeletion:
         assert [v["camera_id"] for v in p["trajectory_history"]] == ["CAM001"]
         assert p["processing_session"] == "OLD"
         # thumbnails of the deleted detections are reported for removal
-        assert "vt_CAM002_10.jpg" in result["image_paths"]
+        assert "vt_CAM002_10.jpg" in [Path(x).name for x in result["image_paths"]]
 
     def test_deleting_the_only_session_removes_the_profile(self, fresh):
         store(*journey())

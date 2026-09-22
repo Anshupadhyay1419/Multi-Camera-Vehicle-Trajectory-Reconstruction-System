@@ -56,15 +56,21 @@ class FrameCapture:
         frame_skip: int = 2,
         max_retries: int = 5,
         stall_timeout: float = 10.0,
+        realtime_playback: bool = True,
     ) -> None:
         self.source = source
         self.frame_skip = max(1, frame_skip)
         self.max_retries = max_retries
         self.stall_timeout = stall_timeout
         self.is_live = self._is_live_source(source)
+        # Recorded files only. A live camera is already paced by the camera.
+        self.realtime_playback = realtime_playback and not self.is_live
 
         self._cap: Optional[cv2.VideoCapture] = None
         self._frame_count: int = 0
+        # Real-time pacing state, set up in open() once the FPS is known.
+        self._frame_interval: float = 0.0
+        self._playback_started: Optional[float] = None
 
         # Live-mode background reader state.
         self._reader_thread: Optional[threading.Thread] = None
@@ -94,6 +100,7 @@ class FrameCapture:
             frame_skip=int(video_cfg.get("frame_skip", 2)),
             max_retries=int(video_cfg.get("max_retries", 5)),
             stall_timeout=float(video_cfg.get("stall_timeout", 10.0)),
+            realtime_playback=bool(video_cfg.get("realtime_playback", True)),
         )
 
     def open(self) -> bool:
@@ -119,6 +126,21 @@ class FrameCapture:
             self._latest_frame_id = 0
             self._consumed_frame_id = 0
             self._start_reader_thread()
+        else:
+            # A file source never starts the reader thread, so nothing else
+            # clears this -- and a stale set() from a previous release()
+            # would make every paced wait return instantly.
+            self._stop_reader.clear()
+
+        self._frame_interval = 0.0
+        self._playback_started = None
+        if self.realtime_playback:
+            fps = self._cap.get(cv2.CAP_PROP_FPS)
+            if fps and fps > 0:
+                # One tick per frame WE return, which is frame_skip frames of
+                # the source, so the clip still finishes in its own running
+                # time when frames are being skipped.
+                self._frame_interval = self.frame_skip / fps
 
         self._frame_count = 0
         _logger.info("Video source opened: '%s' (live=%s)", self.source, self.is_live)
@@ -234,7 +256,36 @@ class FrameCapture:
                 return False, None
 
         self._frame_count += 1
+        self._pace_to_realtime()
         return True, frame
+
+    def _pace_to_realtime(self) -> None:
+        """Hold a recorded file to its own frame rate.
+
+        Nothing else does. A recorded clip is read as fast as the hardware
+        can process it, so on a machine that runs the pipeline faster than
+        the video was shot the camera wall plays the footage sped up -- at
+        roughly 2x here, which is simply the ratio between processing speed
+        and the clip's 30fps. The detections were right; the picture was
+        just not the speed anything actually happened at.
+
+        Only ever slows down, never skips: if processing is SLOWER than the
+        footage the clip already cannot keep up, and dropping frames to
+        chase the clock would cost detections to fix a cosmetic problem.
+        Waiting on the stop event rather than sleeping keeps STOP instant --
+        release() sets it, so a paused-between-frames run still ends at once
+        instead of after one more frame interval.
+        """
+        if self._frame_interval <= 0:
+            return
+        now = time.monotonic()
+        if self._playback_started is None:
+            self._playback_started = now
+            return
+        due = self._playback_started + (self._frame_count - 1) * self._frame_interval
+        delay = due - now
+        if delay > 0:
+            self._stop_reader.wait(timeout=delay)
 
     # ------------------------------------------------------------------
     # Live source path (threaded, always-latest-frame)

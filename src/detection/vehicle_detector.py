@@ -14,6 +14,7 @@ from typing import Optional
 
 import numpy as np
 
+from src.runtime.device import DeviceSpec, device_from_config
 from src.utils.logger import get_logger
 
 _logger = get_logger("detection.vehicle_detector")
@@ -62,14 +63,35 @@ class VehicleDetector:
         )
 
     @classmethod
-    def from_config(cls, config: dict) -> "VehicleDetector":
+    def from_config(
+        cls,
+        config: dict,
+        device: "DeviceSpec | None" = None,
+    ) -> "VehicleDetector":
+        """Build from config, on an already-resolved device.
+
+        `device` is the DeviceSpec the process resolved. Passing it is what
+        keeps every model in a process on the SAME device: this class used
+        to read `detection.device` itself, as did the other detector, while
+        the OCR engine just assumed CUDA -- so nothing in the system owned
+        the answer and nothing noticed when the answers disagreed.
+
+        It stays optional so a one-off script need not build one, and the
+        fallback resolves the same config key through the same resolver, so
+        a lone script gets a validated device rather than a raw dict value.
+        Callers loading several models (see PipelineModels.load) MUST resolve
+        once and pass it, because the first model to load decides the
+        process's CUDA visibility for every model after it.
+        """
         det_cfg = config.get("detection", {})
+        if device is None:
+            device = device_from_config(config)
         return cls(
             model_path=det_cfg["vehicle_model_path"],
             confidence_threshold=float(det_cfg.get("vehicle_confidence", 0.5)),
             imgsz=int(det_cfg.get("vehicle_imgsz", 480)),
-            device=det_cfg.get("device", 0),
-            half=bool(det_cfg.get("half", True)),
+            device=device.ultralytics,
+            half=device.use_half,
         )
 
     def _load_model(self) -> None:

@@ -34,6 +34,23 @@ class OCREngine(ABC):
         is already unwinding.
         """
 
+    @property
+    def is_available(self) -> bool:
+        """Whether this engine can still read anything at all.
+
+        Defaults to True, which is correct for any backend that cannot
+        collapse after construction (a pure-Python or CPU backend).
+        Backends holding a GPU context MUST override it: a CUDA fault can
+        leave them permanently unable to read, and recognize() reports that
+        the same way it reports an empty crop.
+
+        This exists because the two states are otherwise identical from the
+        outside, and the expensive one is invisible: a session whose OCR
+        engine had died processed four videos, stored zero plates, and
+        logged ocr_inference_ms(avg=0.00) -- which reads as "fast".
+        """
+        return True
+
     @abstractmethod
     def recognize(self, image: np.ndarray) -> tuple[str, float]:
         """Extract text from a plate image.
@@ -44,6 +61,19 @@ class OCREngine(ABC):
         Returns:
             Tuple of (recognized_text, confidence_score) where
             confidence_score is in [0.0, 1.0].
-            Returns ("", 0.0) on failure.
+
+            ("", 0.0) means "no readable text in this crop" -- an ordinary,
+            per-frame outcome, NOT an error. It must never be used to report
+            that the engine itself is broken: a caller cannot distinguish
+            that from an empty crop, so a broken engine reported this way
+            stays invisible for an entire run.
+
+        Raises:
+            Implementations report a failure to COME UP by raising
+            ModelUnavailableError from their constructor, so an engine that
+            exists is an engine that works. Implementations do not raise
+            from recognize(): by the time frames are flowing, a live
+            multi-camera session must survive one bad frame. A backend that
+            dies mid-run flips `is_available` to False instead.
         """
         ...

@@ -1,6 +1,6 @@
 {
   "tensorrt_version": "11.3.0.99",
-  "cuda_version": "unknown",
+  "cuda_version": "Cuda compilation tools, release 12.0, V12.0.140",
   "jetpack_version": "unknown",
   "gpu_name": "NVIDIA RTX 5000 Ada Generation",
   "execute_async_v2": false,

@@ -366,6 +366,7 @@ def run_pipeline(
     from src.preprocessing.plate_preprocessor import PlatePreprocessor
     from src.enhancement.super_resolution import SuperResolutionEnhancer
     from src.ocr import create_ocr_engine
+    from src.runtime.device import device_from_config
     from src.validation.plate_validator import PlateValidator
     from src.validation.ocr_fusion import OCRFusion
     from src.classification.color_classifier import ColorClassifier
@@ -400,12 +401,20 @@ def run_pipeline(
     #            is made of.
     owns_models = models is None
     if owns_models:
-        vehicle_detector = VehicleDetector.from_config(config)
-        plate_detector   = PlateDetector.from_config(config)
+        # Resolved once, before any model is built, and then handed to all of
+        # them -- same reason as PipelineModels.load(): the first model to
+        # load fixes this process's CUDA visibility for every model after it,
+        # so a detector built on the CPU would silently take the GPU away
+        # from the OCR engine constructed on the next line.
+        device = device_from_config(config)
+        vehicle_detector = VehicleDetector.from_config(config, device)
+        plate_detector   = PlateDetector.from_config(config, device)
         sr_enhancer      = SuperResolutionEnhancer(
             enh_cfg["realesrgan_model_path"], int(enh_cfg["sr_threshold_px"])
         )
-        ocr_engine       = create_ocr_engine(str(ocr_cfg.get("backend", "paddleocr")), config)
+        ocr_engine       = create_ocr_engine(
+            str(ocr_cfg.get("backend", "paddleocr")), config, device
+        )
     else:
         vehicle_detector = models.vehicle_detector
         plate_detector   = models.plate_detector

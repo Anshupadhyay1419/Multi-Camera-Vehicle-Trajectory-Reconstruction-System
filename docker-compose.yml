@@ -33,6 +33,32 @@ x-alpr: &alpr
     - ./data:/app/data          # database, uploads, plate/vehicle crops, previews
     - ./logs:/app/logs
 
+    # ── the checkout itself ────────────────────────────────────────────
+    # The image carries its own copy of the code (Dockerfile: COPY . /app)
+    # so it can run on a machine that has no checkout. Here the checkout is
+    # mounted over it, and the checkout wins.
+    #
+    # This is what ends the failure that kept costing a whole session: edit
+    # a file, start the stack, and watch the container keep running whatever
+    # code was baked in the last time somebody remembered `--build`. Nothing
+    # is stale any more, because nothing is copied -- `./run restart` picks
+    # up an edit, and only a change to requirements.txt still needs a build.
+    - ./src:/app/src
+    - ./scripts:/app/scripts
+    - ./main.py:/app/main.py
+
+    # Test fixtures .dockerignore deliberately drops to keep the image small
+    # (*.mp4 is 38 MB, training/ is not needed to run). Without them nine
+    # tests fail inside the container for want of files that were never
+    # copied in -- which reads as "the project is broken" rather than "the
+    # image is on a diet". Mounted, so `./run test` means what it says.
+    - ./tests:/app/tests
+    - ./conftest.py:/app/conftest.py
+    - ./pytest.ini:/app/pytest.ini
+    - ./training:/app/training
+    - ./ALPR.mp4:/app/ALPR.mp4
+    - ./mycarplate.mp4:/app/mycarplate.mp4
+
 services:
   # Dashboard + camera manager + ALPR pipeline. They share one process by
   # design: models load once and every live camera thread uses them.

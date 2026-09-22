@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 from src.ocr.base import OCREngine
+from src.runtime.errors import ModelUnavailableError
 from src.utils.logger import get_logger
 
 _logger = get_logger("ocr.parseq_tensorrt_engine")
@@ -71,6 +72,22 @@ class PARSeqTensorRTOCREngine(OCREngine):
         self._host_output: np.ndarray | None = None
         self._output_shape: tuple[int, ...] | None = None
         self._initialize()
+        if self._init_failed:
+            # A dead engine must not escape the constructor. Left alive it
+            # satisfies the OCREngine interface in form only: recognize()
+            # returns ("", 0.0) for every frame of every camera, which is
+            # indistinguishable from "no plate in shot" and reports as
+            # ocr_inference_ms(avg=0.00) -- i.e. it reads as fast rather
+            # than as broken. A real session lost four videos to that.
+            #
+            # close() first: _initialize() may have deserialized a plan or
+            # allocated device buffers before the step that failed, and
+            # nothing else holds a reference once this raises.
+            self.close()
+            raise ModelUnavailableError(
+                f"PARSeq TensorRT engine at '{self.engine_path}' could not be "
+                f"loaded; see the preceding log lines for the cause."
+            )
 
     # ---- Startup and engine compatibility ---------------------------------
 
@@ -453,6 +470,19 @@ class PARSeqTensorRTOCREngine(OCREngine):
                     characters.append(char.upper())
                     confidence.append(float(row[index]))
         return "".join(characters), float(np.mean(confidence)) if confidence else 0.0
+
+    @property
+    def is_available(self) -> bool:
+        """False once this engine has stopped being able to read anything.
+
+        Construction now raises rather than yielding a dead engine, so this
+        only ever goes False mid-run, after a CUDA fault that recovery could
+        not repair. recognize() still degrades to ("", 0.0) there on purpose
+        -- raising would kill a live multi-camera session over one bad frame
+        -- so this property is how a caller tells "read nothing" apart from
+        "cannot read".
+        """
+        return not self._init_failed
 
     def recognize(self, image: np.ndarray) -> tuple[str, float]:
         if self._init_failed or self._context is None or image is None or image.size == 0:

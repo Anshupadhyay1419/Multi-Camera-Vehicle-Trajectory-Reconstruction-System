@@ -113,6 +113,7 @@ class VideoSource(ABC):
                 frame_skip=int(video_cfg.get("frame_skip", 1)),
                 max_retries=int(video_cfg.get("max_retries", 5)),
                 stall_timeout=float(video_cfg.get("stall_timeout", 10.0)),
+                realtime_playback=bool(video_cfg.get("realtime_playback", True)),
             )
             self._capture.open()
         except Exception as exc:

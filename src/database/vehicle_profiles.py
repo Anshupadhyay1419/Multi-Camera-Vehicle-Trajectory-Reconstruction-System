@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from sqlalchemy import func
@@ -38,6 +39,33 @@ from src.database.models import VehicleEvent, VehicleProfile
 from src.utils.logger import get_logger
 
 _logger = get_logger("database.vehicle_profiles")
+
+# Image paths are stored relative to the project root (data/vehicle_crops/...).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _image_exists(path: Optional[str]) -> bool:
+    """Whether a stored image path still points at a real file.
+
+    A profile keeps the pictures of ONE detection, and that detection's files
+    can go away underneath it -- a run deleted while its plate was also seen
+    elsewhere, a data directory restored from a partial backup, crops cleaned
+    up by hand. The row keeps the path either way, so "this profile has an
+    image" and "this profile has a picture to show" are different questions,
+    and only this one is the useful one. Without it a profile pins itself to
+    a dead path forever: the fields are non-empty, so nothing ever replaces
+    them, and the dashboard prints "No image stored" beside a vehicle whose
+    crop is sitting on disk under a different detection.
+    """
+    if not path:
+        return False
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = _REPO_ROOT / candidate
+    try:
+        return candidate.is_file()
+    except OSError:
+        return False
 
 # Two detections of one plate at the same camera, in the same session, no
 # further apart than this, are one visit rather than two. Matches the
@@ -124,15 +152,21 @@ def _apply_event(
     # Images: from the highest-confidence detection that has them. A newer
     # detection with equal confidence wins, so the images stay recent.
     confidence = event.confidence
-    has_images = bool(event.vehicle_thumbnail_path or event.plate_thumbnail_path
-                      or event.vehicle_image_path or event.image_path)
+    # Both questions ask whether the file is THERE, not whether a path was
+    # recorded. That is what lets a profile heal: an event with real files
+    # replaces one whose files have since been deleted, on the next sighting
+    # or on the next rebuild, instead of the dead path outliving them both.
+    has_images = any(_image_exists(path) for path in (
+        event.vehicle_thumbnail_path, event.plate_thumbnail_path,
+        event.vehicle_image_path, event.image_path))
     is_best = confidence is not None and (
         profile.best_confidence is None or confidence >= profile.best_confidence
     )
     if is_best:
         profile.best_confidence = confidence
-    missing_images = not (profile.vehicle_thumbnail_path or profile.plate_thumbnail_path
-                          or profile.vehicle_image_path or profile.plate_image_path)
+    missing_images = not any(_image_exists(path) for path in (
+        profile.vehicle_thumbnail_path, profile.plate_thumbnail_path,
+        profile.vehicle_image_path, profile.plate_image_path))
     if has_images and (is_best or missing_images):
         profile.vehicle_image_path = event.vehicle_image_path or profile.vehicle_image_path
         profile.plate_image_path = event.image_path or profile.plate_image_path

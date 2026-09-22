@@ -38,6 +38,18 @@ video:
   # index, http(s)://) always runs through a background reader thread that
   # keeps only the newest frame, which supersedes frame-skipping.
   frame_skip: 1
+  # Play a recorded file at the speed it was actually shot.
+  #
+  # Nothing else paces a file: it is read as fast as the hardware can
+  # process it, so on a machine faster than the footage the camera wall
+  # shows the clip sped up (about 2x for a 30fps clip here). Detections are
+  # unaffected either way -- this is about the picture being honest, and
+  # about a preview you can actually watch a vehicle in.
+  #
+  # Set to false to process recorded files as fast as possible, which
+  # finishes a long queue of clips sooner at the cost of unwatchable
+  # previews. Ignored for live sources, which the camera already paces.
+  realtime_playback: true
   max_retries: 5                           # reconnect attempts on failure
   # Live sources only: how long read_frame() waits for a new frame before
   # treating the connection as stalled and forcing a reconnect. Guards
@@ -45,16 +57,31 @@ video:
   stall_timeout: 10.0
 
 detection:
-  # ── Jetson Orin Nano edge tuning ────────────────────────────────────────
-  # device: GPU index (0) to run YOLO on the Orin's CUDA cores, or "cpu".
-  # half: fp16 inference — ~2x faster on Jetson GPU, negligible accuracy hit.
+  # ── Compute device ──────────────────────────────────────────────────────
+  # Resolved ONCE per process by src/runtime/device.py and then handed to
+  # every model, so detection and OCR can never disagree about the hardware.
+  #
+  #   0 / "cuda:0"  a specific GPU. If it is not there, startup FAILS rather
+  #                 than falling back -- an explicit GPU that quietly becomes
+  #                 the CPU is a ~58x slowdown nobody notices.
+  #   "auto"        use a GPU when one is really present, else the CPU. Logs
+  #                 a WARNING when it degrades. Use this for a build that
+  #                 ships to machines with and without a GPU.
+  #   "cpu"         force the CPU. The OCR backend below is then switched to
+  #                 a CPU one automatically, because a CPU process cannot
+  #                 host a TensorRT engine.
+  #
+  # half: fp16 inference — ~2x faster on GPU, negligible accuracy hit. It is
+  # a request, not a command: it is forced off on the CPU, where fp16 is
+  # emulated and slower than fp32.
+  #
   # Both are ignored automatically when a model_path points at a pre-exported
   # .engine/.onnx plan (those already fix precision/device at export time).
   # Point *_model_path at a .engine file (run scripts/export_detectors_trt.sh
   # once on-device) for the biggest latency win — raw .pt inference through
   # PyTorch/ultralytics is 3-5x slower than TensorRT on this hardware.
-  device: "cpu"
-  half: false
+  device: 0
+  half: true
   vehicle_model_path: "yolov8s.pt"
   vehicle_confidence: 0.5                  # Back to conservative (0.4 catches too many false positives)
   vehicle_imgsz: 480                       # full-frame detection; 480 balances speed/recall
@@ -195,6 +222,14 @@ vehicle_color:
   chromatic_share: 0.25  # share of such pixels for a vehicle to count as coloured
   white_min_value: 180   # achromatic vehicles by typical brightness:
   silver_min_value: 130  #   >=180 White, >=130 Silver, >=70 Gray, else Black
+  # That brightness is read from BODYWORK only. A row of the crop counts as
+  # bodywork if it is one colour all the way across (quartile spread within
+  # this), which excludes glass -- full of reflections -- and trim rows that
+  # are half dark paint and half chrome. Without it a tall vehicle whose
+  # rear window falls inside the sampled band is judged mostly on its glass:
+  # a white van read 179 against the 180 it needed and was called Silver.
+  # Raise it to accept patchier rows as bodywork, 0 to use every row.
+  panel_row_spread_max: 60
   gray_min_value: 70
   brightness_percentile: 50  # typical panel brightness (upper percentiles follow chrome/glare)
   brown_max_value: 150   # dark orange below this brightness is Brown

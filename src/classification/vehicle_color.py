@@ -80,6 +80,15 @@ class VehicleColorConfig:
     # headlights and sun glare, turning black and dark cars silver on real
     # footage.
     brightness_percentile: float = 50.0
+    # A row of the crop counts as BODYWORK only if it is one colour all the
+    # way across -- its own p75-p25 spread no wider than this. See
+    # _panel_values(). 0 disables the test and uses every row.
+    panel_row_spread_max: int = 60
+    # A row needs at least this many unsaturated pixels to be judged at all.
+    panel_min_row_pixels: int = 4
+    # Below this many bodywork rows there is not enough to judge, and the
+    # whole region is used instead.
+    panel_min_rows: int = 4
     # Orange/red hues darker than this are brown.
     brown_max_value: int = 150
     # Hue boundaries (upper bounds, exclusive), in order around the wheel.
@@ -141,7 +150,7 @@ class VehicleColorDetector:
         if chromatic_share >= c.chromatic_share:
             codes = self._hue_codes(hue[saturated], val[saturated])
         else:
-            codes = self._brightness_codes(val[~saturated])
+            codes = self._brightness_codes(val, ~saturated)
 
         if codes.size == 0:
             return UNKNOWN, {}
@@ -208,14 +217,60 @@ class VehicleColorDetector:
         codes[(hue >= 4) & (hue < c.hue_orange) & (val < c.brown_max_value)] = _CODE["Brown"]
         return codes.astype(np.int64)
 
-    def _brightness_codes(self, val: np.ndarray) -> np.ndarray:
+    def _panel_values(self, val: np.ndarray, unsaturated: np.ndarray) -> np.ndarray:
+        """The unsaturated pixels that are BODYWORK, ignoring glass and trim.
+
+        region_top exists to put the windscreen and rear window above the
+        sampled band, and on a car it does. On a tall vehicle it does not: a
+        van's rear window sits squarely inside 35-80% of the box, and being
+        dark it drags the median of the whole region down. A white Omni
+        measured 179 against the 180 needed for White and was reported
+        Silver -- the paint was never in question, the glass outvoted it.
+
+        Rather than assume where the glass is, ask which rows look like
+        painted panel. A panel row is ONE colour the whole way across, so
+        its own quartile spread is tiny; the van's paint rows sit at 247
+        with a spread of 0-8. Glass is not: it carries reflections of trees,
+        road and sky, and those rows spread 60-120. Trim is not either -- the
+        row through a black car's chrome grille and headlights is half
+        near-black paint and half blown-out highlight.
+
+        So only uniform rows are counted, and what is left is bodywork. This
+        is deliberately not "take a brighter percentile", which is what an
+        earlier attempt did: highlights on a dark car pushed it into the
+        silver band, because that rule cannot tell a bright PIXEL from a
+        bright PANEL. A black car's paint rows are uniform and dark, so they
+        are exactly the rows kept, and it stays Black.
+        """
+        c = self.config
+        flat = val[unsaturated]
+        if c.panel_row_spread_max <= 0 or val.ndim != 2:
+            return flat
+
+        panel_rows = np.zeros(val.shape[0], dtype=bool)
+        for index in range(val.shape[0]):
+            row = val[index][unsaturated[index]]
+            if row.size < c.panel_min_row_pixels:
+                continue
+            quarter, three = np.percentile(row, [25, 75])
+            panel_rows[index] = (three - quarter) <= c.panel_row_spread_max
+
+        if int(panel_rows.sum()) < c.panel_min_rows:
+            return flat
+        panels = val[panel_rows][unsaturated[panel_rows]]
+        return panels if panels.size else flat
+
+    def _brightness_codes(self, val: np.ndarray, unsaturated: np.ndarray) -> np.ndarray:
         if val.size == 0:
             return np.array([], dtype=np.int64)
         c = self.config
+        values = self._panel_values(val, unsaturated)
+        if values.size == 0:
+            return np.array([], dtype=np.int64)
         # One label for the whole vehicle from its typical panel brightness,
         # rather than a per-pixel vote over pixels of very different origin
         # (paint, trim, shadow).
-        level = float(np.percentile(val, c.brightness_percentile))
+        level = float(np.percentile(values, c.brightness_percentile))
         if level >= c.white_min_value:
             label = "White"
         elif level >= c.silver_min_value:

@@ -1,0 +1,504 @@
+#!/usr/bin/env bash
+#
+# ALPR University Gate — one entry point for everything.
+#
+#   ./run up                     dashboard + API, ready to use
+#   ./run video ALPR.mp4         whole pipeline over a file, no browser
+#   ./run rtsp rtsp://cam/live   whole pipeline over a live camera
+#   ./run test                   prove the system still works
+#   ./run doctor                 explain what is wrong with this machine
+#   ./run down                   stop everything
+#
+# Runs either in Docker (default) or in the ./alpr virtualenv (--native).
+# Both are kept working; neither needs you to remember a setup step first.
+#
+# Everything below exists because of a failure that actually happened on
+# this machine, and each guard says which one. Re-running any command is
+# always safe.
+
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+PROJECT_DIR="$PWD"
+
+IMAGE="alpr-university-gate:latest"
+DASH_PORT=8502
+API_PORT=8000
+PREVIEW_PORT=8765
+VENV_PY="$PROJECT_DIR/alpr/bin/python"
+PIDDIR="$PROJECT_DIR/logs/.run"
+
+if [[ -t 1 ]]; then
+    R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'
+else
+    R=""; G=""; Y=""; B=""; N=""
+fi
+note() { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+step() { printf '\n%s%s%s\n' "$B" "$*" "$N"; }
+
+usage() {
+    cat <<'USAGE'
+ALPR University Gate
+
+  ./run up [--build]        Start the dashboard and the REST API.
+  ./run down                Stop them.
+  ./run restart             Restart (picks up code edits; no rebuild needed).
+  ./run video <file>        Run the full pipeline over a video file.
+  ./run rtsp <url>          Run the full pipeline over a live camera.
+  ./run pipeline [args...]  The pipeline with raw arguments (see main.py).
+  ./run test [args...]      Run the test suite.
+  ./run logs [service]      Follow the logs.
+  ./run shell               A shell inside the environment.
+  ./run build               Rebuild the image from scratch.
+  ./run doctor              Check this machine and explain anything wrong.
+  ./run status              What is running right now.
+
+Where it runs:
+  --docker   (default) in the container; isolated, matches deployment.
+  --native   in ./alpr; faster edit loop, uses this machine's CUDA.
+  Set ALPR_RUNTIME=native to make --native the default for your shell.
+
+Examples:
+  ./run up                       then open http://localhost:8502
+  ./run video ALPR.mp4
+  ./run --native video ALPR.mp4 --benchmark
+  ./run test tests/unit -q
+USAGE
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Which runtime
+# ══════════════════════════════════════════════════════════════════════════
+
+RUNTIME="${ALPR_RUNTIME:-docker}"
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --docker) RUNTIME=docker ;;
+        --native) RUNTIME=native ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Guards — each one is a thing that has already gone wrong here
+# ══════════════════════════════════════════════════════════════════════════
+
+require_docker() {
+    command -v docker >/dev/null 2>&1 || die "Docker is not installed. Try: ./run --native ${1:-up}"
+    if ! docker info >/dev/null 2>&1; then
+        warn "Cannot talk to Docker."
+        note "  Not in the docker group yet:  sudo usermod -aG docker \$USER"
+        note "  Just added?  Run 'newgrp docker' or log out and back in."
+        note "  Or skip Docker entirely:      ./run --native ${1:-up}"
+        exit 1
+    fi
+    docker compose version >/dev/null 2>&1 \
+        || die "Docker Compose v2 is missing (this needs 'docker compose', not 'docker-compose')."
+}
+
+# Compose names a project after its DIRECTORY, so every clone of this repo on
+# this machine is called "alpr-university-gate" no matter where it lives. A
+# container created from /home/someone-else/.../alpr-university-gate is
+# therefore "the" project's container as far as compose is concerned, and it
+# keeps its ORIGINAL bind mounts -- pointing at a directory that may not even
+# exist here. That is not hypothetical: this machine spent 33 hours serving a
+# dashboard that crashed on every page load because its /app/logs was an
+# empty root-owned directory belonging to a checkout that had been deleted.
+# Nothing in the error said so. So: if a container is mounting something that
+# is not this directory, it is not ours, and it goes.
+evict_foreign_containers() {
+    local name src foreign=0
+    for name in alpr-dashboard alpr-api; do
+        docker container inspect "$name" >/dev/null 2>&1 || continue
+        while read -r src; do
+            [[ -z "$src" ]] && continue
+            [[ "$src" == "$PROJECT_DIR"/* || "$src" == "$PROJECT_DIR" ]] || foreign=1
+        done < <(docker container inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' "$name" 2>/dev/null)
+    done
+    if (( foreign )); then
+        warn "Containers from a different copy of this project were in the way — replacing them."
+        docker compose down --remove-orphans >/dev/null 2>&1 || true
+        docker rm -f alpr-dashboard alpr-api >/dev/null 2>&1 || true
+    fi
+}
+
+# The container runs as you, so that everything it writes into data/ and
+# logs/ stays yours. It learns your ids from .env -- which is gitignored and
+# therefore absent on every fresh clone, where compose silently falls back to
+# 1000:1000. If you are not user 1000 the container then cannot write its own
+# log file and every entry point dies on PermissionError before it starts.
+# Rewritten on every command so it can never drift from who you actually are.
+sync_env() {
+    local want
+    want="$(printf 'UID=%s\nGID=%s\n' "$(id -u)" "$(id -g)")"
+    if [[ ! -f .env ]] || [[ "$(cat .env)" != "$want" ]]; then
+        printf '%s' "$want" > .env
+    fi
+    # Git-ignored, so absent after a clone. If Docker is left to create them
+    # for the bind mounts they are made root-owned and the container, running
+    # as you, cannot write a thing.
+    mkdir -p data logs "$PIDDIR"
+}
+
+# The trained plate detector is stored in Git LFS. Without `git lfs pull` it
+# is a ~130 byte text pointer, and the pipeline fails on its first frame with
+# an error about the weights being corrupt.
+check_lfs() {
+    local f
+    for f in models/plate_detector/best.pt; do
+        [[ -f "$f" ]] || { warn "Missing $f — run: git lfs install && git lfs pull"; return 1; }
+        if head -c 200 "$f" | grep -q "git-lfs"; then
+            warn "$f is still a Git LFS pointer, not the real weights."
+            note "  Fix with:  git lfs install && git lfs pull"
+            return 1
+        fi
+    done
+    return 0
+}
+
+# The source is bind-mounted (see docker-compose.yml), so an edit needs only
+# a restart. A change to the DEPENDENCIES still needs a build, and forgetting
+# that is its own confusing afternoon -- so notice it instead of waiting to
+# be told.
+image_is_stale() {
+    local created f
+    docker image inspect "$IMAGE" >/dev/null 2>&1 || return 0
+    created="$(docker image inspect -f '{{.Created}}' "$IMAGE")"
+    created="$(date -d "$created" +%s 2>/dev/null || echo 0)"
+    [[ "$created" == 0 ]] && return 1
+    for f in Dockerfile requirements.txt docker/requirements-docker.txt; do
+        [[ -f "$f" ]] || continue
+        (( $(stat -c %Y "$f") > created )) && return 0
+    done
+    return 1
+}
+
+ensure_image() {
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        step "Building the image (first time — the heavy layers are cached afterwards)"
+        docker compose build alpr
+    elif image_is_stale; then
+        step "Dependencies changed since the image was built — rebuilding"
+        docker compose build alpr
+    fi
+}
+
+docker_prepare() {
+    require_docker "${1:-up}"
+    sync_env
+    evict_foreign_containers
+    check_lfs || true
+    ensure_image
+}
+
+require_venv() {
+    [[ -x "$VENV_PY" ]] || die \
+"No virtualenv at ./alpr.
+  Create it with:  python3.12 -m venv alpr && ./alpr/bin/pip install -r requirements.txt
+  Or just use Docker:  ./run ${1:-up}"
+    sync_env
+    check_lfs || true
+}
+
+native_env() {
+    export PYTHONPATH="$PROJECT_DIR"
+    export STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+}
+
+wait_for() {  # wait_for <url> <label> <seconds>
+    local url="$1" label="$2" limit="${3:-120}" waited=0
+    while ! curl -fsS "$url" >/dev/null 2>&1; do
+        sleep 2; waited=$((waited + 2))
+        if (( waited >= limit )); then
+            warn "$label did not come up within ${limit}s. Try: ./run logs"
+            return 1
+        fi
+    done
+    ok "$label is up"
+}
+
+lan_ip() { hostname -I 2>/dev/null | awk '{print $1}'; }
+
+# A running container can LOSE the GPU underneath itself. A driver update or
+# a plain `systemctl daemon-reload` resets the cgroup device allowlist, and
+# from then on the device nodes are still THERE but unusable inside the
+# container, while the host stays perfectly healthy. Nothing announces it.
+# The next session then dies with "cuInit failed: no CUDA-capable device is
+# detected" hours after whatever actually broke it -- which is how a
+# dashboard that has been up all day turns into a failed run for no visible
+# reason, and it is why pressing START stopped working here. cuInit is the
+# cheapest honest question (~0.15s) and it is the exact call that fails.
+container_gpu_ok() {
+    docker exec "${1:-alpr-dashboard}" python3.12 -c \
+        "import ctypes,sys; sys.exit(0 if ctypes.CDLL('libcuda.so.1').cuInit(0)==0 else 1)" \
+        >/dev/null 2>&1
+}
+
+verify_gpu() {
+    docker container inspect alpr-dashboard >/dev/null 2>&1 || return 0
+    if container_gpu_ok; then ok "GPU reachable inside the container"; return 0; fi
+    warn "The container cannot see the GPU — recreating it once."
+    docker compose up -d --force-recreate >/dev/null 2>&1 || true
+    wait_for "http://localhost:$DASH_PORT/_stcore/health" "Dashboard" 180 >/dev/null 2>&1 || true
+    if container_gpu_ok; then
+        ok "GPU reachable after recreate"
+    else
+        warn "Still no GPU inside the container — START would fail on 'no CUDA-capable device'."
+        note "  This normally follows a driver update or a 'systemctl daemon-reload'."
+        note "  Fix with:  sudo systemctl restart docker   then   ./run up"
+        note "  Or run the pipeline outside Docker:  ./run --native video <file>"
+    fi
+}
+
+print_urls() {
+    local ip; ip="$(lan_ip)"; ip="${ip:-localhost}"
+    note ""
+    note "  Dashboard : http://${ip}:${DASH_PORT}"
+    note "  API docs  : http://${ip}:${API_PORT}/docs"
+    note ""
+    note "  Logs      : ./run logs        Stop: ./run down"
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Commands
+# ══════════════════════════════════════════════════════════════════════════
+
+cmd_up() {
+    local build=0
+    for a in "$@"; do [[ "$a" == "--build" ]] && build=1; done
+    if [[ "$RUNTIME" == native ]]; then
+        require_venv up; native_env
+        cmd_down >/dev/null 2>&1 || true
+        step "Starting the dashboard and the API in ./alpr"
+        nohup "$VENV_PY" -m streamlit run src/dashboard/trajectory_app.py \
+            --server.port="$DASH_PORT" --server.address=0.0.0.0 --server.headless=true \
+            >> logs/dashboard.out 2>&1 &
+        echo $! > "$PIDDIR/dashboard.pid"
+        nohup "$VENV_PY" -m uvicorn src.api.server:app \
+            --host 0.0.0.0 --port "$API_PORT" >> logs/api.out 2>&1 &
+        echo $! > "$PIDDIR/api.pid"
+        wait_for "http://localhost:$DASH_PORT/_stcore/health" "Dashboard" 120 || true
+        wait_for "http://localhost:$API_PORT/docs" "API" 60 || true
+        print_urls
+        return
+    fi
+    docker_prepare up
+    (( build )) && docker compose build alpr
+    step "Starting the dashboard and the API"
+    docker compose up -d
+    wait_for "http://localhost:$DASH_PORT/_stcore/health" "Dashboard" 180 || true
+    wait_for "http://localhost:$API_PORT/docs" "API" 60 || true
+    verify_gpu
+    print_urls
+}
+
+cmd_down() {
+    if [[ "$RUNTIME" == native ]]; then
+        local f pid
+        for f in "$PIDDIR"/*.pid; do
+            [[ -e "$f" ]] || continue
+            pid="$(cat "$f")"
+            kill "$pid" 2>/dev/null || true
+            rm -f "$f"
+        done
+        ok "Stopped."
+        return
+    fi
+    require_docker down; sync_env
+    docker compose down
+    ok "Stopped."
+}
+
+cmd_restart() {
+    if [[ "$RUNTIME" == native ]]; then cmd_down; cmd_up; return; fi
+    docker_prepare restart
+    docker compose up -d --force-recreate
+    wait_for "http://localhost:$DASH_PORT/_stcore/health" "Dashboard" 180 || true
+    verify_gpu
+    print_urls
+}
+
+# One-off containers rather than `exec` into the running dashboard: the
+# pipeline is a full GPU workload, and running it inside the process that is
+# also serving the page means one crash takes both down.
+run_in_env() {
+    if [[ "$RUNTIME" == native ]]; then
+        require_venv; native_env
+        exec "$VENV_PY" "$@"
+    fi
+    docker_prepare
+    exec docker compose run --rm --no-deps alpr python3.12 "$@"
+}
+
+cmd_video() {
+    [[ $# -ge 1 ]] || die "Which video? e.g. ./run video ALPR.mp4"
+    local src="$1"; shift
+    [[ -f "$src" ]] || die "No such file: $src"
+    step "Running the full pipeline over $src"
+    run_in_env main.py --source "$src" "$@"
+}
+
+cmd_rtsp() {
+    [[ $# -ge 1 ]] || die "Which camera? e.g. ./run rtsp rtsp://user:pass@10.0.0.5/live"
+    local url="$1"; shift
+    step "Running the full pipeline over the live camera"
+    run_in_env main.py --source "$url" "$@"
+}
+
+cmd_pipeline() { run_in_env main.py "$@"; }
+
+cmd_test() {
+    local args=("$@")
+    (( ${#args[@]} == 0 )) && args=(tests -q)
+    run_in_env -m pytest "${args[@]}"
+}
+
+cmd_logs() {
+    if [[ "$RUNTIME" == native ]]; then
+        tail -f logs/dashboard.out logs/api.out
+        return
+    fi
+    require_docker logs; sync_env
+    docker compose logs -f ${1:+"$1"}
+}
+
+cmd_shell() {
+    if [[ "$RUNTIME" == native ]]; then
+        require_venv; native_env
+        exec bash --rcfile <(echo "PS1='(alpr) \w\$ '; export PYTHONPATH=$PROJECT_DIR")
+    fi
+    docker_prepare
+    exec docker compose run --rm --no-deps alpr bash
+}
+
+cmd_build() {
+    require_docker build; sync_env
+    docker compose build --no-cache alpr
+    ok "Image rebuilt."
+}
+
+cmd_status() {
+    if [[ "$RUNTIME" == native ]]; then
+        local f pid any=0
+        for f in "$PIDDIR"/*.pid; do
+            [[ -e "$f" ]] || continue
+            pid="$(cat "$f")"
+            if kill -0 "$pid" 2>/dev/null; then
+                ok "$(basename "$f" .pid) running (pid $pid)"; any=1
+            fi
+        done
+        (( any )) || note "Nothing running natively."
+        return
+    fi
+    require_docker status; sync_env
+    docker compose ps
+}
+
+cmd_doctor() {
+    local problems=0
+    step "This machine"
+
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        ok "Docker works"
+    else
+        warn "Docker unavailable — ./run --native still works"; problems=$((problems+1))
+    fi
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local drv; drv="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
+        if [[ -n "$drv" ]]; then
+            if (( ${drv%%.*} >= 580 )); then ok "NVIDIA driver $drv"
+            else warn "NVIDIA driver $drv is older than the 580 this image expects"; problems=$((problems+1)); fi
+        fi
+    else
+        warn "No nvidia-smi — the pipeline will be very slow or will not start"; problems=$((problems+1))
+    fi
+
+    # The host having a GPU says nothing about the container still having one.
+    if docker container inspect alpr-dashboard >/dev/null 2>&1; then
+        if container_gpu_ok; then
+            ok "The running container can reach the GPU"
+        else
+            warn "The running container has LOST the GPU — pressing START would fail"
+            note "    ./run restart   recreates it and usually fixes this"
+            problems=$((problems+1))
+        fi
+    fi
+
+    step "This project"
+    if check_lfs; then ok "Model weights are real files, not LFS pointers"
+    else problems=$((problems+1)); fi
+
+    local f missing=0
+    for f in config/config.yaml config/camera_config.yaml main.py; do
+        [[ -e "$f" ]] || { warn "Missing $f"; missing=1; }
+    done
+    (( missing )) && problems=$((problems+1)) || ok "Config and entry point present"
+
+    # Bind-mounting a path that does not exist makes Docker invent a
+    # root-owned directory in its place, which then fails confusingly later.
+    local mnt mnt_missing=0
+    for mnt in src scripts tests training conftest.py pytest.ini ALPR.mp4 mycarplate.mp4; do
+        [[ -e "$mnt" ]] || { warn "docker-compose.yml mounts ./$mnt, which does not exist"; mnt_missing=1; }
+    done
+    (( mnt_missing )) && problems=$((problems+1)) || ok "Every mounted path exists"
+
+    if [[ -f .env ]] && [[ "$(cat .env)" == "$(printf 'UID=%s\nGID=%s\n' "$(id -u)" "$(id -g)")" ]]; then
+        ok ".env matches your user ($(id -u):$(id -g))"
+    else
+        warn ".env is missing or stale — any ./run command rewrites it"
+    fi
+
+    if [[ -x "$VENV_PY" ]]; then ok "Virtualenv ./alpr is usable (--native)"
+    else note "  (no ./alpr virtualenv — --native would need one)"; fi
+
+    step "What is in the way"
+    local p
+    for p in "$DASH_PORT" "$API_PORT" "$PREVIEW_PORT"; do
+        if ss -ltn 2>/dev/null | grep -q ":$p "; then note "  port $p is in use (fine if that is this project)"; fi
+    done
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        local name src foreign=0
+        for name in alpr-dashboard alpr-api; do
+            docker container inspect "$name" >/dev/null 2>&1 || continue
+            while read -r src; do
+                [[ -z "$src" ]] && continue
+                [[ "$src" == "$PROJECT_DIR"/* || "$src" == "$PROJECT_DIR" ]] || foreign=1
+            done < <(docker container inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' "$name" 2>/dev/null)
+        done
+        if (( foreign )); then
+            warn "A container from a DIFFERENT copy of this project exists; ./run up will replace it"
+            problems=$((problems+1))
+        else
+            ok "No containers from another checkout"
+        fi
+    fi
+
+    note ""
+    if (( problems == 0 )); then ok "Nothing wrong. ./run up should just work."
+    else warn "$problems thing(s) above need attention."; fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+
+cmd="${1:-up}"; shift || true
+case "$cmd" in
+    up)        cmd_up "$@" ;;
+    down|stop) cmd_down "$@" ;;
+    restart)   cmd_restart "$@" ;;
+    video)     cmd_video "$@" ;;
+    rtsp)      cmd_rtsp "$@" ;;
+    pipeline)  cmd_pipeline "$@" ;;
+    test)      cmd_test "$@" ;;
+    logs)      cmd_logs "$@" ;;
+    shell)     cmd_shell "$@" ;;
+    build)     cmd_build "$@" ;;
+    status)    cmd_status "$@" ;;
+    doctor)    cmd_doctor "$@" ;;
+    -h|--help|help) usage ;;
+    *)         warn "Unknown command: $cmd"; note ""; usage; exit 1 ;;
+esac

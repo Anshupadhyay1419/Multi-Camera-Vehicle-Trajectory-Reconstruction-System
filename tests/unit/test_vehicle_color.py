@@ -137,3 +137,60 @@ class TestPerformance:
             detector.detect(image)
         per_call_ms = (time.perf_counter() - started) / 50 * 1000
         assert per_call_ms < 5.0, f"{per_call_ms:.2f} ms per vehicle"
+
+
+class TestTallVehicles:
+    """A van's glass sits inside the sampled band, a car's does not.
+
+    region_top skips the top third of the box because that is where the
+    glass is -- on a car. A van is taller and boxier, so its rear window
+    lands squarely in the middle of what is sampled, and being full of dark
+    reflections it outvotes the paint around it. A real white Omni measured
+    179 against the 180 needed for White and was stored as Silver, so a
+    search for white vehicles did not return it.
+    """
+
+    @staticmethod
+    def _van(body_bgr, seed=1):
+        """A tall vehicle whose rear window falls in the middle of the crop.
+
+        The reflections in the glass are drawn as bands rather than
+        per-pixel noise on purpose: the classifier downscales before it
+        measures, and noise simply averages back out into a smooth mid-grey
+        that reads as bodywork. Real glass carries trees, sky and road --
+        structure coarse enough to survive the resize -- and that is what
+        makes a glass row distinguishable from a painted one.
+        """
+        rng = np.random.default_rng(seed)
+        image = np.zeros((300, 300, 3), np.uint8)
+        image[:] = (90, 110, 95)
+        cv2.rectangle(image, (30, 10), (270, 290), body_bgr, -1)
+        cv2.rectangle(image, (50, 60), (250, 205), (35, 35, 35), -1)
+        for x in range(55, 250, 34):
+            cv2.rectangle(image, (x, 62), (x + 17, 203), (150, 155, 150), -1)
+        noise = rng.normal(0, 3, image.shape)
+        return np.clip(image.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+    def test_a_white_van_is_white_not_silver(self, detector):
+        assert detector.detect(self._van(BODY_BGR["White"])) == "White"
+
+    def test_a_black_van_is_still_black(self, detector):
+        """The repair must not simply brighten everything."""
+        assert detector.detect(self._van(BODY_BGR["Black"])) == "Black"
+
+    def test_a_silver_van_is_still_silver(self, detector):
+        assert detector.detect(self._van(BODY_BGR["Silver"])) == "Silver"
+
+    def test_a_gray_van_is_still_gray(self, detector):
+        assert detector.detect(self._van(BODY_BGR["Gray"])) == "Gray"
+
+    def test_without_the_repair_the_white_van_reads_silver(self):
+        """Pins the bug itself, so the fix cannot be quietly undone.
+
+        panel_row_spread_max=0 counts every row, glass included, which is
+        what the classifier used to do -- and it gets the van wrong.
+        """
+        blind = VehicleColorDetector.from_config(
+            {"vehicle_color": {"panel_row_spread_max": 0}}
+        )
+        assert blind.detect(self._van(BODY_BGR["White"])) == "Silver"

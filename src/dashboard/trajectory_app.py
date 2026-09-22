@@ -208,6 +208,99 @@ def _registry():
     return _manager().registry
 
 
+# ── cached database reads ─────────────────────────────────────────────────
+#
+# Every panel on this page runs at least one query, and several run the SAME
+# query: the blacklist feeds both the red banner and the Home panel, and
+# st.tabs renders all three tab bodies on every run, so the Operations
+# statistics and the Home heatmap are computed even while nobody is looking
+# at either of them. Multiplied by a live session's refresh, that was dozens
+# of queries a second against the same handful of rows.
+#
+# cache_data with a short TTL collapses each distinct query to one call per
+# interval and still refreshes fast enough to read as live. A TTL rather
+# than explicit invalidation, because the PIPELINE writes these rows from
+# its own threads -- there is no edit on this page to hang an invalidation
+# off. Edits made HERE are the exception and clear the caches outright (see
+# _clear_query_caches), so an operator's own action is never shown stale.
+#
+# Every one of these returns plain rows -- dicts, lists, ints -- which is
+# what cache_data requires: no ORM instance outlives its session.
+
+_QUERY_TTL = LIVE_REFRESH_SECONDS
+
+
+@st.cache_data(ttl=_QUERY_TTL, show_spinner=False)
+def _q_processing_sessions(limit: int = 20) -> list[dict]:
+    try:
+        with database.get_session() as session:
+            return database.get_processing_sessions(session, limit=limit)
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=_QUERY_TTL, show_spinner=False)
+def _q_blacklisted(plates: tuple) -> list[dict]:
+    """Sightings of the given blacklisted plates.
+
+    Takes the plates as an argument rather than reading the blacklist
+    itself: the list is editable on this page, and passing it in makes an
+    edit a different cache key instead of a change the TTL would hide for a
+    couple of seconds.
+    """
+    if not plates:
+        return []
+    try:
+        with database.get_session() as session:
+            return database.get_blacklisted_detections(session, set(plates))
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=_QUERY_TTL, show_spinner=False)
+def _q_session_stats(session_filter: Optional[str]) -> dict:
+    with database.get_session() as session:
+        return database.get_session_stats(session, processing_session=session_filter)
+
+
+@st.cache_data(ttl=_QUERY_TTL, show_spinner=False)
+def _q_current_locations(session_filter: Optional[str]) -> dict:
+    with database.get_session() as session:
+        return database.get_current_vehicle_locations(
+            session, processing_session=session_filter)
+
+
+@st.cache_data(ttl=_QUERY_TTL, show_spinner=False)
+def _q_events_without_session() -> int:
+    try:
+        with database.get_session() as session:
+            return database.count_events_without_session(session)
+    except Exception:
+        return 0
+
+
+@st.cache_data(ttl=_QUERY_TTL, show_spinner=False)
+def _q_plate_detections(plate: str, session_filter: Optional[str]) -> list[dict]:
+    with database.get_session() as session:
+        return database.get_plate_detections(
+            session, plate, processing_session=session_filter)
+
+
+def _clear_query_caches() -> None:
+    """Drop every cached query after this page itself changes the database.
+
+    The TTL above exists for the pipeline's writes, which this page cannot
+    see coming. An operator's own edit is different: deleting a session must
+    be gone from the scope picker, the statistics and the heatmap on the very
+    next render, not up to _QUERY_TTL seconds later.
+    """
+    for query in (
+        _q_processing_sessions, _q_blacklisted, _q_session_stats,
+        _q_current_locations, _q_events_without_session, _q_plate_detections,
+    ):
+        query.clear()
+
+
 # ── formatting helpers ────────────────────────────────────────────────────
 
 
@@ -748,13 +841,7 @@ def _live_frame_bytes(camera_id: str) -> Optional[bytes]:
     Never raises -- the file is being rewritten underneath us, so a partial
     or vanished read is expected and simply means "no new frame this time".
     """
-    directory = (_bootstrap()["config"].get("api") or {}).get(
-        "live_frames_dir", "data/live_frames"
-    )
-    path = Path(directory)
-    if not path.is_absolute():
-        path = REPO_ROOT / path
-    frame = path / f"{camera_id}.jpg"
+    frame = _live_frame_path(camera_id)
     try:
         if not frame.is_file():
             return None
@@ -764,6 +851,39 @@ def _live_frame_bytes(camera_id: str) -> Optional[bytes]:
         return data if data.endswith(b"\xff\xd9") else None
     except OSError:
         return None
+
+
+def _live_frame_path(camera_id: str) -> Path:
+    """Where the pipeline publishes this camera's latest annotated frame."""
+    directory = (_bootstrap()["config"].get("api") or {}).get(
+        "live_frames_dir", "data/live_frames"
+    )
+    path = Path(directory)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path / f"{camera_id}.jpg"
+
+
+def _has_live_frame(camera_id: str) -> bool:
+    """Whether a camera has published a complete frame, without reading it.
+
+    The same question _live_frame_bytes answers, end-of-image check and all,
+    but it seeks to the last two bytes instead of loading the whole JPEG.
+    When the preview server is up the wall shows video and never displays
+    these pixels -- the file is consulted only to decide between a caption
+    and no caption, and reading a few hundred KB per camera per refresh to
+    answer that was pure disk traffic.
+    """
+    frame = _live_frame_path(camera_id)
+    try:
+        if not frame.is_file():
+            return False
+        with frame.open("rb") as handle:
+            handle.seek(-2, os.SEEK_END)
+            return handle.read(2) == b"\xff\xd9"
+    except OSError:
+        # Includes a file shorter than two bytes, i.e. one just created.
+        return False
 
 
 # Height of each camera's video panel on the wall, in CSS pixels.
@@ -840,11 +960,9 @@ def _panel_status(camera, state: str, is_live: bool, progress) -> tuple[str, str
 
 
 def _blacklisted_sightings() -> list[dict]:
-    try:
-        with database.get_session() as db_session:
-            return database.get_blacklisted_detections(db_session, get_blacklist().plates())
-    except Exception:
-        return []
+    # Sorted into a tuple so the blacklist (a set) is a stable cache key:
+    # the same plates in a different iteration order must not be a miss.
+    return _q_blacklisted(tuple(sorted(get_blacklist().plates())))
 
 
 def render_blacklist_alert() -> None:
@@ -938,15 +1056,13 @@ def render_traffic_heatmap(session_filter: Optional[str]) -> None:
     )
     current = view.startswith("Where")
     try:
-        with database.get_session() as db_session:
-            if current:
-                # Each vehicle counted once, at the camera it was LAST seen:
-                # vehicles that passed 1, 2 and 3 and are now at 4 heat up 4.
-                counts = database.get_current_vehicle_locations(
-                    db_session, processing_session=session_filter)
-            else:
-                stats = database.get_session_stats(db_session, processing_session=session_filter)
-                counts = {row["camera_id"]: row["detections"] for row in stats["per_camera"]}
+        if current:
+            # Each vehicle counted once, at the camera it was LAST seen:
+            # vehicles that passed 1, 2 and 3 and are now at 4 heat up 4.
+            counts = _q_current_locations(session_filter)
+        else:
+            stats = _q_session_stats(session_filter)
+            counts = {row["camera_id"]: row["detections"] for row in stats["per_camera"]}
     except Exception as exc:
         st.warning(f"Heatmap unavailable: {exc}")
         return
@@ -1027,8 +1143,15 @@ def render_camera_wall(status: dict) -> None:
                     unsafe_allow_html=True,
                 )
 
-                frame = _live_frame_bytes(camera.camera_id)
-                if frame:
+                # The streaming panel needs a yes/no, the fallback needs the
+                # pixels. Ask for only what this panel will actually use.
+                frame = None
+                if streaming:
+                    has_frame = _has_live_frame(camera.camera_id)
+                else:
+                    frame = _live_frame_bytes(camera.camera_id)
+                    has_frame = frame is not None
+                if has_frame:
                     any_frame = True
 
                 if streaming:
@@ -1037,7 +1160,7 @@ def render_camera_wall(status: dict) -> None:
                         _stream_player_html(camera.camera_id, server.port),
                         height=FEED_PANEL_HEIGHT + 8,
                     )
-                    if not frame:
+                    if not has_frame:
                         message, css = _panel_status(camera, state, is_live, progress)
                         st.markdown(
                             f'<div style="font-size:.8rem;opacity:.8;{css}">'
@@ -1221,8 +1344,7 @@ def render_statistics(status: dict, session_filter: Optional[str]) -> None:
 
     session_id = session_filter
     try:
-        with database.get_session() as session:
-            stats = database.get_session_stats(session, processing_session=session_id)
+        stats = _q_session_stats(session_id)
     except Exception as exc:
         st.warning(f"Statistics unavailable: {exc}")
         return
@@ -1253,11 +1375,7 @@ def render_statistics(status: dict, session_filter: Optional[str]) -> None:
     )
 
     if not session_filter:
-        try:
-            with database.get_session() as db_session:
-                outside = database.count_events_without_session(db_session)
-        except Exception:
-            outside = 0
+        outside = _q_events_without_session()
         if outside:
             st.caption(
                 f"{outside} older single-gate event(s) are not counted here — "
@@ -1290,10 +1408,10 @@ def render_statistics(status: dict, session_filter: Optional[str]) -> None:
 def _load_trajectory(plate: str, session_filter: Optional[str]):
     registry = _registry()
     engine = TrajectoryEngine.from_registry(registry)
-    with database.get_session() as session:
-        detections = database.get_plate_detections(
-            session, plate, processing_session=session_filter
-        )
+    # Only the query is cached. The engine builds from rows already in
+    # memory, and its result holds live registry objects that have no
+    # business being pickled into a cache.
+    detections = _q_plate_detections(plate, session_filter)
     return engine.build(plate, detections, processing_session=session_filter), detections
 
 
@@ -1590,6 +1708,93 @@ def render_vehicle_search() -> None:
 # ══════════════════════════════════════════════════════════════════════════
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  LIVE PANELS — the parts that move on their own while a session runs
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Each of the four panels that changes by itself during a run is paired with
+# a fragment version of itself. st.experimental_fragment(run_every=...)
+# re-runs JUST that panel on a timer, so a live session repaints the camera
+# wall and the progress bars without re-executing the sidebar, the session
+# queries, all three tab bodies, the heatmap iframe and the trajectory view
+# along with them.
+#
+# This replaces a `time.sleep(LIVE_REFRESH_SECONDS); st.rerun()` that used
+# to sit at the end of main(). That re-ran the whole script every couple of
+# seconds to move a progress bar, and -- worse -- the sleep held the script
+# thread for the entire interval, so a click was not acted on until the nap
+# finished. That delay, not the rendering, is what made the page feel stuck.
+#
+# None of these takes a status argument. A fragment re-runs WITHOUT main(),
+# so it has to read the current status itself rather than close over the one
+# main() read when the page was last built in full.
+
+
+# Set by main() while a run is live, so that the header knows a stand-down
+# is owed when the run finishes and an idle page never asks for one.
+_LIVE_ARMED = "_live_panels_armed"
+
+
+def _panel_header() -> None:
+    manager = _manager()
+    running = manager.is_running()
+    render_header(manager.get_status())
+    # A fragment timer keeps firing for as long as the page is open, so
+    # something has to notice the run has ended and put main() back in
+    # charge. The header does it because it is the one panel always on
+    # screen, and only once -- disarming first, so a page left open idle
+    # does not re-run itself every couple of seconds forever.
+    if not running and st.session_state.get(_LIVE_ARMED):
+        st.session_state[_LIVE_ARMED] = False
+        st.rerun()
+
+
+def _panel_camera_wall() -> None:
+    render_camera_wall(_manager().get_status())
+
+
+def _panel_processing_status() -> None:
+    render_processing_status(_manager().get_status())
+
+
+def _panel_statistics(session_filter: Optional[str]) -> None:
+    render_statistics(_manager().get_status(), session_filter)
+
+
+# Each panel exists twice: once with a refresh timer, once without. Both
+# are built from the SAME function, and that is the entire point.
+#
+# Streamlit identifies a fragment by md5(module + qualname + container
+# path), and it only records that id when the fragment is actually called
+# during a FULL script run. A timer already ticking in the browser is then
+# resolved against those ids. So if a full run draws the page WITHOUT the
+# fragment -- which is exactly what happens the moment a session finishes
+# and the page goes back to its static form -- an in-flight timer arrives
+# for an id that no longer exists, and Streamlit kills the run with
+# "RuntimeError: Could not find fragment with id ...". That is what used to
+# greet anyone whose run ended, including a run that failed on startup.
+#
+# Because both variants are decorated from the same function, they hash to
+# the same id. The page can move between live and static as often as it
+# likes and a late timer always lands on something real.
+def _with_timer(panel):
+    return st.experimental_fragment(run_every=LIVE_REFRESH_SECONDS)(panel)
+
+
+def _without_timer(panel):
+    return st.experimental_fragment()(panel)
+
+
+_panel_header_auto = _with_timer(_panel_header)
+_panel_header_static = _without_timer(_panel_header)
+_panel_camera_wall_auto = _with_timer(_panel_camera_wall)
+_panel_camera_wall_static = _without_timer(_panel_camera_wall)
+_panel_processing_status_auto = _with_timer(_panel_processing_status)
+_panel_processing_status_static = _without_timer(_panel_processing_status)
+_panel_statistics_auto = _with_timer(_panel_statistics)
+_panel_statistics_static = _without_timer(_panel_statistics)
+
+
 def main() -> None:
     try:
         _bootstrap()
@@ -1602,24 +1807,32 @@ def main() -> None:
 
     manager = _manager()
     status = manager.get_status()
-    render_header(status)
+
+    # The auto-refresh checkbox lives in the sidebar, which is built further
+    # down, but the header is the first thing drawn and has to know whether
+    # to draw itself as a self-refreshing fragment. Its value is therefore
+    # read from session state; on the very first run, before the widget
+    # exists, that falls back to the checkbox's own default.
+    live = st.session_state.get("auto_refresh", True) and manager.is_running()
+
+    if live:
+        st.session_state[_LIVE_ARMED] = True
+    (_panel_header_auto if live else _panel_header_static)()
     render_blacklist_alert()
 
     # ── sidebar ───────────────────────────────────────────────────────────
     with st.sidebar:
         st.header("Controls")
-        auto_refresh = st.checkbox(
-            "Auto-refresh while processing", value=True,
-            help="Re-reads live status every couple of seconds during a run.",
+        st.checkbox(
+            "Auto-refresh while processing", value=True, key="auto_refresh",
+            help="Refreshes the live panels every couple of seconds during "
+                 "a run. Keyed so the header, which is drawn before this "
+                 "sidebar, can read it too.",
         )
         st.divider()
 
         st.subheader("Session scope")
-        try:
-            with database.get_session() as session:
-                sessions = database.get_processing_sessions(session, limit=20)
-        except Exception:
-            sessions = []
+        sessions = _q_processing_sessions()
         options = ["All sessions"] + [
             f"{s['processing_session']}  ({s['detections']} events)" for s in sessions
         ]
@@ -1676,6 +1889,9 @@ def main() -> None:
                             # header and camera wall must stop describing
                             # the run that was just deleted.
                             manager.forget_session(target)
+                            # Those rows are gone; nothing may keep serving
+                            # them from cache for the rest of the TTL.
+                            _clear_query_caches()
                             st.session_state.pop(confirm_key, None)
                             # A trajectory on screen may have just lost its
                             # underlying events.
@@ -1750,7 +1966,7 @@ def main() -> None:
         render_blacklist_panel()
 
         st.divider()
-        render_camera_wall(status)
+        (_panel_camera_wall_auto if live else _panel_camera_wall_static)()
 
         st.divider()
         plate = render_search_panel()
@@ -1770,10 +1986,10 @@ def main() -> None:
         render_camera_panel(status)
 
         st.divider()
-        render_processing_status(status)
+        (_panel_processing_status_auto if live else _panel_processing_status_static)()
 
         st.divider()
-        render_statistics(status, session_filter)
+        (_panel_statistics_auto if live else _panel_statistics_static)(session_filter)
 
     with tab_traj:
         plate = st.session_state.get("active_plate")
@@ -1790,12 +2006,10 @@ def main() -> None:
                 st.rerun()
             render_trajectory_view(plate, session_filter)
 
-    # Re-run the page while a session is in progress. Placed last so the
-    # whole UI is painted before the sleep, and gated on the manager still
-    # running so an idle dashboard costs nothing.
-    if auto_refresh and manager.is_running():
-        time.sleep(LIVE_REFRESH_SECONDS)
-        st.rerun()
+    # No refresh loop here any more. While a session runs, the four live
+    # panels above re-run themselves on their own timers (see _live_fragment)
+    # and this function is left alone, so the page stays responsive to
+    # clicks instead of sleeping between repaints.
 
 
 if __name__ == "__main__":

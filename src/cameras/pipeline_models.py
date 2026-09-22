@@ -92,11 +92,15 @@ class PipelineModels:
         plate_detector: Any,
         ocr_engine: Any,
         sr_enhancer: Any,
+        device: Any = None,
     ) -> None:
         self.vehicle_detector = vehicle_detector
         self.plate_detector = plate_detector
         self.ocr_engine = ocr_engine
         self.sr_enhancer = sr_enhancer
+        # The DeviceSpec every model in this bundle was built for. Recorded
+        # so a caller can report it, and so shared() can carry it across.
+        self.device = device
         self._closed = False
         # Held by every view handed out by shared(), so concurrent live
         # cameras enter the GPU one at a time.
@@ -139,9 +143,24 @@ class PipelineModels:
         from src.detection.vehicle_detector import VehicleDetector
         from src.enhancement.super_resolution import SuperResolutionEnhancer
         from src.ocr import create_ocr_engine
+        from src.runtime.device import device_from_config
 
         enhancement_cfg = config["enhancement"]
         ocr_cfg = config["ocr"]
+
+        # Resolve the device ONCE, here, before a single model is built.
+        #
+        # This ordering is load-bearing, not tidiness. ultralytics'
+        # select_device() sets CUDA_VISIBLE_DEVICES=-1 process-wide for
+        # device="cpu", and that cannot be undone. Because detection loads
+        # first, a CPU detector used to silently revoke the GPU from the
+        # TensorRT OCR engine constructed a few lines later, which then came
+        # up dead and read nothing for the rest of the session. Resolving up
+        # front means every model below is told the same answer, and
+        # create_ocr_engine() can refuse a CUDA backend on a CPU process
+        # instead of building one that fails quietly.
+        device = device_from_config(config)
+        report(f"Compute device: {device.describe()}")
 
         # Both detectors load their weights lazily on first detect(), so
         # constructing them costs nothing and the real work would otherwise
@@ -150,11 +169,11 @@ class PipelineModels:
         # is the documented warm-up path (it runs one dummy inference), so
         # calling it here moves the cost to where the UI is reporting it.
         report("Loading vehicle detector…")
-        vehicle_detector = VehicleDetector.from_config(config)
+        vehicle_detector = VehicleDetector.from_config(config, device)
         vehicle_detector._load_model()
 
         report("Loading plate detector…")
-        plate_detector = PlateDetector.from_config(config)
+        plate_detector = PlateDetector.from_config(config, device)
         plate_detector._load_model()
 
         report("Loading super-resolution…")
@@ -167,10 +186,10 @@ class PipelineModels:
         # no separate warm-up call.
         backend = str(ocr_cfg.get("backend", "paddleocr"))
         report(f"Loading OCR engine ({backend})…")
-        ocr_engine = create_ocr_engine(backend, config)
+        ocr_engine = create_ocr_engine(backend, config, device)
 
         report("Models ready")
-        return cls(vehicle_detector, plate_detector, ocr_engine, sr_enhancer)
+        return cls(vehicle_detector, plate_detector, ocr_engine, sr_enhancer, device)
 
     def shared(self) -> "PipelineModels":
         """A view of these models that is safe to use from another thread.
@@ -193,6 +212,7 @@ class PipelineModels:
             _Serialized(self.plate_detector, self._lock),
             _Serialized(self.ocr_engine, self._lock),
             _Serialized(self.sr_enhancer, self._lock),
+            self.device,
         )
         view._closed = True          # borrowed, never released by the borrower
         return view

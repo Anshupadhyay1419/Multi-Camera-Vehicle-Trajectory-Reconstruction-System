@@ -1004,3 +1004,114 @@ class TestLegacyDashboard:
         at.run()
         assert not at.exception, at.exception[0].value
         assert at.title or at.subheader, "the legacy page rendered nothing"
+
+
+class TestLiveSession:
+    """The page as it is drawn WHILE a session is running.
+
+    Every other test here renders an idle dashboard, which is the static
+    form of the page. While a session runs it is built differently: the
+    header, camera wall, processing status and statistics are each drawn as
+    a self-refreshing fragment, so that a live run repaints those four
+    panels without re-executing the sidebar, the queries, the heatmap and
+    the trajectory view along with them. Nothing else reaches that branch,
+    so without these a fragment could stop rendering and the suite would
+    still be green.
+    """
+
+    @pytest.fixture()
+    def running(self, monkeypatch):
+        """Make the camera manager report a session in progress."""
+        from src.cameras import manager as manager_module
+
+        monkeypatch.setattr(manager_module.CameraManager, "is_running", lambda self: True)
+
+    def test_a_live_page_renders(self, app, running):
+        at = app()
+        _assert_clean(at, "live render")
+
+    def test_a_live_page_keeps_every_panel(self, app, running):
+        at = app()
+        rendered = " ".join(
+            [str(m.value) for m in at.get("markdown")]
+            + [str(s.value) for s in at.get("subheader")]
+        )
+        for section in ("Camera feeds", "Live Processing Status", "Statistics"):
+            assert section in rendered, f"{section} is missing while a session runs"
+
+    def test_turning_auto_refresh_off_still_renders(self, app, running):
+        """Unchecking auto-refresh drops back to the static panels."""
+        at = app(auto_refresh=False)
+        _assert_clean(at, "live render with auto-refresh off")
+        rendered = " ".join(str(s.value) for s in at.get("subheader"))
+        assert "Live Processing Status" in rendered
+
+    def test_repeated_live_reruns_do_not_multiply_queries(self, app, running, monkeypatch):
+        """A refresh is not a fresh set of queries.
+
+        The page used to re-run in full every couple of seconds, each run
+        re-issuing every query on all three tabs. This pins the collapse of
+        that down to roughly one query per refresh.
+        """
+        from src.database import db as database_module
+
+        at = app()
+        calls = {"n": 0}
+        real = database_module.get_session
+
+        def counted(*args, **kwargs):
+            calls["n"] += 1
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(database_module, "get_session", counted)
+        for _ in range(5):
+            at.run()
+        _assert_clean(at, "after five live reruns")
+        assert calls["n"] <= 10, f"five reruns issued {calls['n']} queries"
+
+
+class TestLivePanelFragmentIds:
+    """The live and static forms of a panel must be the SAME fragment.
+
+    Streamlit identifies a fragment by md5(module + qualname + container
+    path) and only records that id during a full script run in which the
+    fragment is actually called. A timer already ticking in the browser is
+    resolved against those ids, so drawing the page without a fragment that
+    still has a timer in flight ends the run with "Could not find fragment
+    with id ...". A finishing session does exactly that transition.
+
+    Pairing each panel with a timerless twin built from the same function
+    keeps the id identical across the switch. These assert that pairing,
+    because the failure it prevents only shows up on a real clock and never
+    in AppTest.
+    """
+
+    PAIRS = [
+        ("_panel_header_auto", "_panel_header_static"),
+        ("_panel_camera_wall_auto", "_panel_camera_wall_static"),
+        ("_panel_processing_status_auto", "_panel_processing_status_static"),
+        ("_panel_statistics_auto", "_panel_statistics_static"),
+    ]
+
+    @pytest.fixture(scope="class")
+    def page(self):
+        import importlib
+
+        return importlib.import_module("src.dashboard.trajectory_app")
+
+    @pytest.mark.parametrize("auto_name,static_name", PAIRS)
+    def test_both_forms_share_one_identity(self, page, auto_name, static_name):
+        auto = getattr(page, auto_name)
+        static = getattr(page, static_name)
+        assert (auto.__module__, auto.__qualname__) == (static.__module__, static.__qualname__), (
+            f"{auto_name} and {static_name} would hash to different fragment ids, "
+            "so a timer outliving the switch would crash the page"
+        )
+
+    def test_every_panel_has_both_forms(self, page):
+        for auto_name, static_name in self.PAIRS:
+            assert hasattr(page, auto_name), f"{auto_name} is missing"
+            assert hasattr(page, static_name), (
+                f"{static_name} is missing — the page would render this panel "
+                "without registering its fragment id"
+            )
