@@ -714,7 +714,9 @@ def render_camera_panel(status: dict) -> None:
             usable, source_text = _describe_source(camera)
             if usable:
                 ready += 1
-                if camera.source_type.value == "rtsp":
+                # "Runs until STOP", not "is RTSP": with loop_recorded on,
+                # uploaded clips run continuously too.
+                if manager.runs_continuously(camera):
                     live_cameras += 1
 
             with column:
@@ -757,17 +759,23 @@ def render_camera_panel(status: dict) -> None:
     st.divider()
 
     total = len(manager.registry.enabled)
-    st.caption(
-        f"**{ready} of {total}** camera(s) have a source. "
-        "Uploaded videos are processed **one at a time**, in order; "
-        "RTSP streams all run **together**."
-    )
+    if manager.loops_recorded:
+        schedule = (
+            "Every camera runs **together** -- uploaded videos loop like live "
+            "feeds -- and nothing stops until you press **STOP PROCESSING**."
+        )
+    else:
+        schedule = (
+            "Uploaded videos are processed **one at a time**, in order; "
+            "RTSP streams all run **together**."
+        )
+    st.caption(f"**{ready} of {total}** camera(s) have a source. {schedule}")
 
     if live_cameras:
         # A live stream carries what is happening now, so it is not queued
         # behind anything and it is not cut short -- it runs until STOP.
         st.info(
-            f"{live_cameras} live stream(s) will start together and keep "
+            f"{live_cameras} camera(s) will start together and keep "
             "running until you press STOP.",
         )
 
@@ -1136,6 +1144,11 @@ def render_camera_wall(status: dict) -> None:
                 state = progress["state"] if progress else CameraState.PENDING.value
                 color, label = _STATE_STYLE.get(state, ("#6b7280", state))
                 is_live = state == CameraState.RUNNING.value
+                # With no session running, "Queued" read as stuck. It is not
+                # queued for anything -- it is waiting for START.
+                idle = not manager.is_running() and state == CameraState.PENDING.value
+                if idle:
+                    label = "Ready"
 
                 st.markdown(
                     f"**{camera.order}. {camera.camera_name}** "
@@ -1162,6 +1175,8 @@ def render_camera_wall(status: dict) -> None:
                     )
                     if not has_frame:
                         message, css = _panel_status(camera, state, is_live, progress)
+                        if idle:
+                            message, css = "Press START PROCESSING to begin", ""
                         st.markdown(
                             f'<div style="font-size:.8rem;opacity:.8;{css}">'
                             f"{html_escape(message)}</div>",
@@ -1173,6 +1188,8 @@ def render_camera_wall(status: dict) -> None:
                     st.image(frame, **{_IMAGE_FIT_KWARG: True})
                 else:
                     message, css = _panel_status(camera, state, is_live, progress)
+                    if idle:
+                        message, css = "Press START PROCESSING to begin", ""
                     st.markdown(
                         '<div style="min-height:150px;border:1px dashed rgba(128,128,128,.4);'
                         'border-radius:8px;display:flex;align-items:center;'
@@ -1208,11 +1225,18 @@ def render_processing_status(status: dict) -> None:
     state = status.get("state", SessionState.IDLE.value)
 
     if not cameras:
+        manager = _manager()
+        schedule = (
+            "Every camera runs together, uploaded videos looping like live "
+            "feeds, until you press STOP."
+            if manager.loops_recorded
+            else "Uploaded videos are processed one at a time, in order; RTSP "
+            "streams all run together until you stop them."
+        )
         st.info(
             "No processing session yet. Give each camera a source in the "
             "**Cameras** section above, then press **START PROCESSING**. "
-            "Uploaded videos are processed one at a time, in order; RTSP "
-            "streams all run together until you stop them."
+            + schedule
         )
         return
 
@@ -1795,6 +1819,21 @@ _panel_statistics_auto = _with_timer(_panel_statistics)
 _panel_statistics_static = _without_timer(_panel_statistics)
 
 
+def _autostart_once() -> str:
+    """Start processing the first time this dashboard process renders a page.
+
+    The once-per-process guard lives in cameras.manager (see autostart_once
+    there for why it cannot be a Streamlit cache). An environment variable on
+    the dashboard container turns it on, not a config key: the camera config
+    is also read by the API, CLI tools and the tests, and a test that rendered
+    this page with the real config used to start a real GPU session.
+    """
+    from src.cameras.manager import autostart_once
+
+    enabled = os.environ.get("ALPR_AUTOSTART", "").strip().lower() in {"1", "true", "yes"}
+    return autostart_once(_manager(), enabled)
+
+
 def main() -> None:
     try:
         _bootstrap()
@@ -1806,6 +1845,7 @@ def main() -> None:
         st.stop()
 
     manager = _manager()
+    _autostart_once()
     status = manager.get_status()
 
     # The auto-refresh checkbox lives in the sidebar, which is built further

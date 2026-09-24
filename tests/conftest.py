@@ -4,6 +4,15 @@ Shared pytest fixtures and Hypothesis configuration for the ALPR test suite.
 
 from __future__ import annotations
 
+import os as _os
+
+# The dashboard starts processing by itself when ALPR_AUTOSTART is set (the
+# dashboard container sets it). A test that renders the dashboard must never
+# do that: it would start the real GPU pipeline in the middle of the suite.
+# Forced off here for every test; the autostart tests turn it on explicitly,
+# per test, with monkeypatch.
+_os.environ["ALPR_AUTOSTART"] = "0"
+
 import numpy as np
 import pytest
 from hypothesis import HealthCheck, settings

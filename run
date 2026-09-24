@@ -274,6 +274,9 @@ cmd_up() {
         require_venv up; native_env
         cmd_down >/dev/null 2>&1 || true
         step "Starting the dashboard and the API in ./alpr"
+        # Same as the dashboard container: processing starts when the page is
+        # first opened. Set on the dashboard only -- never on the API.
+        ALPR_AUTOSTART="${ALPR_AUTOSTART:-1}" \
         nohup "$VENV_PY" -m streamlit run src/dashboard/trajectory_app.py \
             --server.port="$DASH_PORT" --server.address=0.0.0.0 --server.headless=true \
             >> logs/dashboard.out 2>&1 &
@@ -331,7 +334,10 @@ run_in_env() {
         exec "$VENV_PY" "$@"
     fi
     docker_prepare
-    exec docker compose run --rm --no-deps alpr python3.12 "$@"
+    # A one-off copy of the dashboard service inherits ALPR_AUTOSTART=1 from
+    # docker-compose.yml. Tests, video runs and shells must never start a
+    # background session of their own, so it is switched off here.
+    exec docker compose run --rm --no-deps -e ALPR_AUTOSTART=0 alpr python3.12 "$@"
 }
 
 cmd_video() {
@@ -372,7 +378,7 @@ cmd_shell() {
         exec bash --rcfile <(echo "PS1='(alpr) \w\$ '; export PYTHONPATH=$PROJECT_DIR")
     fi
     docker_prepare
-    exec docker compose run --rm --no-deps alpr bash
+    exec docker compose run --rm --no-deps -e ALPR_AUTOSTART=0 alpr bash
 }
 
 cmd_build() {

@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -72,6 +74,46 @@ def _resolve_db_url() -> str | None:
     return (_config.get("database") or {}).get("path") or None
 
 
+def _init_sentinel_registry() -> None:
+    """Put the Sentinel camera registry in the database this API already uses.
+
+    The registry keeps its own SQLAlchemy metadata -- it has its own tables
+    and its own Alembic history -- but it must not open its own DATABASE.
+    Two database files where one was intended, only one of which anybody
+    backs up, is how a camera registry quietly goes missing.
+
+    So rather than re-deriving which database the deployment uses (that
+    logic is _resolve_db_url() above, and duplicating it is how the two
+    drift apart), this reads the URL off the engine ALPR just opened and
+    hands the same one to the registry. SENTINEL_DATABASE_URL still wins if
+    set, which is how a production deployment points the registry at
+    PostgreSQL while the ALPR pipeline stays on its local file.
+    """
+    from sentinel_system.core.database import Base as _RegistryBase
+    from sentinel_system.core.database import configure as _configure_registry
+
+    # Import for the side effect: a model that is not imported is absent
+    # from Base.metadata, and create_all() below would silently skip its
+    # table. The router imports these too, but relying on import order for
+    # whether a table exists is not a thing to rely on.
+    from sentinel_system.registry import models as _registry_models  # noqa: F401
+    from sentinel_system.verification import models as _verify_models  # noqa: F401
+    from sentinel_system.bulk_import import models as _import_models  # noqa: F401
+
+    url = os.getenv("SENTINEL_DATABASE_URL")
+    if not url:
+        # hide_password=False: str(url) would render '***' into the DSN and
+        # the registry would then fail to authenticate against it.
+        url = database.get_engine().url.render_as_string(hide_password=False)
+
+    engine = _configure_registry(url)
+    # Idempotent, and matches what init_db() does for the ALPR tables.
+    # PostgreSQL deployments should run `alembic upgrade head` instead; this
+    # no-ops once the table exists either way.
+    _RegistryBase.metadata.create_all(engine)
+    _logger.info("Sentinel camera registry ready on %s", engine.url)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize resources on startup, clean up on shutdown."""
@@ -82,6 +124,13 @@ async def lifespan(app: FastAPI):
         )
     except Exception as exc:
         _logger.error("Failed to initialize database: %s", exc)
+
+    try:
+        _init_sentinel_registry()
+    except Exception as exc:
+        # The ALPR API predates the registry and must keep serving without
+        # it. A failure here costs /api/v1/cameras, not /entry or /logs.
+        _logger.error("Sentinel camera registry unavailable: %s", exc)
     yield
     # shutdown — nothing to release for SQLite; connection pool closes itself
 
@@ -418,6 +467,38 @@ async def get_stream():
 from src.api.trajectory_routes import router as trajectory_router  # noqa: E402
 
 app.include_router(trajectory_router)
+
+# Sentinel camera registry, under /api/v1. Same reason as above: it has to
+# be registered before the "/" mount, which matches everything.
+from src.api.sentinel_routes import router as sentinel_router  # noqa: E402
+
+app.include_router(sentinel_router)
+
+
+@app.exception_handler(RequestValidationError)
+async def _log_registry_validation_failures(request, exc: RequestValidationError):
+    """Log rejected registry payloads, and change nothing else.
+
+    The brief asks for validation failures to be logged. A body that fails
+    Pydantic validation is rejected by FastAPI before any route function
+    runs, so the route cannot log it -- only a handler can see it.
+
+    The response is byte-for-byte what FastAPI would have returned: this
+    delegates to the stock handler rather than composing its own body.
+    Exception handlers are application-wide, so anything else would change
+    what the existing ALPR endpoints return, and it logs only for the
+    registry prefix so those endpoints do not gain log volume either.
+    """
+    if request.url.path.startswith("/api/v1/cameras"):
+        fields = [
+            ".".join(str(part) for part in error.get("loc", ())[1:])
+            for error in exc.errors()
+        ]
+        _logger.warning(
+            "Camera payload rejected at %s: invalid fields %s",
+            request.url.path, fields or ["<body>"],
+        )
+    return await request_validation_exception_handler(request, exc)
 
 
 # Serves the dashboard's HTML/CSS/JS. Mounted last and at the root path so

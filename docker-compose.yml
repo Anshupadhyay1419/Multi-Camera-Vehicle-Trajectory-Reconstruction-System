@@ -46,6 +46,10 @@ x-alpr: &alpr
     - ./src:/app/src
     - ./scripts:/app/scripts
     - ./main.py:/app/main.py
+    # Sentinel platform (Gujarat Police). A separate top-level package from
+    # src/: it shares this checkout and this interpreter, but none of the
+    # ALPR pipeline's models or imports.
+    - ./sentinel_system:/app/sentinel_system
 
     # Test fixtures .dockerignore deliberately drops to keep the image small
     # (*.mp4 is 38 MB, training/ is not needed to run). Without them nine
@@ -66,6 +70,13 @@ services:
     <<: *alpr
     build: .
     container_name: alpr-dashboard
+    environment:
+      # Open the dashboard and processing is already running -- the live
+      # feeds play without pressing START. Once per container start; STOP
+      # PROCESSING stops it until START is pressed. Set to 0 to disable.
+      # Deliberately on this service only: the API must never start a
+      # session by itself, or two pipelines would fight over the GPU.
+      - ALPR_AUTOSTART=1
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8502/_stcore/health"]
       interval: 30s

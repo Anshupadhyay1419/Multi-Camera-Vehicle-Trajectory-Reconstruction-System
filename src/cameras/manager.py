@@ -40,6 +40,7 @@ the process running it.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 import uuid
@@ -84,15 +85,22 @@ class ProgressReporter:
         publish: Callable[[], None],
         stop_event: threading.Event,
         log: Callable[[str], None],
+        unbounded: bool = False,
     ) -> None:
         self._progress = progress
         self._publish = publish
         self._stop_event = stop_event
         self._log = log
         self._plates: set[str] = set()
+        # A looping clip has no end. The pipeline still reports the clip's
+        # own length, which made the wall read "frame 11,810/320" and the
+        # session "100%" while it was still running. Unbounded means "no
+        # total", the same as a live stream.
+        self._unbounded = unbounded
 
     def on_start(self, total_frames: int = 0) -> None:
-        self._progress.total_frames = max(0, int(total_frames or 0))
+        total = 0 if self._unbounded else total_frames
+        self._progress.total_frames = max(0, int(total or 0))
         self._publish()
 
     def on_frame(
@@ -189,6 +197,14 @@ class CameraManager:
         )
         self._continue_on_error = bool(processing.get("continue_on_error", True))
         self._upload_dir = Path(processing.get("upload_dir", "data/uploads"))
+        # Uploaded clips loop and run alongside the live streams until STOP,
+        # instead of playing once each in turn (camera_config.yaml).
+        self._loop_recorded = bool(processing.get("loop_recorded", False))
+        # Pause between attempts to reach a live stream that is down. Zero or
+        # less restores the original behaviour: an unreachable stream fails
+        # its camera at once instead of waiting for STOP.
+        self._live_retry_seconds = float(processing.get("live_retry_seconds", 5))
+        self._reattach_uploads()
 
         # Loaded on the first session and KEPT for the life of this
         # process. Two reasons, both learned the hard way:
@@ -236,12 +252,79 @@ class CameraManager:
         """
         return camera.source_type is SourceType.RTSP
 
+    #: Extensions save_upload() writes and UploadSource can decode.
+    _VIDEO_SUFFIXES = (".mp4", ".avi", ".mov", ".mkv", ".m4v")
+
+    def _reattach_uploads(self) -> None:
+        """Give each source-less camera back the clip it was last given.
+
+        The dashboard's camera list (cameras_runtime.yaml) records a camera's
+        name, place and order -- not its source -- so after a restart every
+        camera came back empty, and START skipped all of them, even though
+        each uploaded clip was still on disk under the camera's own name
+        (save_upload() names it `<camera_id>.<ext>`). The operator had to
+        upload every video again after each restart.
+
+        Only fills cameras with NO source: a camera pointed at a stream, or
+        at a file named in camera_config.yaml, is left exactly as configured.
+        Never raises -- a missing or unreadable upload directory just means
+        there is nothing to reattach.
+        """
+        import dataclasses
+
+        try:
+            if not self._upload_dir.is_dir():
+                return
+            for camera in list(self._registry.all):
+                if self.has_source_configured(camera):
+                    continue
+                matches = sorted(
+                    path for path in self._upload_dir.glob(f"{camera.camera_id}.*")
+                    if path.suffix.lower() in self._VIDEO_SUFFIXES and path.is_file()
+                )
+                if not matches:
+                    continue
+                self._registry.replace(dataclasses.replace(
+                    camera,
+                    video_path=str(matches[0]),
+                    rtsp_url=None,
+                    source_type=SourceType.UPLOAD,
+                ))
+                _logger.info(
+                    "Camera %s (%s): reattached its upload %s",
+                    camera.camera_id, camera.camera_name, matches[0].name,
+                )
+        except OSError as exc:
+            _logger.warning("Could not reattach uploaded videos: %s", exc)
+
+    def ready_camera_count(self) -> int:
+        """Enabled cameras that have a video or stream to run."""
+        return sum(1 for c in self._registry.enabled if self.has_source_configured(c))
+
+    @property
+    def loops_recorded(self) -> bool:
+        """Whether uploaded clips loop and run alongside live streams until STOP."""
+        return self._loop_recorded
+
+    def runs_continuously(self, camera: CameraConfig) -> bool:
+        """True if this camera runs until STOP rather than to the end of a clip.
+
+        Every live stream does. With `loop_recorded` on, so does every
+        uploaded clip -- it rewinds at the end, and joins the live streams so
+        that all the cameras play at once instead of one clip after another.
+        """
+        return self.is_live_camera(camera) or self._loop_recorded
+
     def split_queue(
         self, queue: Sequence[CameraConfig]
     ) -> tuple[list[CameraConfig], list[CameraConfig]]:
-        """Split a queue into (recorded, live), each keeping queue order."""
-        recorded = [c for c in queue if not self.is_live_camera(c)]
-        live = [c for c in queue if self.is_live_camera(c)]
+        """Split a queue into (one-at-a-time, continuous), keeping queue order.
+
+        The second group is what the name "live" has always meant here: the
+        cameras that run together until STOP.
+        """
+        recorded = [c for c in queue if not self.runs_continuously(c)]
+        live = [c for c in queue if self.runs_continuously(c)]
         return recorded, live
 
     def is_running(self) -> bool:
@@ -1004,60 +1087,105 @@ class CameraManager:
             # where "you never uploaded a video for camera 3" gets caught,
             # with a message naming the camera.
             source = create_video_source(camera, self._config)
+            # Permanent problems -- no file uploaded, a malformed URL -- fail
+            # here and are never retried: no amount of waiting fixes them.
             source.validate()
 
-            # An unreachable live camera used to freeze the queue for about
-            # three minutes: OpenCV blocks ~30s per open attempt and
-            # FrameCapture retries five times, while the dashboard showed
-            # nothing but "Connecting". A TCP check answers the same question
-            # in seconds and names the actual problem.
-            if source.is_live:
-                from src.cameras.stream_probe import mask_credentials, probe_stream
-
-                self._append_log(
-                    f"Checking {camera.camera_name} stream "
-                    f"{mask_credentials(source.uri)}…"
-                )
-                self._publish()
-                reachable = probe_stream(source.uri)
-                if not reachable.ok:
-                    raise VideoSourceError(reachable.message)
-            progress.total_frames = source.total_frames()
+            # A clip that should run until STOP gets a config copy that tells
+            # FrameCapture to rewind at the end. A copy, so the shared config
+            # (and every other camera's run) is untouched.
+            looping = continuous and not source.is_live
+            run_config = self._config
+            if looping:
+                run_config = {
+                    **self._config,
+                    "video": {**self._config.get("video", {}), "loop": True},
+                }
 
             reporter = ProgressReporter(
                 progress=progress,
                 publish=self._publish,
                 stop_event=self._stop_event,
                 log=self._append_log,
+                unbounded=looping,
             )
 
             # Nothing is ever cut short by a clock: a recorded file runs to
-            # its natural end, and a live stream runs until STOP. The queue
-            # no longer has to take turns on a live camera, so the dwell time
-            # that used to bound one has nothing left to protect.
+            # its natural end, and a live stream (or a looping clip) runs
+            # until STOP.
             duration_limit = None
-            if source.is_live:
+            if source.is_live or looping:
+                kind = "live stream" if source.is_live else "looping clip"
                 self._append_log(
-                    f"{camera.camera_name} is a live stream — running "
+                    f"{camera.camera_name} is a {kind} — running "
                     "continuously until STOP."
                 )
 
-            summary = self._resolve_runner()(
-                config=self._config,
-                camera_meta=camera.event_metadata(),
-                session_context={
-                    "processing_session": session_id,
-                    # The camera's queue position as it actually applied for
-                    # this run, frozen onto every event -- re-ordering
-                    # camera_config.yaml later cannot rewrite this history.
-                    "trajectory_order": camera.order,
-                    "video_source": source.uri,
-                },
-                progress=reporter,
-                source_override=source.uri,
-                max_duration_seconds=duration_limit,
-                models=models,
-            )
+            summary = None
+            stopped_while_waiting = False
+            while True:
+                try:
+                    # An unreachable live camera used to freeze the queue for
+                    # about three minutes: OpenCV blocks ~30s per open attempt
+                    # and FrameCapture retries five times. A TCP check answers
+                    # the same question in seconds and names the problem.
+                    if source.is_live:
+                        from src.cameras.stream_probe import mask_credentials, probe_stream
+
+                        self._append_log(
+                            f"Checking {camera.camera_name} stream "
+                            f"{mask_credentials(source.uri)}…"
+                        )
+                        self._publish()
+                        reachable = probe_stream(source.uri)
+                        if not reachable.ok:
+                            raise VideoSourceError(reachable.message)
+                    # A looping clip has no end, so no meaningful total: 0 is
+                    # "indeterminate", the same as a live stream, and keeps
+                    # the progress bar from climbing past 100%.
+                    progress.total_frames = 0 if looping else source.total_frames()
+
+                    summary = self._resolve_runner()(
+                        config=run_config,
+                        camera_meta=camera.event_metadata(),
+                        session_context={
+                            "processing_session": session_id,
+                            # The camera's queue position as it actually applied
+                            # for this run, frozen onto every event --
+                            # re-ordering camera_config.yaml later cannot
+                            # rewrite this history.
+                            "trajectory_order": camera.order,
+                            "video_source": source.uri,
+                        },
+                        progress=reporter,
+                        source_override=source.uri,
+                        max_duration_seconds=duration_limit,
+                        models=models,
+                    )
+                    break
+                except Exception as exc:
+                    # Only a LIVE stream that could not be reached is retried.
+                    # Anything else -- a broken file, a model error -- is a
+                    # real failure and is reported as one.
+                    if not (
+                        source.is_live
+                        and continuous
+                        and self._live_retry_seconds > 0
+                        and self._is_unreachable(exc)
+                    ):
+                        raise
+                    if self._stop_event.is_set():
+                        stopped_while_waiting = True
+                        break
+                    self._append_log(
+                        f"{camera.camera_name}: stream not available ({exc}). "
+                        f"Retrying every {self._live_retry_seconds:.0f}s until STOP."
+                    )
+                    self._publish()
+                    # Waits on the stop event, so STOP ends the wait at once.
+                    if self._stop_event.wait(self._live_retry_seconds):
+                        stopped_while_waiting = True
+                        break
 
             if isinstance(summary, dict):
                 progress.frames_processed = summary.get(
@@ -1073,7 +1201,7 @@ class CameraManager:
             # being stopped IS how it finishes, so it counts as completed.
             progress.state = (
                 CameraState.SKIPPED
-                if self._stop_event.is_set() and not continuous
+                if (self._stop_event.is_set() and not continuous) or stopped_while_waiting
                 else CameraState.COMPLETED
             )
             progress.finished_at = time.time()
@@ -1093,6 +1221,24 @@ class CameraManager:
             return self._fail_camera(
                 camera, position, progress, f"{type(exc).__name__}: {exc}"
             )
+
+    @staticmethod
+    def _is_unreachable(exc: Exception) -> bool:
+        """Whether a failure means "the stream is not reachable right now".
+
+        VideoSourceError inside the retry loop only ever comes from the
+        reachability probe (validate() runs before the loop). The pipeline's
+        own VideoSourceUnavailable -- raised when OpenCV exhausts its open
+        attempts -- is matched by looking the class up in sys.modules rather
+        than importing run_pipeline here: by the time it can have been raised,
+        the module is already loaded, and an import would drag the whole
+        pipeline into anything that merely constructs a CameraManager.
+        """
+        if isinstance(exc, VideoSourceError):
+            return True
+        module = sys.modules.get("scripts.run_pipeline")
+        unavailable = getattr(module, "VideoSourceUnavailable", None)
+        return unavailable is not None and isinstance(exc, unavailable)
 
     def _fail_camera(
         self,
@@ -1278,3 +1424,49 @@ def reset_camera_manager() -> None:
     global _manager
     with _manager_lock:
         _manager = None
+
+
+# ── autostart: once per process ───────────────────────────────────────────
+#
+# Module state, not the manager's and not a Streamlit cache, because it has to
+# outlive both. The dashboard re-executes its whole script on every click;
+# "Reload camera config" replaces the manager; and st.cache_resource is
+# cleared by more than one thing (and does not cache at all outside a running
+# Streamlit server). Anchor the flag to any of those and pressing STOP could be
+# followed, a rerun later, by processing starting itself again -- which would
+# make STOP meaningless. A module global lives exactly as long as the process.
+
+_autostart_lock = threading.Lock()
+_autostart_attempted = False
+
+
+def autostart_once(manager: CameraManager, enabled: bool) -> str:
+    """Start a session the first time this is called in the process.
+
+    Returns what happened, for logging. Every later call is a no-op, so a
+    session the operator stopped stays stopped.
+    """
+    global _autostart_attempted
+    if not enabled:
+        return "disabled"
+    with _autostart_lock:
+        if _autostart_attempted:
+            return "already attempted in this process"
+        _autostart_attempted = True
+    if manager.is_running():
+        return "already running"
+    if manager.ready_camera_count() == 0:
+        return "no camera has a source"
+    try:
+        manager.start()
+    except RuntimeError as exc:
+        return f"not started: {exc}"
+    _logger.info("Autostart: processing started when the dashboard was first opened")
+    return "started"
+
+
+def reset_autostart() -> None:
+    """Forget that autostart ran. For tests only."""
+    global _autostart_attempted
+    with _autostart_lock:
+        _autostart_attempted = False

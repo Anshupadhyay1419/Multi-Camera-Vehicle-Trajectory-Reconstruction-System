@@ -57,6 +57,7 @@ class FrameCapture:
         max_retries: int = 5,
         stall_timeout: float = 10.0,
         realtime_playback: bool = True,
+        loop: bool = False,
     ) -> None:
         self.source = source
         self.frame_skip = max(1, frame_skip)
@@ -65,6 +66,13 @@ class FrameCapture:
         self.is_live = self._is_live_source(source)
         # Recorded files only. A live camera is already paced by the camera.
         self.realtime_playback = realtime_playback and not self.is_live
+        # Recorded files only: rewind at the end instead of stopping, so an
+        # uploaded clip behaves like a feed that runs until STOP.
+        self.loop = loop and not self.is_live
+        self.loops_completed: int = 0
+        # Seconds of footage in every completed loop, added to the in-file
+        # position so stream time keeps rising across the rewind.
+        self._loop_offset: float = 0.0
 
         self._cap: Optional[cv2.VideoCapture] = None
         self._frame_count: int = 0
@@ -101,6 +109,7 @@ class FrameCapture:
             max_retries=int(video_cfg.get("max_retries", 5)),
             stall_timeout=float(video_cfg.get("stall_timeout", 10.0)),
             realtime_playback=bool(video_cfg.get("realtime_playback", True)),
+            loop=bool(video_cfg.get("loop", False)),
         )
 
     def open(self) -> bool:
@@ -194,9 +203,10 @@ class FrameCapture:
             return time.time()
         position_ms = self._cap.get(cv2.CAP_PROP_POS_MSEC)
         if position_ms and position_ms > 0:
-            return float(position_ms) / 1000.0
+            return self._loop_offset + float(position_ms) / 1000.0
         # Backends that don't report position still need a monotonic video
-        # clock; derive one from the decoded frame count.
+        # clock; derive one from the decoded frame count. That count is never
+        # reset by a loop, so it needs no offset.
         fps = self._cap.get(cv2.CAP_PROP_FPS)
         if not fps or fps <= 0:
             fps = 30.0
@@ -253,7 +263,31 @@ class FrameCapture:
         for _ in range(self.frame_skip):
             ret, frame = self._cap.read()
             if not ret:
-                return False, None
+                if not self.loop:
+                    return False, None
+                # End of the clip in loop mode: rewind and carry on.
+                #
+                # stream_time_seconds() reads the position INSIDE the file,
+                # which drops back to zero on the rewind -- so the length of
+                # the clip is banked in _loop_offset first. Without it, the
+                # duplicate-suppression window (measured in stream time)
+                # would see the clock run backwards every loop. _frame_count
+                # is not reset either, which keeps real-time pacing smooth
+                # across the seam.
+                fps = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
+                frames = self._cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+                if frames > 0:
+                    self._loop_offset += frames / fps
+                else:
+                    position = self._cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0
+                    self._loop_offset += position / 1000.0 + 1.0 / fps
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                self.loops_completed += 1
+                ret, frame = self._cap.read()
+                if not ret:
+                    # Even the first frame will not read: an empty or broken
+                    # file. Stop rather than rewind-and-fail forever.
+                    return False, None
 
         self._frame_count += 1
         self._pace_to_realtime()

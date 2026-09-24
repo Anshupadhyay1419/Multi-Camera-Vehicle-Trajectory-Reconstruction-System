@@ -98,6 +98,26 @@ processing:
   # sampled before a sequential queue moved on. Live cameras now run together
   # and continuously, so nothing has to take turns and the setting is gone --
   # a stream ends when the session is stopped, not on a clock.
+  #
+  # Treat uploaded videos as live feeds: every camera runs at the same time
+  # and each clip starts again from the beginning when it ends, until STOP
+  # PROCESSING is pressed. Without it, uploaded clips play once, one after
+  # another, and the session ends by itself when the last one finishes --
+  # which is what a survey of recorded footage wants, and what a live-feed
+  # demo does not. Note a looping clip re-detects the same vehicles each
+  # time round, so their plates are stored again once the duplicate window
+  # has passed.
+  loop_recorded: true
+  # How long to wait between attempts when a live stream cannot be reached
+  # -- at START, or after it drops. It keeps trying until STOP rather than
+  # failing the camera, so a feed that is briefly down when you press START
+  # simply appears once it comes back.
+  live_retry_seconds: 5
+  # Autostart (processing begins when the dashboard is first opened) is NOT
+  # set here: it is the ALPR_AUTOSTART environment variable on the dashboard
+  # container in docker-compose.yml. This file is shared by the dashboard,
+  # the REST API, CLI tools and the tests, and none of those may start a
+  # GPU session just because they read the camera list.
 
 trajectory:
   # How detections are ordered into a path.

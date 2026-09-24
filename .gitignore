@@ -59,3 +59,6 @@ Thumbs.db
 
 # Cameras added or removed from the dashboard (runtime state, per device).
 config/cameras_runtime.yaml
+
+# Sentinel portal credentials (the .example beside it is the committed template)
+config/sentinel_portal.env

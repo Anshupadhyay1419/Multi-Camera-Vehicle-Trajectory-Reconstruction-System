@@ -255,6 +255,10 @@ class TestFailureIsolation:
         closed = socket.socket(); closed.bind(("127.0.0.1", 0))
         port = closed.getsockname()[1]; closed.close()
 
+        # The fail-fast contract this test was written for is now opt-in:
+        # by default a dead live stream waits for STOP instead (see
+        # TestLiveStreamRunsUntilStop). live_retry_seconds <= 0 restores it.
+        registry._settings["processing"] = {"live_retry_seconds": 0}
         runner = RecordingRunner()
         manager = CameraManager({"video": {}}, registry, runner, store)
         manager.set_rtsp_url("CAM001", f"rtsp://admin:pw123@127.0.0.1:{port}/11")
@@ -1107,3 +1111,246 @@ class TestSingleton:
             assert first is second
         finally:
             reset_camera_manager()
+
+
+class UntilStopRunner:
+    """Fake pipeline that behaves like a live feed: runs until STOP."""
+
+    def __init__(self):
+        self.started: list[str] = []
+        self.loop_flags: dict[str, object] = {}
+        self.concurrent_peak = 0
+        self._active = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, config, camera_meta, session_context, progress,
+                 source_override, max_duration_seconds=None, models=None):
+        camera_id = camera_meta["camera_id"]
+        with self._lock:
+            self.started.append(camera_id)
+            self.loop_flags[camera_id] = config.get("video", {}).get("loop")
+            self._active += 1
+            self.concurrent_peak = max(self.concurrent_peak, self._active)
+        progress.on_start(total_frames=0)
+        frames = 0
+        while not progress.should_stop():
+            frames += 1
+            progress.on_frame(frames_processed=frames, fps=25.0,
+                              avg_ocr_ms=4.0, avg_detection_ms=12.0)
+            time.sleep(0.01)
+        with self._lock:
+            self._active -= 1
+        return {"frames_processed": frames, "events_stored": 0}
+
+
+def _wait_for(condition, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+class TestLiveStreamRunsUntilStop:
+    """The feed only ends when somebody presses STOP PROCESSING."""
+
+    def test_a_dead_stream_waits_for_stop_instead_of_failing(
+        self, registry, store, monkeypatch
+    ):
+        from src.cameras import stream_probe
+
+        registry._settings["processing"] = {"live_retry_seconds": 0.05}
+        monkeypatch.setattr(
+            stream_probe, "probe_stream",
+            lambda url, timeout=3.0: stream_probe.ProbeResult(
+                ok=False, message="127.0.0.1 refused the connection on port 554."),
+        )
+        runner = UntilStopRunner()
+        manager = CameraManager({"video": {}}, registry, runner, store)
+        manager.set_rtsp_url("CAM001", "rtsp://admin:pw123@127.0.0.1:554/11")
+
+        manager.start(camera_ids=["CAM001"])
+        time.sleep(0.4)                       # several retry rounds
+        assert manager.is_running(), "a dead stream ended the session on its own"
+        assert runner.started == [], "the pipeline was started on a dead stream"
+
+        logs = " ".join(manager.get_status()["logs"])
+        assert "refused" in logs and "Retrying" in logs, "no reason given"
+        assert "pw123" not in logs, "the stream password leaked into the log"
+
+        started = time.monotonic()
+        manager.stop()
+        assert manager.wait(timeout=5)
+        assert time.monotonic() - started < 2.0, "STOP did not end the wait at once"
+        camera = next(c for c in manager.get_status()["cameras"]
+                      if c["camera_id"] == "CAM001")
+        assert camera["state"] == CameraState.SKIPPED.value
+
+    def test_a_stream_that_comes_back_is_picked_up(self, registry, store, monkeypatch):
+        from src.cameras import stream_probe
+
+        registry._settings["processing"] = {"live_retry_seconds": 0.05}
+        attempts = {"n": 0}
+
+        def flaky_probe(url, timeout=3.0):
+            attempts["n"] += 1
+            ok = attempts["n"] >= 3
+            return stream_probe.ProbeResult(
+                ok=ok, message="up" if ok else "No response within 3s.")
+
+        monkeypatch.setattr(stream_probe, "probe_stream", flaky_probe)
+        runner = UntilStopRunner()
+        manager = CameraManager({"video": {}}, registry, runner, store)
+        manager.set_rtsp_url("CAM001", "rtsp://10.0.0.5:554/live")
+
+        manager.start(camera_ids=["CAM001"])
+        assert _wait_for(lambda: runner.started == ["CAM001"]), "never recovered"
+        assert manager.is_running()
+        manager.stop()
+        assert manager.wait(timeout=5)
+        camera = next(c for c in manager.get_status()["cameras"]
+                      if c["camera_id"] == "CAM001")
+        assert camera["state"] == CameraState.COMPLETED.value
+
+    def test_a_running_live_stream_is_ended_only_by_stop(self, registry, store):
+        runner = UntilStopRunner()
+        manager = CameraManager({"video": {}}, registry, runner, store)
+        manager.set_rtsp_url("CAM001", "rtsp://10.0.0.5:554/live")
+        manager.start(camera_ids=["CAM001"])
+        assert _wait_for(lambda: runner.started == ["CAM001"])
+        time.sleep(0.3)
+        assert manager.is_running()
+        manager.stop()
+        assert manager.wait(timeout=5)
+
+
+class TestLoopRecorded:
+    """Uploaded clips behave like live feeds when loop_recorded is on."""
+
+    def test_clips_run_together_until_stop(self, registry, store):
+        registry._settings["processing"] = {"loop_recorded": True}
+        runner = UntilStopRunner()
+        manager = CameraManager({"video": {}}, registry, runner, store)
+
+        manager.start()
+        assert _wait_for(lambda: len(runner.started) == 4), "not all clips started"
+        assert runner.concurrent_peak == 4, "clips did not run together"
+        time.sleep(0.2)
+        assert manager.is_running(), "a looping clip ended the session on its own"
+
+        manager.stop()
+        assert manager.wait(timeout=5)
+        states = {c["camera_id"]: c["state"] for c in manager.get_status()["cameras"]}
+        assert set(states.values()) == {CameraState.COMPLETED.value}
+
+    def test_the_pipeline_is_told_to_loop(self, registry, store):
+        registry._settings["processing"] = {"loop_recorded": True}
+        runner = UntilStopRunner()
+        manager = CameraManager({"video": {}}, registry, runner, store)
+        manager.start(camera_ids=["CAM001"])
+        assert _wait_for(lambda: runner.started == ["CAM001"])
+        manager.stop()
+        manager.wait(timeout=5)
+        assert runner.loop_flags["CAM001"] is True
+
+    def test_looping_never_leaks_into_the_shared_config(self, registry, store):
+        """A per-camera copy: the manager's own config must stay untouched."""
+        config = {"video": {}}
+        registry._settings["processing"] = {"loop_recorded": True}
+        manager = CameraManager(config, registry, UntilStopRunner(), store)
+        manager.start(camera_ids=["CAM001"])
+        time.sleep(0.1)
+        manager.stop()
+        manager.wait(timeout=5)
+        assert "loop" not in config["video"]
+
+    def test_without_it_clips_still_play_once_in_turn(self, registry, store):
+        """The original schedule is untouched when the option is off."""
+        runner = RecordingRunner()
+        manager = CameraManager({"video": {}}, registry, runner, store)
+        manager.start()
+        assert manager.wait(timeout=30), "session did not end by itself"
+        assert runner.order == ["CAM001", "CAM002", "CAM003", "CAM004"]
+        assert runner.overlaps == []
+
+
+class TestUploadsSurviveRestart:
+    """A restart must not make the operator upload every video again."""
+
+    def _empty_registry(self, camera_config_file, tmp_path, video_file):
+        import shutil
+
+        uploads = tmp_path / "uploads"
+        uploads.mkdir()
+        shutil.copy(video_file, uploads / "CAM001.mp4")
+        shutil.copy(video_file, uploads / "CAM003.mp4")
+        registry = load_camera_registry(str(camera_config_file))
+        for camera in registry.all:
+            registry.replace(dataclasses.replace(camera, video_path=None,
+                                                 source_type=SourceType.UPLOAD))
+        registry._settings["processing"] = {"upload_dir": str(uploads)}
+        return registry, uploads
+
+    def test_each_camera_gets_its_own_clip_back(
+        self, camera_config_file, tmp_path, video_file, store
+    ):
+        registry, uploads = self._empty_registry(camera_config_file, tmp_path, video_file)
+        manager = CameraManager({"video": {}}, registry, RecordingRunner(), store)
+        paths = {c.camera_id: c.video_path for c in manager.registry}
+        assert paths["CAM001"] == str(uploads / "CAM001.mp4")
+        assert paths["CAM003"] == str(uploads / "CAM003.mp4")
+        assert paths["CAM002"] is None and paths["CAM004"] is None
+
+    def test_a_reattached_camera_actually_runs(
+        self, camera_config_file, tmp_path, video_file, store
+    ):
+        registry, _ = self._empty_registry(camera_config_file, tmp_path, video_file)
+        runner = RecordingRunner()
+        manager = CameraManager({"video": {}}, registry, runner, store)
+        manager.start()
+        assert manager.wait(timeout=30)
+        assert runner.order == ["CAM001", "CAM003"]
+
+    def test_a_configured_stream_is_never_replaced_by_an_upload(
+        self, camera_config_file, tmp_path, video_file, store
+    ):
+        registry, _ = self._empty_registry(camera_config_file, tmp_path, video_file)
+        camera = registry.require("CAM001")
+        registry.replace(dataclasses.replace(
+            camera, source_type=SourceType.RTSP, rtsp_url="rtsp://10.0.0.5/live"))
+        manager = CameraManager({"video": {}}, registry, RecordingRunner(), store)
+        kept = manager.registry.require("CAM001")
+        assert kept.source_type is SourceType.RTSP
+        assert kept.rtsp_url == "rtsp://10.0.0.5/live"
+
+    def test_a_missing_upload_folder_is_not_an_error(
+        self, camera_config_file, tmp_path, store
+    ):
+        registry = load_camera_registry(str(camera_config_file))
+        registry._settings["processing"] = {"upload_dir": str(tmp_path / "absent")}
+        CameraManager({"video": {}}, registry, RecordingRunner(), store)
+
+
+class TestLoopingProgress:
+    def test_a_looping_clip_reports_no_total(self, registry, store):
+        """Otherwise the wall reads 'frame 11,810/320' and 100% mid-run."""
+        registry._settings["processing"] = {"loop_recorded": True}
+
+        def runner(config, camera_meta, session_context, progress,
+                   source_override, max_duration_seconds=None, models=None):
+            progress.on_start(total_frames=320)       # what the pipeline sends
+            while not progress.should_stop():
+                progress.on_frame(frames_processed=900, fps=30.0,
+                                  avg_ocr_ms=1.0, avg_detection_ms=1.0)
+                time.sleep(0.01)
+            return {"frames_processed": 900, "events_stored": 0}
+
+        manager = CameraManager({"video": {}}, registry, runner, store)
+        manager.start(camera_ids=["CAM001"])
+        assert _wait_for(lambda: manager.get_status()["cameras"][0]["frames_processed"] > 0)
+        camera = manager.get_status()["cameras"][0]
+        assert camera["total_frames"] == 0
+        assert camera["percent"] < 100
+        manager.stop()
+        manager.wait(timeout=5)

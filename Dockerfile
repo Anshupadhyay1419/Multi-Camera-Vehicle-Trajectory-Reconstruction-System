@@ -24,6 +24,12 @@ RUN pip install --upgrade pip setuptools wheel
 COPY docker/requirements-docker.txt /tmp/requirements-docker.txt
 RUN pip install --no-deps -r /tmp/requirements-docker.txt
 
+# Sentinel additions in a layer of their own, AFTER the ML stack above, so
+# that adding a small package here rebuilds seconds of work instead of
+# re-downloading several GB. See docker/requirements-sentinel.txt.
+COPY docker/requirements-sentinel.txt /tmp/requirements-sentinel.txt
+RUN pip install --no-deps -r /tmp/requirements-sentinel.txt
+
 # ── runtime stage ────────────────────────────────────────────────────────────
 # "runtime" (not "base") because PyCUDA links libcurand, which it provides.
 FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04

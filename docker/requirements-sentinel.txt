@@ -1,0 +1,22 @@
+# Sentinel platform dependencies, installed in their own image layer.
+#
+# Kept out of requirements-docker.txt on purpose. That file is a pinned
+# lockfile for the ALPR pipeline (torch, TensorRT, PaddlePaddle -- several
+# GB), and Docker invalidates a layer's cache whenever its input file
+# changes. Adding one small package there would re-download the entire ML
+# stack on the next build; adding it here rebuilds only this layer, in
+# seconds.
+#
+# Installed with --no-deps, like the file above, so every transitive
+# dependency is listed explicitly. Mako and MarkupSafe (alembic's) are
+# already pinned in requirements-docker.txt and are deliberately not
+# repeated here.
+
+# Bulk camera import from Excel (M1.4).
+openpyxl==3.1.5
+et_xmlfile==2.0.0
+
+# Schema migrations for the camera registry (M1.1). Not imported at runtime;
+# present so `alembic upgrade head` can be run inside the container, which
+# is the documented path for PostgreSQL deployments.
+alembic==1.20.0
